@@ -26,6 +26,15 @@ test("CLI login seeds and repairs ACP credentials, follows account changes, and 
     await bridgeCliAuthentication(env);
     expect((await stat(acpPath)).mtimeMs).toBe(modified);
 
+    // V0.2.0 copied Go's timezone/fractional expiry directly. google-auth can
+    // misread that as a future UTC time and reuse an expired bearer token.
+    await writeFile(acpPath, JSON.stringify({ ...generated, token: "expired-bearer", expiry: "2099-01-01T14:10:46.330765581+07:00" }));
+    await bridgeCliAuthentication(env);
+    const repaired = JSON.parse(await readFile(acpPath, "utf8"));
+    expect(repaired).not.toHaveProperty("token");
+    expect(repaired).not.toHaveProperty("expiry");
+    expect(repaired.refresh_token).toBe("fixture-refresh");
+
     await writeFile(acpPath, "{corrupt");
     expect(await bridgeCliAuthentication(env)).toBe(true);
     expect(JSON.parse(await readFile(acpPath, "utf8")).refresh_token).toBe("fixture-refresh");

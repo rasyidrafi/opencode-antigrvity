@@ -284,7 +284,7 @@ export class AcpWorker {
           fs: { readTextFile: true, writeTextFile: true },
           terminal: true,
         },
-        clientInfo: { name: "opencode-antigravity", version: "0.2.1" },
+        clientInfo: { name: "opencode-antigravity", version: "0.2.2" },
       }), signal);
       this.initValue = init;
       const authMethod = this.options.authMethod?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();

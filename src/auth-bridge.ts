@@ -83,7 +83,8 @@ export async function bridgeCliAuthentication(environment: NodeJS.ProcessEnv = p
   if (auth.type && auth.type !== "oauth-personal") return false;
   const existing = await readObject(acpPath);
   if (existing.refresh_token !== token.refresh_token || existing.client_id !== OAUTH_CLIENT_ID ||
-      existing.client_secret !== OAUTH_CLIENT_SECRET || existing.token_uri !== OAUTH_TOKEN_URI) {
+      existing.client_secret !== OAUTH_CLIENT_SECRET || existing.token_uri !== OAUTH_TOKEN_URI ||
+      "token" in existing || "expiry" in existing) {
     const credentials = {
       client_id: OAUTH_CLIENT_ID,
       client_secret: OAUTH_CLIENT_SECRET,
