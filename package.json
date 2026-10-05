@@ -1,11 +1,11 @@
 {
   "name": "@rasyid_rafi/opencode-antigravity",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenCode V2 provider adapter for Google's official Antigravity ACP server",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rasyidrafi/opencode-antigrvity.git"
+    "url": "git+https://github.com/rasyidrafi/opencode-antigrvity.git"
   },
   "homepage": "https://github.com/rasyidrafi/opencode-antigrvity#readme",
   "bugs": {
@@ -40,7 +40,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.4.0",
-    "@opencode/plugin": "2.0.22"
+    "@opencode/plugin": "2.0.22",
+    "fflate": "^0.8.2"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

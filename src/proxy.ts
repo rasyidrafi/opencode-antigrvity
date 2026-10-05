@@ -15,7 +15,7 @@ import {
   SESSION_HEADER,
   envNumber,
 } from "./constants.js";
-import { detectAcpServer } from "./acp-detect.js";
+import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { AgyError, AgyProtocolError, asAgyError, retryAfterSeconds } from "./errors.js";
 import { error as logError, info, warn } from "./log.js";
 import { acpModelCatalog, fallbackAcpModelCatalog, resolveAcpModelSelection, type AcpModelCatalog } from "./models.js";
@@ -336,7 +336,11 @@ function utilityStream(result: OneShotResult, model: string): Response {
 
 async function handleMessages(request: Request, body: AnthropicMessageRequest): Promise<Response> {
   if (!runtime) throw new AgyError("internal", "The Antigravity ACP proxy runtime is not initialized", { code: "agy_runtime_uninitialized" });
-  if (runtime.startupError) throw runtime.startupError;
+  if (runtime.startupError) {
+    const detection = await ensureAcpServer();
+    runtime.catalog = acpModelCatalog(detection.executable);
+    delete runtime.startupError;
+  }
   const cwd = resolvePath(readHeader(request, DIRECTORY_HEADER) || runtime.directory);
   if (!(await registeredWorkspaceContains(cwd))) throw new AgyError("unsupported", "The requested OpenCode workspace is outside the plugin workspace", { code: "agy_workspace_boundary" });
   const requestMessages = body.system === undefined ? body.messages : [{ role: "system", content: body.system }, ...(Array.isArray(body.messages) ? body.messages : [])];

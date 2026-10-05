@@ -51,12 +51,19 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
 
   const providers: any[] = [];
   const methods: any[] = [];
+  const savedMarkers: any[] = [];
+  let marker: any;
   const sessionDirectories = new Map<string, string>();
   const hooks = new Map<string, { callback: (event: any) => Promise<void>; options?: unknown }>();
   const context = {
     location: { directory: root },
     options: {},
     integration: {
+      connection: {
+        active: async () => marker ? { id: "local-marker" } : undefined,
+        resolve: async () => marker,
+      },
+      connect: { key: async (input: any) => { savedMarkers.push(input); marker = { type: "key", key: input.key }; } },
       transform: async (callback: (editor: any) => void) => {
         callback({
           update: () => undefined,
@@ -85,7 +92,8 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const cleanup = await (AntigravityCliPlugin as any).setup(context);
   cleanupTasks.push(cleanup);
   expect(PLUGIN_ID).toBe("opencode-antigravity");
-  expect(INTEGRATION_ID).toBe("opencode-antigravity");
+  expect(INTEGRATION_ID).toBe(PROVIDER_ID);
+  expect(savedMarkers).toEqual([{ integrationID: PROVIDER_ID, key: LOCAL_API_KEY }]);
   expect(typeof cleanup).toBe("function");
 
   const provider = providers[0];
@@ -102,7 +110,8 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   expect(flash.capabilities.tools).toBe(false);
   expect(flash.limit).toEqual({ context: 1_048_576, output: 65_536 });
 
-  const auth = methods.find((method) => method.integrationID === INTEGRATION_ID);
+  expect(methods.some((method) => method.integrationID === PROVIDER_ID && method.method.type === "key")).toBe(true);
+  const auth = methods.find((method) => method.integrationID === INTEGRATION_ID && method.method.type === "oauth");
   expect(auth.method).toMatchObject({ id: AUTH_METHOD_ID, type: "oauth" });
   expect(auth.method.form[0].options.map((option: { value: string }) => option.value)).toContain("gemini-api-key");
   const authorization = await auth.authorize({ method: "oauth-personal" });
@@ -169,4 +178,9 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   await Promise.all([cleanup(), cleanup()]);
   cleanupTasks.pop();
   expect(getProxyPort()).toBeNull();
+
+  // Reloading a location reuses the automatic local marker, not another account.
+  const secondCleanup = await (AntigravityCliPlugin as any).setup(context);
+  cleanupTasks.push(secondCleanup);
+  expect(savedMarkers).toHaveLength(1);
 });

@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +24,7 @@ const OAUTH_SCOPES = [
 ];
 
 type CliTokenFile = {
+  auth_method?: string;
   token?: {
     access_token?: unknown;
     refresh_token?: unknown;
@@ -30,17 +32,37 @@ type CliTokenFile = {
   };
 };
 
-function geminiHome(): string {
-  return process.env.GEMINI_HOME?.trim() || join(homedir(), ".gemini");
+function geminiHome(environment: NodeJS.ProcessEnv): string {
+  return environment.GEMINI_HOME?.trim() || join(environment.HOME?.trim() || homedir(), ".gemini");
+}
+
+async function readObject(path: string): Promise<Record<string, any>> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch (error: any) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError) return {};
+    throw error;
+  }
+}
+
+async function writePrivateJson(path: string, value: unknown): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+    await rename(temporary, path);
+  } finally { await rm(temporary, { force: true }); }
 }
 
 /**
  * The standalone ACP server keeps a separate credential file from the CLI.
- * Seed that file from the CLI's already-authenticated refresh token once.
+ * Seed or repair personal ACP credentials from the authenticated CLI. Account
+ * switches in the CLI are reflected on the next worker; other ACP auth modes
+ * and the CLI's source file are left alone.
  * The token itself never enters logs or the OpenCode request path.
  */
-export async function bridgeCliAuthentication(): Promise<boolean> {
-  const home = geminiHome();
+export async function bridgeCliAuthentication(environment: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  const home = geminiHome(environment);
   const cliPath = join(home, "antigravity-cli", "antigravity-oauth-token");
   const acpDir = join(home, "antigravity-acp");
   const acpPath = join(acpDir, "acp_token.json");
@@ -53,32 +75,30 @@ export async function bridgeCliAuthentication(): Promise<boolean> {
   }
   const token = cli.token;
   if (typeof token?.refresh_token !== "string" || !token.refresh_token.trim()) return false;
-  try {
-    await readFile(acpPath, "utf8");
-  } catch {
+  if (cli.auth_method && cli.auth_method !== "consumer" && cli.auth_method !== "oauth-personal") return false;
+  const requestedMethod = environment.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();
+  if (requestedMethod && requestedMethod !== "oauth-personal") return false;
+  const settings = await readObject(settingsPath);
+  const auth = settings.auth && typeof settings.auth === "object" ? settings.auth : {};
+  if (auth.type && auth.type !== "oauth-personal") return false;
+  const existing = await readObject(acpPath);
+  if (existing.refresh_token !== token.refresh_token || existing.client_id !== OAUTH_CLIENT_ID ||
+      existing.client_secret !== OAUTH_CLIENT_SECRET || existing.token_uri !== OAUTH_TOKEN_URI) {
     const credentials = {
       client_id: OAUTH_CLIENT_ID,
       client_secret: OAUTH_CLIENT_SECRET,
       refresh_token: token.refresh_token,
       token_uri: OAUTH_TOKEN_URI,
       scopes: OAUTH_SCOPES,
-      ...(typeof token.access_token === "string" ? { token: token.access_token } : {}),
-      ...(typeof token.expiry === "string" ? { expiry: token.expiry } : {}),
+      // Let Google's credential loader refresh. CLI expiry timestamps and
+      // access-token formats need not match google-auth's serialization.
     };
     await mkdir(acpDir, { recursive: true, mode: 0o700 });
-    await writeFile(acpPath, JSON.stringify(credentials), { mode: 0o600 });
-    await chmod(acpPath, 0o600).catch(() => undefined);
+    await writePrivateJson(acpPath, credentials);
   }
-  try {
-    const settings = JSON.parse(await readFile(settingsPath, "utf8")) as Record<string, unknown>;
-    const auth = settings.auth && typeof settings.auth === "object" ? settings.auth as Record<string, unknown> : {};
-    if (auth.type !== "oauth-personal") {
-      settings.auth = { ...auth, type: "oauth-personal" };
-      await writeFile(settingsPath, JSON.stringify(settings, null, 2));
-    }
-  } catch {
-    await writeFile(settingsPath, JSON.stringify({ auth: { type: "oauth-personal" } }, null, 2), { mode: 0o600 });
-    await chmod(settingsPath, 0o600).catch(() => undefined);
+  if (auth.type !== "oauth-personal") {
+    await mkdir(acpDir, { recursive: true, mode: 0o700 });
+    await writePrivateJson(settingsPath, { ...settings, auth: { ...auth, type: "oauth-personal" } });
   }
   return true;
 }

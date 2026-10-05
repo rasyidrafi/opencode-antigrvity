@@ -1,7 +1,9 @@
 import { access } from "node:fs/promises";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { constants } from "node:fs";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { AgyProcessError } from "./errors.js";
+import { installAcpServer } from "./acp-install.js";
 
 export type AcpServerDetection = {
   executable: string;
@@ -27,7 +29,7 @@ function defaultArgs(): string[] {
 
 async function isExecutable(path: string): Promise<boolean> {
   try {
-    await access(path);
+    await access(path, process.platform === "win32" ? constants.F_OK : constants.X_OK);
     return true;
   } catch {
     return false;
@@ -75,7 +77,11 @@ export async function resolveAcpExecutable(preferred?: string, options: AcpServe
   for (const candidate of candidates) {
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
-    if (await isExecutable(candidate)) return candidate;
+    if (await isExecutable(candidate)) {
+      if (dirname(candidate) === join(dataHome, "opencode-antigravity", "acp-server-1.3.0") &&
+          !await isExecutable(join(dirname(candidate), process.platform === "win32" ? "localharness_external.exe" : "localharness_external"))) continue;
+      return candidate;
+    }
   }
 
   throw new AgyProcessError(
@@ -86,4 +92,15 @@ export async function resolveAcpExecutable(preferred?: string, options: AcpServe
 export async function detectAcpServer(preferred?: string): Promise<AcpServerDetection> {
   const executable = await resolveAcpExecutable(preferred);
   return { executable, args: acpServerArgs(), platform: `${process.platform}-${process.arch}` };
+}
+
+export async function ensureAcpServer(preferred?: string): Promise<AcpServerDetection> {
+  try {
+    return await detectAcpServer(preferred);
+  } catch (error) {
+    // Never silently ignore a user's explicit override.
+    if (preferred?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_PATH?.trim()) throw error;
+    const executable = await installAcpServer();
+    return { executable, args: acpServerArgs(), platform: `${process.platform}-${process.arch}` };
+  }
 }

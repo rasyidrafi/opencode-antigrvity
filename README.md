@@ -10,38 +10,19 @@ agy_acp_server.par
 ## Requirements
 
 - OpenCode V2 (tested against `2.0.22`);
-- Google's `agy_acp_server.par` and the accompanying `localharness_external`;
-- an authenticated ACP server session (or sign in through `/connect`).
+- Google's `agy` CLI, already signed in to your personal Google account.
 
 The official server is listed in the [ACP Registry](https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp).
 
 ## Install
 
-Download the ACP server archive for your platform. Keep these files together:
-
-```text
-agy_acp_server.par
-localharness_external
-```
-
-The server is discovered automatically from
-`$XDG_DATA_HOME/opencode-antigravity/acp-server-1.3.0/` (default:
-`~/.local/share/opencode-antigravity/acp-server-1.3.0/`) or from `PATH`. Keep
-the two official files together. Set the path explicitly when it is installed
-elsewhere:
+Install the plugin:
 
 ```sh
-export OPENCODE_ANTIGRAVITY_ACP_PATH=/absolute/path/to/agy_acp_server.par
+opencode plugin add @rasyid_rafi/opencode-antigravity
 ```
 
-On Linux the registry argument `--uid=` is supplied automatically. Custom
-arguments can be provided as JSON:
-
-```sh
-export OPENCODE_ANTIGRAVITY_ACP_ARGS='["--uid="]'
-```
-
-Register the V2 plugin in `~/.config/opencode/opencode.jsonc`:
+Or register it in `~/.config/opencode/opencode.jsonc`:
 
 ```json
 {
@@ -50,35 +31,36 @@ Register the V2 plugin in `~/.config/opencode/opencode.jsonc`:
 }
 ```
 
-Restart OpenCode after changing plugin configuration.
+Select an **Antigravity ACP** model and send a message. No `/connect`, API key,
+or second Google sign-in is needed when the CLI is already authenticated.
+This also applies to OpenChamber.
+
+The plugin reuses an installed ACP server. If missing, the first request downloads
+Google's official ACP **1.3.0** server and companion automatically into
+`$XDG_DATA_HOME/opencode-antigravity/acp-server-1.3.0/` (default:
+`~/.local/share/opencode-antigravity/acp-server-1.3.0/`). The first request can take
+longer while downloading. Downloads support Linux, macOS, and Windows on x64/arm64.
+Google's archive URLs are taken from the ACP Registry; no system installer is needed.
+
+An explicit `OPENCODE_ANTIGRAVITY_ACP_PATH` takes precedence and is never replaced.
+Custom arguments can be supplied with `OPENCODE_ANTIGRAVITY_ACP_ARGS` as a JSON array;
+Linux defaults to `["--uid="]`.
 
 ## Authentication
-
-Run `/connect`, choose **Antigravity ACP**, then select one of the ACP server's
-authentication methods:
-
-- `oauth-personal`;
-- `oauth-business`;
-- `gemini-api-key`;
-- `agent-platform`.
-
-OpenCode links to the official ACP registry entry during the integration flow;
-the server handles the actual sign-in. Do not paste a Google credential into
-OpenCode.
-
-You can set a default method for the next ACP worker:
-
-```sh
-export OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD=oauth-personal
-```
 
 The plugin reuses the official CLI's existing OAuth login when it finds
 `~/.gemini/antigravity-cli/antigravity-oauth-token` (or the equivalent path
 under `GEMINI_HOME`). It seeds the ACP server's local credential file so the
-first OpenCode request does not start a second browser login. Credentials stay
+first OpenCode request does not start a second browser login. Malformed ACP
+credentials are repaired and CLI account changes are picked up on the next worker.
+The CLI's original credential file is never modified. Credentials stay
 on the local machine and are not sent through the OpenCode proxy. The V2
-integration stores only a synthetic OAuth access marker (`opencode-antigravity-local`);
+integration automatically stores only a fixed local API marker (`opencode-antigravity-local`);
 Google credentials remain in the official ACP server's local auth store.
+
+Existing non-personal ACP authentication is preserved. Advanced users can select
+`oauth-business`, `gemini-api-key`, or `agent-platform` through the official ACP
+server; `OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD` remains an optional override.
 
 ## Configuration
 

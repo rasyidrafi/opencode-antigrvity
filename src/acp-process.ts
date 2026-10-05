@@ -17,7 +17,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { AgyAbortError, AgyError, AgyProcessError, AgyProtocolError, AgyTimeoutError } from "./errors.js";
 import { DEFAULT_MAX_STDERR_BYTES, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort } from "./constants.js";
-import { detectAcpServer } from "./acp-detect.js";
+import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { bridgeCliAuthentication } from "./auth-bridge.js";
 import { debug, info, warn } from "./log.js";
 import type { AcpEvent } from "./protocol.js";
@@ -284,7 +284,7 @@ export class AcpWorker {
           fs: { readTextFile: true, writeTextFile: true },
           terminal: true,
         },
-        clientInfo: { name: "opencode-antigravity", version: "0.2.0" },
+        clientInfo: { name: "opencode-antigravity", version: "0.2.1" },
       }), signal);
       this.initValue = init;
       const authMethod = this.options.authMethod?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();
@@ -718,10 +718,14 @@ export class AcpWorker {
 }
 
 export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortSignal): Promise<AcpWorker> {
-  await bridgeCliAuthentication();
+  await bridgeCliAuthentication({
+    ...process.env,
+    ...options.environment,
+    ...(options.authMethod ? { OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: options.authMethod } : {}),
+  });
   const detection = options.executable
     ? { executable: options.executable, args: options.executableArgs }
-    : await detectAcpServer();
+    : await ensureAcpServer();
   const worker = new AcpWorker({
     ...options,
     executableArgs: options.executableArgs ?? detection.args,

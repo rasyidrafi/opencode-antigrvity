@@ -12,14 +12,14 @@ import {
   SESSION_HEADER,
 } from "./constants.js";
 import { createAcpWorker } from "./acp-process.js";
-import { detectAcpServer } from "./acp-detect.js";
+import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { researchedMetadataFor } from "./model-metadata.js";
 import { acpModelCatalog, fallbackAcpModelCatalog, type AcpModel, type AcpModelCatalog } from "./models.js";
 import { getProxyBaseUrl, startProxy, stopProxy } from "./proxy.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
 
 export const PLUGIN_ID = "opencode-antigravity";
-export const INTEGRATION_ID = "opencode-antigravity";
+export const INTEGRATION_ID = PROVIDER_ID;
 export const AUTH_METHOD_ID = "antigravity-acp";
 const PROVIDER_PACKAGE = "@opencode/ai/providers/anthropic";
 const AUTH_REGISTRY_URL = "https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp";
@@ -82,7 +82,7 @@ async function authorizeAcp(directory: string, answer: Record<string, unknown>) 
   const method = AUTH_METHODS.some((item) => item.value === requested)
     ? requested as (typeof AUTH_METHODS)[number]["value"]
     : "oauth-personal";
-  const detection = await detectAcpServer();
+  const detection = await ensureAcpServer();
   const callback = (async () => {
     const worker = await createAcpWorker({
       cwd: directory,
@@ -177,7 +177,18 @@ export const AntigravityCliPlugin = Plugin.define({
           },
           authorize: (answer) => authorizeAcp(ctx.location.directory, answer),
         });
+        // This is a local adapter, not a Google API-key provider. Keep the
+        // integration ID equal to the provider ID for clients such as OpenChamber.
+        editor.method.update({ integrationID: INTEGRATION_ID, method: { type: "key", label: "Local Antigravity CLI" } });
       });
+
+      // Match V1: install the non-secret loopback marker automatically. Google
+      // authentication stays in the CLI/ACP worker; no user-facing connect flow.
+      const connection = await ctx.integration.connection.active(INTEGRATION_ID);
+      const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
+      if (credential?.type !== "key" || credential.key !== LOCAL_API_KEY) {
+        await ctx.integration.connect.key({ integrationID: INTEGRATION_ID, key: LOCAL_API_KEY });
+      }
 
       await ctx.provider.transform((editor) => {
         editor.add({ info, models: buildProviderModels(catalog) });

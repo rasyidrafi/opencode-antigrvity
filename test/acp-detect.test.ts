@@ -15,6 +15,8 @@ test("discovers the installed ACP server under the XDG Antigravity data director
     await mkdir(join(dataHome, "opencode-antigravity", "acp-server-1.3.0"), { recursive: true });
     await writeFile(executable, "#!/bin/sh\nexit 0\n");
     await chmod(executable, 0o755);
+    const companion = join(dataHome, "opencode-antigravity", "acp-server-1.3.0", process.platform === "win32" ? "localharness_external.exe" : "localharness_external");
+    await writeFile(companion, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     process.env.XDG_DATA_HOME = dataHome;
     delete process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
 
