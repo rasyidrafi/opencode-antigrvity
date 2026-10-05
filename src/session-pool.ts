@@ -27,6 +27,9 @@ export type SessionSettings = {
   cliVersion?: string | null;
   executable?: string;
   catalogScope?: string;
+  hostTools?: boolean;
+  mcpServers?: AcpWorkerOptions["mcpServers"];
+  waitingForTools?: () => boolean;
 };
 
 export type SessionTurnRequest = {
@@ -36,6 +39,7 @@ export type SessionTurnRequest = {
   priorMessages?: Array<{ role?: unknown; content?: unknown }>;
   settings: SessionSettings;
   signal?: AbortSignal;
+  instructions?: string;
 };
 
 type SessionEntry = {
@@ -56,6 +60,8 @@ function settingsSignature(settings: SessionSettings): string {
     effort: settings.effort ?? null,
     mode: settings.mode ?? null,
     catalogScope: settings.catalogScope,
+    mcpServers: settings.mcpServers,
+    hostTools: settings.hostTools,
   });
 }
 
@@ -101,6 +107,9 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
     effort: settings.effort,
     sessionId,
     mode: settings.mode,
+    hostTools: settings.hostTools,
+    mcpServers: settings.mcpServers,
+    waitingForTools: settings.waitingForTools,
   };
 }
 
@@ -158,6 +167,7 @@ export class SessionPool {
         if (signal.aborted) throw new AgyAbortError();
         const identity = request.requestId || createHash("sha256").update(JSON.stringify({
           prior: request.priorMessages, prompt: request.prompt,
+          instructions: request.instructions, model: request.settings.model,
         })).digest("hex");
         const receipt = await sessionStore.receipt(request.key, identity);
         if (receipt) {
@@ -212,6 +222,7 @@ export class SessionPool {
     const prompt: ContentBlock[] = history
       ? [{ type: "text", text: `${history}\n\n<current-user-message>` }, ...request.prompt, { type: "text", text: "</current-user-message>" }]
       : request.prompt;
+    if (request.instructions) prompt.unshift({ type: "text", text: request.instructions });
     // This write must succeed before sending a prompt that can change files.
     await sessionStore.saveReceipt(request.key, identity, { state: "started" });
     if (history) entry.historyTransferred = true;
@@ -312,6 +323,14 @@ export class SessionPool {
       this.entries.delete(key);
       await sessionStore.delete(key);
     } finally { await unlock(); }
+  }
+
+  /** Release an idle process while retaining the persisted ACP resume point. */
+  async forgetWorker(key: string): Promise<void> {
+    const entry = this.entries.get(key);
+    if (!entry || entry.pending) return;
+    this.entries.delete(key);
+    await entry.worker?.stop();
   }
 
   async status(key: string): Promise<Record<string, unknown>> {

@@ -92,6 +92,7 @@ export async function runAcpOneShot(prompt: string, settings: OneShotSettings): 
       model: settings.model,
       effort: settings.effort,
       mode: "plan",
+      hostTools: true,
       permissionPolicy: "allow-always",
       printTimeoutMs: configuredPrintTimeoutMs(),
     }, settings.signal);

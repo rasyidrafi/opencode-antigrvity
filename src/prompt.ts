@@ -177,6 +177,8 @@ export function extractTextContent(content: unknown): string {
   return content.map((part) => {
     if (!part || typeof part !== "object" || Array.isArray(part)) return "";
     const record = part as MessageContentPart;
+    if (record.type === "tool_use") return `[tool ${String(record.name)} ${String(record.id)}] ${JSON.stringify(record.input ?? {})}`;
+    if (record.type === "tool_result") return `[tool result ${String(record.tool_use_id)}] ${extractTextContent(record.content)}`;
     return record.type === "text" || record.type === "input_text" ? (typeof record.text === "string" ? record.text : "") : "";
   }).filter(Boolean).join("\n");
 }
@@ -200,13 +202,13 @@ export function validateTextOnlyMessages(messages: unknown): HostMessage[] {
   });
 }
 
-export async function normalizePrompt(messages: unknown, options: { allowedRoots?: string[] } = {}): Promise<NormalizedPrompt> {
+export async function normalizePrompt(messages: unknown, options: { allowedRoots?: string[]; hostTools?: boolean } = {}): Promise<NormalizedPrompt> {
   if (!Array.isArray(messages)) throw new AgyError("invalid_request", "`messages` must be an array", { code: "agy_messages_array" });
   const normalized = messages.map((message, index) => {
     if (!message || typeof message !== "object" || Array.isArray(message)) throw new AgyError("invalid_request", `Message ${index} must be an object`, { code: "agy_message_object" });
     const record = message as HostMessage;
     validateMessage(record, index);
-    if (record.tool_calls !== undefined && record.tool_calls !== null) {
+    if (!options.hostTools && record.tool_calls !== undefined && record.tool_calls !== null) {
       throw new AgyError("unsupported", "OpenCode tool calls are not forwarded; Antigravity owns its ACP tool loop", { code: "agy_host_tool_calls_unsupported" });
     }
     return record;

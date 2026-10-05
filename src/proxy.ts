@@ -24,6 +24,7 @@ import { detectMetaRequestKind } from "./request-kind.js";
 import { buildGenerateUtilityPrompt, buildUtilityPrompt, runAcpOneShot, type OneShotResult } from "./utility.js";
 import { sessionPool } from "./session-pool.js";
 import type { AcpEvent } from "./protocol.js";
+import { hostBridge, handleHostMcp, closeHostBridges, hostInstructions, type BridgeEvent } from "./host-tools.js";
 import {
   addAnthropicUsage,
   appendResultWithoutDuplication,
@@ -57,7 +58,7 @@ type RuntimeState = {
   manager: ModelCatalog;
 };
 
-type ProbeResult = { replay: AsyncIterable<AcpEvent> } | { error: AgyError };
+type ProbeResult = { replay: AsyncIterable<BridgeEvent> } | { error: AgyError };
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream; charset=utf-8",
@@ -194,21 +195,23 @@ function anthropicUsage(usage: AnthropicUsage | undefined): Record<string, unkno
   };
 }
 
-async function probeTurn(events: AsyncIterable<AcpEvent>): Promise<ProbeResult> {
+async function probeTurn(events: AsyncIterable<BridgeEvent>): Promise<ProbeResult> {
   const iterator = events[Symbol.asyncIterator]();
-  const buffered: AcpEvent[] = [];
+  const buffered: BridgeEvent[] = [];
+  const resume = async function* () { try { yield* buffered; while (true) { const next = await iterator.next(); if (next.done) return; yield next.value; } } finally { await iterator.return?.(); } };
   try {
     while (true) {
       const next = await iterator.next();
       if (next.done) break;
       const event = next.value;
       buffered.push(event);
+      if (event.event === "host_tools") return { replay: resume() };
       if (event.event === "result") {
         const mapped = mapAcpEvent(event);
         if (mapped.kind === "error") { await iterator.return?.(); return { error: mapped.error }; }
-        return { replay: replay(buffered, iterator) };
+        return { replay: resume() };
       }
-      if (isMeaningfulEvent(event)) return { replay: replay(buffered, iterator) };
+      if (isMeaningfulEvent(event)) return { replay: resume() };
     }
   } catch (error) {
     await iterator.return?.();
@@ -222,7 +225,7 @@ function contentBlock(kind: "text" | "thinking", text = ""): Record<string, unkn
 }
 
 function streamAnthropic(
-  events: AsyncIterable<AcpEvent>,
+  events: AsyncIterable<BridgeEvent>,
   model: string,
   signal?: AbortSignal,
 ): Response {
@@ -230,7 +233,7 @@ function streamAnthropic(
   const encoder = new TextEncoder();
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
-  let iterator: AsyncIterator<AcpEvent> | undefined;
+  let iterator: AsyncIterator<BridgeEvent> | undefined;
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       iterator = events[Symbol.asyncIterator]();
@@ -269,6 +272,17 @@ function streamAnthropic(
           if (signal?.aborted) throw new AgyError("timeout", "The client cancelled the ACP request", { status: 499, code: "agy_client_cancelled" });
           const next = await iterator!.next();
           if (next.done) break;
+          if (next.value.event === "host_tools") {
+            closeBlock();
+            for (const call of next.value.calls) {
+              const index = nextBlockIndex++;
+              send({ type: "content_block_start", index, content_block: { ...call, input: {} } });
+              send({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(call.input) } });
+              send({ type: "content_block_stop", index });
+            }
+            finishReason = "tool_use";
+            continue;
+          }
           const mapped = mapAcpEvent(next.value, translation);
           if (mapped.kind === "text") { streamedText += mapped.text; emitBlock("text", mapped.text); }
           else if (mapped.kind === "reasoning") emitBlock("thinking", mapped.text);
@@ -352,11 +366,11 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
   const requestedEffort = readHeader(request, EFFORT_HEADER);
   const selected = resolveAcpModelSelection(requestedModel, requestedEffort, runtime.catalog);
   const mode: "accept-edits" | "plan" | undefined = process.env.OPENCODE_ANTIGRAVITY_MODE === "accept-edits" || process.env.OPENCODE_ANTIGRAVITY_MODE === "plan" ? process.env.OPENCODE_ANTIGRAVITY_MODE : undefined;
-  const settings = { cwd, model: selected.acpModel, ...(selected.effort ? { effort: selected.effort } : {}), ...(mode ? { mode } : {}), cliVersion: runtime.catalog.version, executable: runtime.catalog.executable, catalogScope: runtime.manager.scope } as const;
-  const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd] });
-  const metaKind = detectMetaRequestKind(normalized.messages, readHeader(request, REQUEST_KIND_HEADER));
+  const settings = { cwd, model: selected.acpModel, ...(selected.effort ? { effort: selected.effort } : {}), ...(mode ? { mode } : {}), cliVersion: runtime.catalog.version, executable: runtime.catalog.executable, catalogScope: runtime.manager.scope, hostTools: true } as const;
+  const metaKind = detectMetaRequestKind(Array.isArray(requestMessages) ? requestMessages : [], readHeader(request, REQUEST_KIND_HEADER));
   if (metaKind) {
     try {
+      const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true });
       const generated = metaKind === "generate" ? buildGenerateUtilityPrompt(normalized.messages) : undefined;
       const utilityPrompt = generated?.context ?? buildUtilityPrompt(metaKind, normalized.messages);
       const utility = await runAcpOneShot(utilityPrompt, {
@@ -370,11 +384,35 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
       return body.stream === true ? utilityStream(utility, responseModel(body.model, selected.requestedModel)) : utilityMessage(utility, responseModel(body.model, selected.requestedModel));
     } catch (error) { return errorResponse(error); }
   }
-  const events = sessionPool.turn({ key, requestId: readHeader(request, MESSAGE_HEADER), prompt: normalized.blocks, priorMessages: normalized.priorMessages, settings, signal: request.signal });
+  // The host session header is mandatory for tool continuations: inference
+  // request content changes after every result and cannot identify a session.
+  const sessionID = readHeader(request, SESSION_HEADER);
+  if (body.tools !== undefined && !sessionID) throw new AgyError("invalid_request", "OpenCode tool requests require a session header");
+  let events: AsyncIterable<BridgeEvent>;
+  if (sessionID && (body.tools !== undefined || readHeader(request, "x-opencode-antigravity-host-tools") === "1")) {
+    if (body.tool_choice && typeof body.tool_choice === "object" && (body.tool_choice as any).type !== "auto") throw new AgyError("unsupported", "ACP currently supports automatic OpenCode tool selection only");
+    events = hostBridge(`host-v1:${key}`, sessionID, cwd).request({ messages: body.messages, system: body.system, tools: body.tools, settings,
+      baseURL: getProxyBaseUrl().replace(/\/v1$/, ""), requestId: readHeader(request, MESSAGE_HEADER), signal: request.signal });
+  } else {
+    const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true });
+    events = sessionPool.turn({ key, requestId: readHeader(request, MESSAGE_HEADER), prompt: normalized.blocks,
+      priorMessages: normalized.priorMessages.filter((m) => m.role !== "system"), instructions: hostInstructions(body.system, cwd), settings, signal: request.signal });
+  }
   const probed = await probeTurn(events);
   if ("error" in probed) return errorResponse(probed.error);
   if (body.stream !== true) {
-    try { return collectedMessage(await collectTurn(probed.replay), responseModel(body.model, selected.requestedModel)); }
+    try {
+      const acp: AcpEvent[] = []; const calls: unknown[] = [];
+      for await (const event of probed.replay) { if (event.event === "host_tools") calls.push(...event.calls); else acp.push(event); }
+      if (calls.length) {
+        const state = createAcpTranslationState();
+        const content: unknown[] = [];
+        for (const event of acp) { const mapped = mapAcpEvent(event, state); if (mapped.kind === "text") content.push({ type: "text", text: mapped.text }); }
+        return Response.json({ id: completionId(), type: "message", role: "assistant", model: responseModel(body.model, selected.requestedModel),
+          content: [...content, ...calls], stop_reason: "tool_use", stop_sequence: null, usage: anthropicUsage(undefined) });
+      }
+      return collectedMessage(await collectTurn((async function* () { yield* acp; })()), responseModel(body.model, selected.requestedModel));
+    }
     catch (error) { return errorResponse(error); }
   }
   return streamAnthropic(probed.replay, responseModel(body.model, selected.requestedModel), request.signal);
@@ -382,6 +420,7 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
 
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname.startsWith("/mcp/")) return handleHostMcp(request);
   const protectedRoute = (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models" || url.pathname === "/v1/usage" || url.pathname === "/usage")) || (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages"));
   if (protectedRoute && !localAuthorizationIsValid(request)) return errorResponse(new AgyError("auth", "Invalid local proxy API key", { code: "agy_local_key" }));
   if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
@@ -422,6 +461,7 @@ export async function startProxy(directory = process.cwd()): Promise<number> {
 export async function stopProxy(directory?: string): Promise<void> {
   if (directory) workspaceRoots.delete(resolvePath(directory)); else workspaceRoots.clear();
   if (workspaceRoots.size > 0) return;
+  await closeHostBridges();
   if (server) { server.stop(true); server = null; proxyPort = null; }
   const manager = runtime?.manager;
   runtime = null;

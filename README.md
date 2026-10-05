@@ -5,6 +5,9 @@ An OpenCode V2 provider plugin for Google's official Antigravity ACP server.
 ```text
 OpenCode → loopback Anthropic Messages proxy → ACP JSON-RPC client →
 agy_acp_server.par
+
+Antigravity tool call → session-bound MCP bridge → OpenCode tool + permissions
+                     ← tool result             ←
 ```
 
 ## Requirements
@@ -64,6 +67,38 @@ server; `OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD` remains an optional override.
 
 ## Configuration
 
+### OpenCode tools and permissions
+
+Tool definitions from each OpenCode request are exposed to Antigravity through
+a local MCP bridge. Antigravity's call is returned as an Anthropic `tool_use`;
+OpenCode evaluates permissions and executes its own tool. The resulting
+`tool_result` completes the pending MCP call, continuing the same ACP turn.
+
+Shell, skill loading, subagents, questions, and installed plugin/MCP tools use
+their actual OpenCode implementations. Global, agent, and session permission
+rules—including `ask`, `deny`, and command/path-specific rules—remain owned by
+OpenCode. Subagents create real OpenCode child sessions with their configured
+agents and models. Tools are not approximated with Antigravity equivalents.
+
+The bridge disables ACP built-in tools and direct filesystem/terminal callbacks.
+Workers use a private Gemini home and empty ACP workspace under
+`host-acp/<scope>/`, carrying only authentication settings and credential files
+(private permissions on POSIX). Global Antigravity MCP servers, hooks and skills
+are not imported; host tools execute in the actual OpenCode workspace. Google
+credentials are never exposed through MCP. This mode requires official ACP
+1.3.0 or a compatible implementation of its tool-filter extension.
+
+Host system instructions are forwarded in a dedicated instruction block on each
+new user turn, outside the bounded history budget. Instruction changes and user
+steering during tool execution accompany the next completed tool-result group.
+ACP still receives user content, not a native system-role override.
+
+Parallel calls can share a host step. Partial results are retained until all
+calls in that step have results. Cancelling the OpenCode session interrupts its
+ACP turn and invalidates its MCP endpoint. A lost/restarted bridge rejects orphan
+tool results instead of re-executing tools. Tool selection currently supports
+`auto`; forced/required tool choices are rejected explicitly.
+
 ### Dynamic model catalog
 
 The picker uses the official ACP server's `session/new` and `session/load`
@@ -101,7 +136,7 @@ filenames use an account/configuration digest, not stored login credentials.
 | `OPENCODE_ANTIGRAVITY_ACP_PATH` | ACP server executable path |
 | `OPENCODE_ANTIGRAVITY_ACP_ARGS` | JSON array of ACP server arguments |
 | `OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD` | ACP authentication method |
-| `OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow-always\|allow-once\|deny` | Automatic ACP permission response; default `allow-always` |
+| `OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow-always\|allow-once\|deny` | Legacy direct-worker policy; provider tools always use OpenCode permissions |
 | `OPENCODE_ANTIGRAVITY_MODE=plan\|accept-edits` | ACP session mode when advertised |
 | `OPENCODE_ANTIGRAVITY_PROXY_PORT` | Loopback proxy port; default ephemeral |
 | `OPENCODE_ANTIGRAVITY_DATA_DIR` | Session metadata and request replay directory |
@@ -113,6 +148,7 @@ filenames use an account/configuration digest, not stored login credentials.
 | `OPENCODE_ANTIGRAVITY_TURN_STALL_MS` | Idle timeout after the last ACP session update |
 | `OPENCODE_ANTIGRAVITY_PRINT_TIMEOUT_MS` | Setup/request timeout, not a streamed-turn limit |
 | `OPENCODE_ANTIGRAVITY_IDLE_WORKER_MS` | Idle session cleanup interval |
+| `OPENCODE_ANTIGRAVITY_HOST_IDLE_MS` | Parked MCP bridge lifetime without a host continuation; default 2 hours |
 | `OPENCODE_ANTIGRAVITY_MAX_SESSIONS` | Maximum concurrent ACP sessions |
 | `OPENCODE_ANTIGRAVITY_MAX_QUEUE` | Maximum queued turns per session |
 | `OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS` | Maximum host conversation history size |
@@ -122,6 +158,8 @@ Active turns do not have a default wall-clock limit. They time out only after
 `OPENCODE_ANTIGRAVITY_TURN_STALL_MS` has elapsed since the last ACP `session/update`.
 `OPENCODE_ANTIGRAVITY_PRINT_TIMEOUT_MS` covers setup RPCs and does not cut off an
 actively streaming turn.
+While waiting for OpenCode tool results or approval, the ACP stall watchdog is
+paused. The bridge lifetime above still applies.
 
 Code that creates an ACP worker may set `onActivity?: () => void` in
 `AcpWorkerOptions`. The callback runs for each accepted ACP `session/update`
@@ -135,13 +173,10 @@ ACP text, image, and audio blocks are supported. Images and audio may be sent
 as base64 data URLs or local files inside the configured workspace. Remote URLs,
 PDFs, and video are rejected.
 
-The provider reports native ACP image/audio input capability. Antigravity tool
-activity is streamed as reasoning/status content because OpenCode's ordinary
-provider tool loop is separate from the ACP agent tool loop.
-
-Filesystem requests are restricted to the configured workspace. Terminal
-requests use sanitized environment variables and are controlled by the ACP
-permission policy. The adapter is not an operating-system sandbox.
+The provider reports ACP image/audio input capability and OpenCode tool support.
+Tool results preserve text, error status, and base64 images. Other tool-result
+media types are rejected explicitly. Tool calls and their results appear in
+OpenCode's normal tool UI; ACP progress may also appear as status content.
 
 ## Sessions and retries
 
@@ -173,6 +208,10 @@ for those requests.
 - `GET /v1/models`;
 - `GET /v1/usage`;
 - `POST /v1/messages`.
+
+The private `/mcp/<session-token>/<catalog-hash>` endpoint serves Streamable HTTP
+MCP for ACP. Tokens are random, session-bound, and revoked on bridge shutdown;
+the fixed proxy marker cannot authorize an MCP call.
 
 Requests require the loopback marker `x-api-key: opencode-antigravity-local`.
 

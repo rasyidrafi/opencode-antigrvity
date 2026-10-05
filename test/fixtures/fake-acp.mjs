@@ -8,6 +8,7 @@ let sessionId = "fake-acp-session-1";
 const stateFile = process.env.FAKE_ACP_STATE_FILE;
 let remembered = stateFile && fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf8")).remembered ?? "" : "";
 let activePrompt;
+let mcpServers = [];
 const pending = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -47,6 +48,23 @@ async function handlePrompt(message) {
   const text = textFromPrompt(message.params?.prompt);
   if (process.env.FAKE_ACP_PROMPT_LOG) fs.appendFileSync(process.env.FAKE_ACP_PROMPT_LOG, JSON.stringify({ text }) + "\n");
   activePrompt = { id, cancelled: false };
+  if (text.includes("FAKE_MCP")) {
+    const url = mcpServers[0]?.url;
+    if (!url) { fail(id, -32603, "Missing MCP bridge"); return; }
+    const rpc = async (method, params = {}) => (await (await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: nextRequestId++, method, params }) })).json());
+    await rpc("initialize", { protocolVersion: "2025-03-26" });
+    const list = await rpc("tools/list");
+    const name = list.result.tools[0].name;
+    const count = text.includes("FAKE_MCP_PARALLEL") ? 2 : 1;
+    const results = await Promise.all(Array.from({ length: count }, (_, index) => rpc("tools/call", { name, arguments: { index } })));
+    update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(results.map((r) => r.result ?? r.error)) } });
+    if (text.includes("FAKE_MCP_SEQUENCE")) {
+      const second = await rpc("tools/call", { name, arguments: { index: 2 } });
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(second) } });
+    }
+    respond(id, { stopReason: "end_turn" }); activePrompt = undefined; return;
+  }
   if (text.includes("FAKE_HANG")) return;
   if (text.includes("FAKE_EXIT")) process.exit(1);
   if (text.includes("FAKE_AUTH_ERROR")) {
@@ -135,6 +153,7 @@ input.on("line", (line) => {
   } else if (message?.method === "authenticate") {
     respond(message.id, {});
   } else if (message?.method === "session/new") {
+    mcpServers = message.params.mcpServers;
     if (!Array.isArray(message.params?.mcpServers)) {
       fail(message.id, -32602, "mcpServers is required");
       return;
@@ -153,6 +172,7 @@ input.on("line", (line) => {
       ],
     });
   } else if (message?.method === "session/load") {
+    mcpServers = message.params.mcpServers;
     sessionId = String(message.params?.sessionId ?? sessionId);
     respond(message.id, { configOptions: [] });
   } else if (message?.method === "session/set_config_option") {

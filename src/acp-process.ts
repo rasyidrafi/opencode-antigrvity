@@ -23,6 +23,7 @@ import { debug, info, warn } from "./log.js";
 import type { AcpEvent } from "./protocol.js";
 import { catalogFromSession, type AcpModelCatalog } from "./models.js";
 import { emitAcpCatalog } from "./catalog-events.js";
+import { hostEnvironment } from "./host-environment.js";
 export type { AcpEvent } from "./protocol.js";
 
 export type AcpWorkerState = "created" | "starting" | "ready" | "turn_active" | "closing" | "closed" | "failed";
@@ -45,6 +46,9 @@ export type AcpWorkerOptions = {
   printTimeoutMs?: number;
   stallTimeoutMs?: number;
   onActivity?: () => void;
+  hostTools?: boolean;
+  mcpServers?: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;
+  waitingForTools?: () => boolean;
 };
 
 type QueueWaiter<T> = {
@@ -53,7 +57,7 @@ type QueueWaiter<T> = {
   abort?: () => void;
 };
 
-class AsyncEventQueue<T> {
+export class AsyncEventQueue<T> {
   private values: T[] = [];
   private waiters: QueueWaiter<T>[] = [];
   private closed = false;
@@ -118,7 +122,7 @@ type TurnActivityWatchdog = {
   lastActivityAt: () => number;
 };
 
-function createTurnActivityWatchdog(timeoutMs: number, onTimeout: () => void): TurnActivityWatchdog {
+function createTurnActivityWatchdog(timeoutMs: number, onTimeout: () => void, paused?: () => boolean): TurnActivityWatchdog {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
   let fired = false;
@@ -131,6 +135,7 @@ function createTurnActivityWatchdog(timeoutMs: number, onTimeout: () => void): T
     timer = setTimeout(() => {
       timer = undefined;
       if (stopped || fired) return;
+      if (paused?.()) { lastActivity = performance.now(); schedule(); return; }
       if (performance.now() - lastActivity >= timeoutMs) {
         fired = true;
         onTimeout();
@@ -292,11 +297,11 @@ export class AcpWorker {
       const agent = this.connection.agent;
       const init = await this.withSignal(agent.request(methods.agent.initialize, {
         protocolVersion: 1,
-        clientCapabilities: {
+        clientCapabilities: this.options.hostTools ? {} : {
           fs: { readTextFile: true, writeTextFile: true },
           terminal: true,
         },
-        clientInfo: { name: "opencode-antigravity", version: "0.3.0" },
+        clientInfo: { name: "opencode-antigravity", version: "0.4.0" },
       }), signal);
       this.initValue = init;
       const authMethod = this.options.authMethod?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();
@@ -330,7 +335,8 @@ export class AcpWorker {
   private async openSession(agent: ClientConnection["agent"], signal?: AbortSignal): Promise<void> {
     const request = {
       cwd: this.options.cwd,
-      mcpServers: [],
+      mcpServers: this.options.mcpServers ?? [],
+      ...(this.options.hostTools ? { _meta: { agy: { enabledTools: [] } } } : {}),
       ...(this.options.addDirs?.length ? { additionalDirectories: this.options.addDirs } : {}),
     };
     if (this.options.sessionId && this.initValue?.agentCapabilities?.loadSession === true) {
@@ -453,7 +459,7 @@ export class AcpWorker {
         // `next()` for the abort signal to reject. Stop the worker here too
         // so an abandoned stream cannot leave an ACP process running.
         void this.stop(true).catch(() => undefined);
-      });
+      }, this.options.waitingForTools);
       this.turnWatchdog = turnWatchdog;
       requestPromise = this.connection!.agent.request(methods.agent.session.prompt, {
         sessionId: this.sessionIdValue,
@@ -578,6 +584,16 @@ export class AcpWorker {
   }
 
   private async requestPermission(params: import("@agentclientprotocol/sdk").RequestPermissionRequest): Promise<import("@agentclientprotocol/sdk").RequestPermissionResponse> {
+    if (this.options.hostTools) {
+      const meta = (params.toolCall as { _meta?: { mcp?: { server?: string } } })._meta;
+      // Malformed MCP envelopes have no parsed _meta yet. Let the MCP
+      // dispatcher report argument errors so the model can correct them.
+      // The isolated harness contains only our session-bound MCP endpoint.
+      const dispatcher = params.toolCall.title === "Run call_mcp_tool?";
+      const allowed = (meta?.mcp?.server === "opencode" || dispatcher) && Boolean(this.options.mcpServers?.length);
+      const option = params.options.find((item) => item.kind === (allowed ? "allow_once" : "reject_once"));
+      return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : { outcome: { outcome: "cancelled" } };
+    }
     const policy = this.options.permissionPolicy ?? (process.env.OPENCODE_ANTIGRAVITY_ACP_PERMISSION ?? "allow-always");
     if (policy === "deny") {
       const option = params.options.find((candidate) => candidate.kind === "reject_once" || candidate.kind === "reject_always");
@@ -591,6 +607,7 @@ export class AcpWorker {
   }
 
   private async readTextFile(params: import("@agentclientprotocol/sdk").ReadTextFileRequest): Promise<import("@agentclientprotocol/sdk").ReadTextFileResponse> {
+    if (this.options.hostTools) throw new AgyError("unsupported", "File access must use OpenCode tools");
     const path = await this.allowedPath(params.path, false);
     const content = await readFile(path, "utf8");
     const lines = content.split(/\r?\n/);
@@ -600,6 +617,7 @@ export class AcpWorker {
   }
 
   private async writeTextFile(params: import("@agentclientprotocol/sdk").WriteTextFileRequest): Promise<import("@agentclientprotocol/sdk").WriteTextFileResponse> {
+    if (this.options.hostTools) throw new AgyError("unsupported", "File access must use OpenCode tools");
     const path = await this.allowedPath(params.path, true);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, params.content, { encoding: "utf8", mode: 0o600 });
@@ -629,6 +647,7 @@ export class AcpWorker {
   }
 
   private async createTerminal(params: import("@agentclientprotocol/sdk").CreateTerminalRequest): Promise<import("@agentclientprotocol/sdk").CreateTerminalResponse> {
+    if (this.options.hostTools) throw new AgyError("unsupported", "Terminal access must use OpenCode tools");
     const cwd = await this.allowedPath(params.cwd ?? this.options.cwd, false);
     const child = spawn(params.command, params.args ?? [], {
       cwd,
@@ -740,6 +759,10 @@ export class AcpWorker {
 }
 
 export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortSignal): Promise<AcpWorker> {
+  if (options.hostTools) {
+    const isolated = await hostEnvironment({ ...process.env, ...options.environment }, options.catalogScope);
+    options = { ...options, ...isolated };
+  }
   await bridgeCliAuthentication({
     ...process.env,
     ...options.environment,

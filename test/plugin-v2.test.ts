@@ -113,7 +113,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   });
   const flash = provider.models.find((model: { id: string }) => model.id === "gemini-3.8-flash");
   expect(flash.variants.map((variant: { id: string }) => variant.id)).toEqual(["high", "medium", "low"]);
-  expect(flash.capabilities.tools).toBe(false);
+  expect(flash.capabilities.tools).toBe(true);
   expect(flash.limit).toEqual({ context: 1_048_576, output: 65_536 });
 
   expect(methods.some((method) => method.integrationID === PROVIDER_ID && method.method.type === "key")).toBe(true);

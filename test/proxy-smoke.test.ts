@@ -69,10 +69,10 @@ describe("loopback Anthropic proxy", () => {
     expect((await rejected.json()).error.message).toContain("outside");
   });
 
-  test("accepts Anthropic image blocks and ignores host tools", async () => {
+  test("accepts Anthropic image blocks with host tools", async () => {
     const response = await fetch(getProxyBaseUrl() + "/messages", {
       method: "POST",
-      headers: authHeaders,
+      headers: { ...authHeaders, [SESSION_HEADER]: "image-with-tools" },
       body: JSON.stringify(message([{ type: "text", text: "x" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }], { tools: [{ name: "host_tool", input_schema: { type: "object" } }], tool_choice: { type: "auto" } })),
     });
     expect(response.status).toBe(200);

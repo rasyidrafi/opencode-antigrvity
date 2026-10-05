@@ -44,6 +44,7 @@ export async function catalogContext(): Promise<CatalogContext> {
 async function probe(context: CatalogContext, directory: string, signal: AbortSignal): Promise<AcpModelCatalog> {
   const worker = await createAcpWorker({
     cwd: directory, executable: context.executable, executableArgs: context.args, nonInteractive: true,
+    hostTools: true, catalogScope: undefined,
     // Discovery does not select a model and never sends an inference prompt.
   }, signal);
   try {

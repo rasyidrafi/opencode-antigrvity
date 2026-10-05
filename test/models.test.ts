@@ -31,7 +31,7 @@ describe("ACP model catalog", () => {
     const flash = models.find((model) => model.id === "gemini-3.8-flash")!;
     expect(flash.limit).toEqual({ context: 1_048_576, output: 65_536 });
     expect(flash.variants.map((variant) => variant.id)).toEqual(["high", "medium", "low"]);
-    expect(flash.capabilities).toEqual({ tools: false, input: ["text", "image", "audio"], output: ["text"] });
+    expect(flash.capabilities).toEqual({ tools: true, input: ["text", "image", "audio"], output: ["text"] });
     expect(flash.status).toBe("active");
     expect(researchedMetadataFor({ id: "gpt-oss-120b-medium", name: "GPT-OSS", acpModel: "gpt-oss-120b-medium", family: "gpt-oss-120b", effort: "medium" })?.output).toBe(32_768);
   });

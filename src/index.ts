@@ -17,6 +17,7 @@ import { refreshModelMetadata, researchedMetadataFor } from "./model-metadata.js
 import { fallbackAcpModelCatalog, type AcpModel, type AcpModelCatalog } from "./models.js";
 import { getProxyBaseUrl, getProxyRuntime, onModelCatalogChange, startProxy, stopProxy } from "./proxy.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
+import { closeHostBridges } from "./host-tools.js";
 
 export const PLUGIN_ID = "opencode-antigravity";
 export const INTEGRATION_ID = PROVIDER_ID;
@@ -61,7 +62,7 @@ function providerModel(model: AcpModel): Model.Info {
     name: metadata ? model.name : `${model.name} (limits estimated)`,
     ...(model.family ? { family: Model.Family.make(model.family) } : {}),
     capabilities: {
-      tools: false,
+      tools: true,
       input: ["text", "image", "audio"],
       output: ["text"],
     },
@@ -140,6 +141,7 @@ export const AntigravityCliPlugin = Plugin.define({
     let unsubscribe: (() => void) | undefined;
     let disposed = false;
     let metadataTimer: ReturnType<typeof setInterval> | undefined;
+    const events = new AbortController();
 
     try {
       await workspaces.add(ctx.location.directory);
@@ -200,6 +202,14 @@ export const AntigravityCliPlugin = Plugin.define({
       refreshMetadata();
       metadataTimer = setInterval(refreshMetadata, 24 * 60 * 60_000);
       metadataTimer.unref?.();
+      void (async () => {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: events.signal })) {
+            const e = event as { type?: string; data?: { sessionID?: string } };
+            if ((e.type === "session.execution.interrupted" || e.type === "session.execution.failed") && e.data?.sessionID) await closeHostBridges(e.data.sessionID);
+          }
+        } catch { /* Cleanup aborts the event subscription. */ }
+      })();
 
       for (const kind of ["context", "compaction", "generate", "title"] as const) {
         await ctx.session.hook(kind, stripAcpOwnedOptions, { providerID: PROVIDER_ID });
@@ -221,6 +231,7 @@ export const AntigravityCliPlugin = Plugin.define({
           else delete event.headers[EFFORT_HEADER];
           event.headers[DIRECTORY_HEADER] = directory;
           event.headers[SESSION_HEADER] = event.sessionID;
+          event.headers["x-opencode-antigravity-host-tools"] = "1";
           event.headers[REQUEST_KIND_HEADER] = requestKind(event.kind);
           // V2's model.request event has no messageID. The proxy uses its stable
           // request-content hash for replay protection when this header is absent.
@@ -229,9 +240,10 @@ export const AntigravityCliPlugin = Plugin.define({
         { providerID: PROVIDER_ID },
       );
 
-      return () => { disposed = true; clearInterval(metadataTimer); unsubscribe?.(); return workspaces.cleanup(); };
+      return () => { disposed = true; events.abort(); clearInterval(metadataTimer); unsubscribe?.(); return workspaces.cleanup(); };
     } catch (error) {
       disposed = true;
+      events.abort();
       clearInterval(metadataTimer);
       unsubscribe?.();
       try {
