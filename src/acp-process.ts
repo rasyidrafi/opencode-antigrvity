@@ -21,6 +21,8 @@ import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { bridgeCliAuthentication } from "./auth-bridge.js";
 import { debug, info, warn } from "./log.js";
 import type { AcpEvent } from "./protocol.js";
+import { catalogFromSession, type AcpModelCatalog } from "./models.js";
+import { emitAcpCatalog } from "./catalog-events.js";
 export type { AcpEvent } from "./protocol.js";
 
 export type AcpWorkerState = "created" | "starting" | "ready" | "turn_active" | "closing" | "closed" | "failed";
@@ -37,6 +39,8 @@ export type AcpWorkerOptions = {
   mode?: "accept-edits" | "plan";
   authMethod?: string;
   skipSession?: boolean;
+  nonInteractive?: boolean;
+  catalogScope?: string;
   permissionPolicy?: "allow-always" | "allow-once" | "deny";
   printTimeoutMs?: number;
   stallTimeoutMs?: number;
@@ -237,6 +241,14 @@ export class AcpWorker {
   get resumed(): boolean { return this.resumedValue; }
   get sessionId(): string | undefined { return this.sessionIdValue; }
   get init(): InitializeResponse | null { return this.initValue; }
+  catalog: AcpModelCatalog | undefined;
+
+  private recordModels(response: unknown): void {
+    const catalog = catalogFromSession(response, this.executable, this.initValue?.agentInfo?.version ?? null);
+    if (!catalog) return;
+    this.catalog = catalog;
+    emitAcpCatalog(this.options.catalogScope, catalog);
+  }
 
   async start(signal?: AbortSignal): Promise<void> {
     if (this.stateValue === "ready") return;
@@ -284,11 +296,11 @@ export class AcpWorker {
           fs: { readTextFile: true, writeTextFile: true },
           terminal: true,
         },
-        clientInfo: { name: "opencode-antigravity", version: "0.2.2" },
+        clientInfo: { name: "opencode-antigravity", version: "0.3.0" },
       }), signal);
       this.initValue = init;
       const authMethod = this.options.authMethod?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();
-      if (authMethod) {
+      if (authMethod && !this.options.nonInteractive) {
         const advertised = init.authMethods?.find((method) => method.id === authMethod);
         if (!advertised) throw new AgyError("auth", `The ACP server did not advertise authentication method "${authMethod}"`, { code: "agy_acp_auth_method" });
         if ((advertised as { type?: unknown }).type === "terminal") throw new AgyError("unsupported", `Authentication method "${authMethod}" requires a terminal ACP flow`, { code: "agy_acp_terminal_auth" });
@@ -299,7 +311,7 @@ export class AcpWorker {
           await this.openSession(agent, signal);
         } catch (error) {
           const explicitMethod = this.options.authMethod?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();
-          if (explicitMethod || !isAuthenticationRequired(error)) throw error;
+          if (explicitMethod || this.options.nonInteractive || !isAuthenticationRequired(error)) throw error;
           const method = init.authMethods?.find((entry) => entry.id === "oauth-personal") ?? init.authMethods?.find((entry) => (entry as { type?: unknown }).type !== "terminal");
           if (!method) throw error;
           await this.withSignal(agent.request(methods.agent.authenticate, { methodId: method.id }), signal);
@@ -324,6 +336,7 @@ export class AcpWorker {
     if (this.options.sessionId && this.initValue?.agentCapabilities?.loadSession === true) {
       try {
         const loaded = await this.withSignal(agent.request(methods.agent.session.load, { sessionId: this.options.sessionId, ...request }), signal) as { configOptions?: unknown; modes?: unknown } | void;
+        this.recordModels(loaded);
         this.sessionIdValue = this.options.sessionId;
         this.resumedValue = true;
         await this.configureSession(agent, loaded && typeof loaded === "object" ? loaded.configOptions : undefined, loaded && typeof loaded === "object" ? loaded.modes : undefined, signal);
@@ -334,6 +347,7 @@ export class AcpWorker {
       }
     }
     const created = await this.withSignal(agent.request(methods.agent.session.new, request), signal) as { sessionId: string; configOptions?: unknown; modes?: unknown };
+    this.recordModels(created);
     this.sessionIdValue = created.sessionId;
     this.resumedValue = false;
     await this.configureSession(agent, created.configOptions, created.modes, signal);
@@ -349,8 +363,12 @@ export class AcpWorker {
         await this.withSignal(agent.request(methods.agent.session.setMode, { sessionId: this.sessionIdValue, modeId: String(mode.id) }), signal);
       }
     }
+    const hasModelSelector = Array.isArray(configOptions) && configOptions.some((option) => option?.category === "model" || option?.id === "model");
+    if (this.options.model && this.catalog && !hasModelSelector && this.options.model !== this.catalog.currentModel) {
+      throw new AgyError("unsupported", "This ACP server lists models but does not expose session model configuration", { code: "agy_acp_model_selection" });
+    }
     if (!Array.isArray(configOptions)) return;
-    const options = configOptions as Array<{ id?: unknown; options?: Array<{ value?: unknown }>; currentValue?: unknown }>;
+    const options = configOptions as Array<{ id?: unknown; category?: unknown; options?: Array<{ value?: unknown }>; currentValue?: unknown }>;
     const desired: Array<{ ids: string[]; value: string | undefined }> = [
       { ids: ["model"], value: this.options.model },
       { ids: ["effort", "thought_level", "reasoning_effort"], value: this.options.effort },
@@ -358,12 +376,12 @@ export class AcpWorker {
     ];
     for (const item of desired) {
       if (!item.value) continue;
-      const option = options.find((candidate) => item.ids.includes(String(candidate.id)));
+      const option = options.find((candidate) => item.ids.includes(String(candidate.id)) || item.ids[0] === "model" && candidate.category === "model");
       if (!option) continue;
-      const values = Array.isArray(option.options) ? option.options.map((entry) => String(entry.value)) : [];
-      const baseValue = item.value.replace(/-(?:low|medium|high|thinking)$/i, "");
+      const values = item.ids[0] === "model" && this.catalog ? this.catalog.exactModels.map((model) => model.id)
+        : Array.isArray(option.options) ? option.options.map((entry) => String(entry.value)) : [];
       const value = values.length
-        ? values.find((entry) => entry === item.value || entry === baseValue || entry.toLowerCase() === item.value!.toLowerCase() || entry.toLowerCase() === baseValue.toLowerCase())
+        ? values.find((entry) => entry === item.value)
         : item.value;
       if (!value || (values.length > 0 && !values.includes(value))) {
         throw new AgyError("unknown_model", `The ACP session does not support the requested ${String(option.id)} value`, {
@@ -371,15 +389,19 @@ export class AcpWorker {
           details: { configId: String(option.id), available: values },
         });
       }
-      await this.withSignal(agent.request(methods.agent.session.setConfigOption, {
+      const updated = await this.withSignal(agent.request(methods.agent.session.setConfigOption, {
         sessionId: this.sessionIdValue,
         configId: String(option.id),
         value,
       }), signal);
+      this.recordModels(updated);
     }
   }
 
   private onSessionUpdate(params: SessionNotification): void {
+    if (params.sessionId === this.sessionIdValue && params.update.sessionUpdate === "config_option_update") {
+      this.recordModels(params.update);
+    }
     if (!this.sessionIdValue || params.sessionId !== this.sessionIdValue || !this.turnEvents) return;
     // A turn may legitimately run for longer than the setup/RPC timeout. Only
     // reset the turn watchdog when the ACP transport actually delivers an

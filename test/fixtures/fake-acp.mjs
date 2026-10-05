@@ -106,6 +106,12 @@ async function handlePrompt(message) {
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: response.slice(0, -1) } });
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
   update({ sessionUpdate: "usage_update", used: 12, size: 1000 });
+  if (text.includes("FAKE_CATALOG_UPDATE")) {
+    update({ sessionUpdate: "config_option_update", configOptions: [{
+      id: "model", category: "model", type: "select", name: "Model", currentValue: "new-server-model",
+      options: [{ value: "new-server-model", name: "Server-added model" }],
+    }] });
+  }
   respond(id, { stopReason: text.includes("FAKE_MAX_TOKENS") ? "max_tokens" : text.includes("FAKE_MAX_TURNS") ? "max_turn_requests" : "end_turn", usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, thoughtTokens: 0 } });
   activePrompt = undefined;
 }
@@ -137,7 +143,12 @@ input.on("line", (line) => {
     respond(message.id, {
       sessionId,
       configOptions: [
-        { id: "model", name: "Model", type: "select", currentValue: "gemini-3.8-flash-high", options: [{ value: "gemini-3.8-flash-high", name: "Fake Gemini" }, { value: "fake-model-low", name: "Fake Model" }] },
+        { id: "model", category: "model", name: "Model", type: "select", currentValue: "gemini-3.8-flash-high", options: [
+          { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+          { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+          { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
+          { value: "fake-model-low", name: "Fake Model" },
+        ] },
         { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }, { value: "plan", name: "Plan" }, { value: "default", name: "Default" }] },
       ],
     });

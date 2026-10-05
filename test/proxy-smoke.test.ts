@@ -137,7 +137,8 @@ describe("loopback Anthropic proxy", () => {
       },
       body: JSON.stringify(message(text)),
     });
-    const sessionKey = (sessionID: string) => createHash("sha256")
+    const { getProxyRuntime } = await import("../src/proxy.js");
+    const sessionKey = (sessionID: string) => `${getProxyRuntime()!.manager.scope}:` + createHash("sha256")
       .update(`workspace:${process.cwd()}:session:${sessionID}`)
       .digest("hex");
 
@@ -163,4 +164,19 @@ describe("loopback Anthropic proxy", () => {
     expect((await sessionPool.status(sessionKey(primarySession))).hasSession).toBe(true);
   });
 
+  test("session config updates change picker inventory and request validation together", async () => {
+    const { refreshModels, onModelCatalogChange } = await import("../src/proxy.js");
+    let changes = 0;
+    const unsubscribe = onModelCatalogChange(() => { changes++; });
+    try {
+      const updated = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: authHeaders, body: JSON.stringify(message("FAKE_CATALOG_UPDATE")) });
+      expect(updated.status).toBe(200);
+      await updated.text();
+      const catalog = await (await fetch(getProxyBaseUrl() + "/models", { headers: authHeaders })).json();
+      expect(catalog.data.map((model: any) => model.id)).toEqual(["new-server-model"]);
+      expect(changes).toBeGreaterThan(0);
+      const unavailable = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: authHeaders, body: JSON.stringify(message("old model")) });
+      expect(unavailable.status).toBe(400);
+    } finally { unsubscribe(); await refreshModels(); }
+  });
 });

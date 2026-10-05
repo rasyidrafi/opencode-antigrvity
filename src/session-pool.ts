@@ -26,6 +26,7 @@ export type SessionSettings = {
   mode?: "accept-edits" | "plan";
   cliVersion?: string | null;
   executable?: string;
+  catalogScope?: string;
 };
 
 export type SessionTurnRequest = {
@@ -54,6 +55,7 @@ function settingsSignature(settings: SessionSettings): string {
     model: settings.model,
     effort: settings.effort ?? null,
     mode: settings.mode ?? null,
+    catalogScope: settings.catalogScope,
   });
 }
 
@@ -94,6 +96,7 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
   return {
     cwd: settings.cwd,
     executable: settings.executable,
+    catalogScope: settings.catalogScope,
     model: settings.model,
     effort: settings.effort,
     sessionId,

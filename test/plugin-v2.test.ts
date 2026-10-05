@@ -13,13 +13,15 @@ import {
   REQUEST_KIND_HEADER,
   SESSION_HEADER,
 } from "../src/constants.js";
-import { getProxyPort } from "../src/proxy.js";
+import { getProxyPort, getProxyRuntime } from "../src/proxy.js";
+import { emitAcpCatalog } from "../src/catalog-events.js";
+import { acpModelCatalog } from "../src/models.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const temporaryDirectories: string[] = [];
 const cleanupTasks: Array<() => Promise<void>> = [];
 const savedEnvironment = new Map<string, string | undefined>();
-const environmentKeys = ["OPENCODE_ANTIGRAVITY_ACP_PATH", "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME"];
+const environmentKeys = ["OPENCODE_ANTIGRAVITY_ACP_PATH", "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV"];
 
 afterEach(async () => {
   await Promise.all(cleanupTasks.splice(0).map((cleanup) => cleanup()));
@@ -47,9 +49,11 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
   process.env.GEMINI_HOME = geminiHome;
+  process.env.OPENCODE_ANTIGRAVITY_MODELS_DEV = "0";
   await chmod(fixture, 0o755);
 
   const providers: any[] = [];
+  let providerTransform: ((editor: any) => void) | undefined;
   const methods: any[] = [];
   const savedMarkers: any[] = [];
   let marker: any;
@@ -73,7 +77,9 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
       },
     },
     provider: {
+      reload: async () => { providerTransform?.({ add: (input: any) => providers.push(input) }); },
       transform: async (callback: (editor: any) => void) => {
+        providerTransform = callback;
         callback({ add: (input: any) => providers.push(input) });
         return { dispose: async () => undefined };
       },
@@ -174,6 +180,11 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   await Promise.all(["concurrent-session-a", "concurrent-session-b"].map((sessionID) =>
     modelRequest.callback({ ...event, sessionID, headers: {} }),
   ));
+
+  const runtime = getProxyRuntime()!;
+  emitAcpCatalog(runtime.manager.scope, acpModelCatalog(fixture, "test", [["future-opaque", "Future model"]]));
+  expect(providers.at(-1).models.map((model: any) => model.id)).toEqual(["future-opaque"]);
+  expect(runtime.catalog.exactModels.map((model) => model.id)).toEqual(["future-opaque"]);
 
   await Promise.all([cleanup(), cleanup()]);
   cleanupTasks.pop();

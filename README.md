@@ -64,6 +64,38 @@ server; `OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD` remains an optional override.
 
 ## Configuration
 
+### Dynamic model catalog
+
+The picker uses the official ACP server's `session/new` and `session/load`
+model choices, preferring `configOptions` (`category: "model"`) over legacy
+`models.availableModels`. Discovery creates a session but sends no inference prompt
+and does not initiate an interactive sign-in.
+
+The plugin keeps exact ACP IDs for requests, including opaque IDs such as
+`gemini-pro-agent`. Only explicitly named, matching effort siblings are grouped
+into variants; unfamiliar models stay selectable under their original IDs.
+The picker and proxy validation are refreshed together on configuration updates.
+Background checks run once a minute, with fresh discovery at most once every
+10 minutes unless a refresh is explicitly requested. A failed refresh retains
+the last successful catalog for the same account, auth mode, client, and server
+installation. A first-time failure shows no fabricated model list.
+
+ACP may expose fewer models than `agy models`: availability can depend on the
+account, authentication method, and client surface. The plugin never adds models
+that are absent from ACP's advertised choices.
+
+Optional models.dev enrichment refreshes daily and supplies underlying-model
+token-limit estimates for known matches. It never determines availability,
+rewrites wire IDs, or imports direct-API prices as Antigravity subscription costs.
+Unmatched models are labelled **limits estimated** and use conservative defaults
+(32,768 context / 8,192 output). Bundled metadata is retained if enrichment is offline.
+Set `OPENCODE_ANTIGRAVITY_MODELS_DEV=0` to disable external metadata fetching.
+
+Catalog caches live under `model-catalogs/` in the plugin's data directory;
+filenames use an account/configuration digest, not stored login credentials.
+
+### Environment
+
 | Variable | Purpose |
 |---|---|
 | `OPENCODE_ANTIGRAVITY_ACP_PATH` | ACP server executable path |
@@ -73,6 +105,7 @@ server; `OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD` remains an optional override.
 | `OPENCODE_ANTIGRAVITY_MODE=plan\|accept-edits` | ACP session mode when advertised |
 | `OPENCODE_ANTIGRAVITY_PROXY_PORT` | Loopback proxy port; default ephemeral |
 | `OPENCODE_ANTIGRAVITY_DATA_DIR` | Session metadata and request replay directory |
+| `OPENCODE_ANTIGRAVITY_MODELS_DEV=0` | Disable optional models.dev metadata fetching |
 | `OPENCODE_ANTIGRAVITY_DEBUG=1` | Metadata-only debug logging |
 | `OPENCODE_ANTIGRAVITY_MAX_REQUEST_BYTES` | Maximum request size |
 | `OPENCODE_ANTIGRAVITY_REQUEST_READ_TIMEOUT_MS` | Timeout while reading an HTTP request |

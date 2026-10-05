@@ -12,10 +12,10 @@ import {
   SESSION_HEADER,
 } from "./constants.js";
 import { createAcpWorker } from "./acp-process.js";
-import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
-import { researchedMetadataFor } from "./model-metadata.js";
-import { acpModelCatalog, fallbackAcpModelCatalog, type AcpModel, type AcpModelCatalog } from "./models.js";
-import { getProxyBaseUrl, startProxy, stopProxy } from "./proxy.js";
+import { ensureAcpServer } from "./acp-detect.js";
+import { refreshModelMetadata, researchedMetadataFor } from "./model-metadata.js";
+import { fallbackAcpModelCatalog, type AcpModel, type AcpModelCatalog } from "./models.js";
+import { getProxyBaseUrl, getProxyRuntime, onModelCatalogChange, startProxy, stopProxy } from "./proxy.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
 
 export const PLUGIN_ID = "opencode-antigravity";
@@ -58,7 +58,7 @@ function providerModel(model: AcpModel): Model.Info {
   return {
     ...base,
     modelID: id,
-    name: model.name,
+    name: metadata ? model.name : `${model.name} (limits estimated)`,
     ...(model.family ? { family: Model.Family.make(model.family) } : {}),
     capabilities: {
       tools: false,
@@ -66,8 +66,8 @@ function providerModel(model: AcpModel): Model.Info {
       output: ["text"],
     },
     limit: {
-      context: metadata?.context ?? base.limit.context,
-      output: metadata?.output ?? base.limit.output,
+      context: metadata?.context ?? 32_768,
+      output: metadata?.output ?? 8_192,
     },
     variants: Object.keys(model.variants ?? {}).map((variant) => ({ id: Model.VariantID.make(variant) })),
   };
@@ -137,10 +137,12 @@ export const AntigravityCliPlugin = Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
     const workspaces = new WorkspaceRegistry(retainWorkspace, releaseWorkspace);
+    let unsubscribe: (() => void) | undefined;
+    let disposed = false;
+    let metadataTimer: ReturnType<typeof setInterval> | undefined;
 
     try {
       await workspaces.add(ctx.location.directory);
-      const catalog = await currentCatalog();
       const providerID = Provider.ID.make(PROVIDER_ID);
       const info: Provider.Info = {
         ...Provider.Info.empty(providerID),
@@ -191,8 +193,13 @@ export const AntigravityCliPlugin = Plugin.define({
       }
 
       await ctx.provider.transform((editor) => {
-        editor.add({ info, models: buildProviderModels(catalog) });
+        editor.add({ info, models: buildProviderModels(getProxyRuntime()?.catalog ?? fallbackAcpModelCatalog()) });
       });
+      unsubscribe = onModelCatalogChange(() => { void ctx.provider.reload().catch(() => undefined); });
+      const refreshMetadata = () => { void refreshModelMetadata().then(() => { if (!disposed) return ctx.provider.reload(); }).catch(() => undefined); };
+      refreshMetadata();
+      metadataTimer = setInterval(refreshMetadata, 24 * 60 * 60_000);
+      metadataTimer.unref?.();
 
       for (const kind of ["context", "compaction", "generate", "title"] as const) {
         await ctx.session.hook(kind, stripAcpOwnedOptions, { providerID: PROVIDER_ID });
@@ -222,8 +229,11 @@ export const AntigravityCliPlugin = Plugin.define({
         { providerID: PROVIDER_ID },
       );
 
-      return () => workspaces.cleanup();
+      return () => { disposed = true; clearInterval(metadataTimer); unsubscribe?.(); return workspaces.cleanup(); };
     } catch (error) {
+      disposed = true;
+      clearInterval(metadataTimer);
+      unsubscribe?.();
       try {
         await workspaces.cleanup();
       } catch (cleanupError) {
@@ -233,15 +243,6 @@ export const AntigravityCliPlugin = Plugin.define({
     }
   },
 });
-
-async function currentCatalog(): Promise<AcpModelCatalog> {
-  try {
-    const detection = await detectAcpServer();
-    return acpModelCatalog(detection.executable, null);
-  } catch {
-    return fallbackAcpModelCatalog();
-  }
-}
 
 export { acpModelCatalog, fallbackAcpModelCatalog } from "./models.js";
 export { detectAcpServer } from "./acp-detect.js";

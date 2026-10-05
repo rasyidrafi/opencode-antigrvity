@@ -15,10 +15,10 @@ import {
   SESSION_HEADER,
   envNumber,
 } from "./constants.js";
-import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { AgyError, AgyProtocolError, asAgyError, retryAfterSeconds } from "./errors.js";
 import { error as logError, info, warn } from "./log.js";
-import { acpModelCatalog, fallbackAcpModelCatalog, resolveAcpModelSelection, type AcpModelCatalog } from "./models.js";
+import { fallbackAcpModelCatalog, resolveAcpModelSelection, type AcpModelCatalog } from "./models.js";
+import { ModelCatalog } from "./model-catalog.js";
 import { normalizePrompt } from "./prompt.js";
 import { detectMetaRequestKind } from "./request-kind.js";
 import { buildGenerateUtilityPrompt, buildUtilityPrompt, runAcpOneShot, type OneShotResult } from "./utility.js";
@@ -54,7 +54,7 @@ export type AnthropicMessageRequest = {
 type RuntimeState = {
   directory: string;
   catalog: AcpModelCatalog;
-  startupError?: AgyError;
+  manager: ModelCatalog;
 };
 
 type ProbeResult = { replay: AsyncIterable<AcpEvent> } | { error: AgyError };
@@ -71,6 +71,12 @@ let proxyPort: number | null = null;
 let runtime: RuntimeState | null = null;
 let startPromise: Promise<number> | null = null;
 const workspaceRoots = new Set<string>();
+const catalogListeners = new Set<() => void>();
+
+export function onModelCatalogChange(listener: () => void): () => void {
+  catalogListeners.add(listener);
+  return () => { catalogListeners.delete(listener); };
+}
 
 function requestedPort(): number {
   const value = Number(process.env.OPENCODE_ANTIGRAVITY_PROXY_PORT);
@@ -336,20 +342,17 @@ function utilityStream(result: OneShotResult, model: string): Response {
 
 async function handleMessages(request: Request, body: AnthropicMessageRequest): Promise<Response> {
   if (!runtime) throw new AgyError("internal", "The Antigravity ACP proxy runtime is not initialized", { code: "agy_runtime_uninitialized" });
-  if (runtime.startupError) {
-    const detection = await ensureAcpServer();
-    runtime.catalog = acpModelCatalog(detection.executable);
-    delete runtime.startupError;
-  }
+  await runtime.manager.refresh();
+  if (runtime.catalog.source === "empty") throw runtime.manager.lastError ?? new AgyError("unknown_model", "Antigravity model discovery is unavailable");
   const cwd = resolvePath(readHeader(request, DIRECTORY_HEADER) || runtime.directory);
   if (!(await registeredWorkspaceContains(cwd))) throw new AgyError("unsupported", "The requested OpenCode workspace is outside the plugin workspace", { code: "agy_workspace_boundary" });
   const requestMessages = body.system === undefined ? body.messages : [{ role: "system", content: body.system }, ...(Array.isArray(body.messages) ? body.messages : [])];
-  const key = sessionKey(request, requestMessages, cwd);
+  const key = `${runtime.manager.scope}:${sessionKey(request, requestMessages, cwd)}`;
   const requestedModel = readHeader(request, MODEL_HEADER) || (typeof body.model === "string" ? body.model : undefined);
   const requestedEffort = readHeader(request, EFFORT_HEADER);
   const selected = resolveAcpModelSelection(requestedModel, requestedEffort, runtime.catalog);
   const mode: "accept-edits" | "plan" | undefined = process.env.OPENCODE_ANTIGRAVITY_MODE === "accept-edits" || process.env.OPENCODE_ANTIGRAVITY_MODE === "plan" ? process.env.OPENCODE_ANTIGRAVITY_MODE : undefined;
-  const settings = { cwd, model: selected.acpModel, ...(selected.effort ? { effort: selected.effort } : {}), ...(mode ? { mode } : {}), cliVersion: runtime.catalog.version, executable: runtime.catalog.executable } as const;
+  const settings = { cwd, model: selected.acpModel, ...(selected.effort ? { effort: selected.effort } : {}), ...(mode ? { mode } : {}), cliVersion: runtime.catalog.version, executable: runtime.catalog.executable, catalogScope: runtime.manager.scope } as const;
   const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd] });
   const metaKind = detectMetaRequestKind(normalized.messages, readHeader(request, REQUEST_KIND_HEADER));
   if (metaKind) {
@@ -381,7 +384,11 @@ async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const protectedRoute = (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models" || url.pathname === "/v1/usage" || url.pathname === "/usage")) || (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages"));
   if (protectedRoute && !localAuthorizationIsValid(request)) return errorResponse(new AgyError("auth", "Invalid local proxy API key", { code: "agy_local_key" }));
-  if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) return Response.json({ ok: !runtime?.startupError, provider: "antigravity-acp", proxy: "loopback", port: proxyPort, acp: { executable: runtime?.catalog.executable, version: runtime?.catalog.version, ready: !runtime?.startupError, ...(runtime?.startupError ? { error: runtime.startupError.message } : {}) } });
+  if (request.method === "GET" && (url.pathname === "/health" || url.pathname === "/v1/health")) {
+    const ready = Boolean(runtime && runtime.catalog.source !== "empty");
+    return Response.json({ ok: ready, provider: "antigravity-acp", proxy: "loopback", port: proxyPort,
+      acp: { executable: runtime?.catalog.executable, version: runtime?.catalog.version, ready, catalogSource: runtime?.catalog.source } });
+  }
   if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) return Response.json({ object: "list", data: (runtime?.catalog ?? fallbackAcpModelCatalog()).models.map((model) => ({ id: model.id, object: "model", created: Math.floor(Date.now() / 1_000), owned_by: "antigravity" })) });
   if (request.method === "GET" && (url.pathname === "/v1/usage" || url.pathname === "/usage")) return Response.json({ provider: "antigravity-acp", source: "acp", windows: {}, models: {} });
   if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
@@ -394,16 +401,14 @@ async function handleRequest(request: Request): Promise<Response> {
 async function startProxyInternal(directory: string): Promise<number> {
   if (server && proxyPort) return proxyPort;
   sessionPool.open();
-  let catalog: AcpModelCatalog;
-  let startupError: AgyError | undefined;
-  try { const detection = await detectAcpServer(); catalog = acpModelCatalog(detection.executable); }
-  catch (error) { startupError = asAgyError(error, "The official Antigravity ACP server is unavailable"); warn("starting proxy without a usable Antigravity ACP server", { kind: startupError.kind }); catalog = fallbackAcpModelCatalog(); }
-  runtime = { directory, catalog, ...(startupError ? { startupError } : {}) };
+  const manager = new ModelCatalog(directory, { onChange: () => { for (const listener of catalogListeners) listener(); } });
+  runtime = { directory, manager, get catalog() { return manager.catalog; } };
   const bound = Bun.serve({ hostname: "127.0.0.1", port: requestedPort(), idleTimeout: 0, fetch: handleRequest });
   server = bound;
   proxyPort = bound.port ?? null;
   if (!proxyPort) throw new AgyError("internal", "The loopback Antigravity ACP proxy did not receive a port", { code: "agy_proxy_no_port" });
-  info("Antigravity ACP loopback proxy listening", { port: proxyPort, models: catalog.models.length, ready: !startupError });
+  await manager.start();
+  info("Antigravity ACP loopback proxy listening", { port: proxyPort, models: manager.catalog.models.length, ready: manager.catalog.source !== "empty" });
   return proxyPort;
 }
 
@@ -418,7 +423,9 @@ export async function stopProxy(directory?: string): Promise<void> {
   if (directory) workspaceRoots.delete(resolvePath(directory)); else workspaceRoots.clear();
   if (workspaceRoots.size > 0) return;
   if (server) { server.stop(true); server = null; proxyPort = null; }
+  const manager = runtime?.manager;
   runtime = null;
+  await manager?.close();
   await sessionPool.close();
 }
 
@@ -426,8 +433,5 @@ export function getProxyPort(): number | null { return proxyPort; }
 export function getProxyBaseUrl(): string { if (!proxyPort) throw new AgyError("internal", "The Antigravity ACP proxy is not listening", { code: "agy_proxy_not_started" }); return `http://127.0.0.1:${proxyPort}/v1`; }
 export function getProxyRuntime(): RuntimeState | null { return runtime; }
 export async function refreshModels(): Promise<AcpModelCatalog> {
-  const detection = await detectAcpServer();
-  const catalog = acpModelCatalog(detection.executable);
-  if (runtime) runtime.catalog = catalog;
-  return catalog;
+  return runtime ? runtime.manager.refresh(true) : fallbackAcpModelCatalog();
 }
