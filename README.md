@@ -1,0 +1,182 @@
+# opencode-antigravity
+
+An OpenCode V2 provider plugin for Google's official Antigravity ACP server.
+
+```text
+OpenCode → loopback Anthropic Messages proxy → ACP JSON-RPC client →
+agy_acp_server.par
+```
+
+## Requirements
+
+- OpenCode V2 (tested against `2.0.22`);
+- Google's `agy_acp_server.par` and the accompanying `localharness_external`;
+- an authenticated ACP server session (or sign in through `/connect`).
+
+The official server is listed in the [ACP Registry](https://github.com/agentclientprotocol/registry/tree/main/antigravity-acp).
+
+## Install
+
+Download the ACP server archive for your platform. Keep these files together:
+
+```text
+agy_acp_server.par
+localharness_external
+```
+
+The server is discovered automatically from
+`$XDG_DATA_HOME/opencode-antigravity/acp-server-1.3.0/` (default:
+`~/.local/share/opencode-antigravity/acp-server-1.3.0/`) or from `PATH`. Keep
+the two official files together. Set the path explicitly when it is installed
+elsewhere:
+
+```sh
+export OPENCODE_ANTIGRAVITY_ACP_PATH=/absolute/path/to/agy_acp_server.par
+```
+
+On Linux the registry argument `--uid=` is supplied automatically. Custom
+arguments can be provided as JSON:
+
+```sh
+export OPENCODE_ANTIGRAVITY_ACP_ARGS='["--uid="]'
+```
+
+Register the V2 plugin in `~/.config/opencode/opencode.jsonc`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-antigravity"]
+}
+```
+
+Restart OpenCode after changing plugin configuration.
+
+## Authentication
+
+Run `/connect`, choose **Antigravity ACP**, then select one of the ACP server's
+authentication methods:
+
+- `oauth-personal`;
+- `oauth-business`;
+- `gemini-api-key`;
+- `agent-platform`.
+
+OpenCode links to the official ACP registry entry during the integration flow;
+the server handles the actual sign-in. Do not paste a Google credential into
+OpenCode.
+
+You can set a default method for the next ACP worker:
+
+```sh
+export OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD=oauth-personal
+```
+
+The plugin reuses the official CLI's existing OAuth login when it finds
+`~/.gemini/antigravity-cli/antigravity-oauth-token` (or the equivalent path
+under `GEMINI_HOME`). It seeds the ACP server's local credential file so the
+first OpenCode request does not start a second browser login. Credentials stay
+on the local machine and are not sent through the OpenCode proxy. The V2
+integration stores only a synthetic OAuth access marker (`opencode-antigravity-local`);
+Google credentials remain in the official ACP server's local auth store.
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `OPENCODE_ANTIGRAVITY_ACP_PATH` | ACP server executable path |
+| `OPENCODE_ANTIGRAVITY_ACP_ARGS` | JSON array of ACP server arguments |
+| `OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD` | ACP authentication method |
+| `OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow-always\|allow-once\|deny` | Automatic ACP permission response; default `allow-always` |
+| `OPENCODE_ANTIGRAVITY_MODE=plan\|accept-edits` | ACP session mode when advertised |
+| `OPENCODE_ANTIGRAVITY_PROXY_PORT` | Loopback proxy port; default ephemeral |
+| `OPENCODE_ANTIGRAVITY_DATA_DIR` | Session metadata and request replay directory |
+| `OPENCODE_ANTIGRAVITY_DEBUG=1` | Metadata-only debug logging |
+| `OPENCODE_ANTIGRAVITY_MAX_REQUEST_BYTES` | Maximum request size |
+| `OPENCODE_ANTIGRAVITY_REQUEST_READ_TIMEOUT_MS` | Timeout while reading an HTTP request |
+| `OPENCODE_ANTIGRAVITY_SSE_HEARTBEAT_MS` | Loopback SSE heartbeat interval |
+| `OPENCODE_ANTIGRAVITY_TURN_STALL_MS` | Idle timeout after the last ACP session update |
+| `OPENCODE_ANTIGRAVITY_PRINT_TIMEOUT_MS` | Setup/request timeout, not a streamed-turn limit |
+| `OPENCODE_ANTIGRAVITY_IDLE_WORKER_MS` | Idle session cleanup interval |
+| `OPENCODE_ANTIGRAVITY_MAX_SESSIONS` | Maximum concurrent ACP sessions |
+| `OPENCODE_ANTIGRAVITY_MAX_QUEUE` | Maximum queued turns per session |
+| `OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS` | Maximum host conversation history size |
+| `OPENCODE_ANTIGRAVITY_UTILITY_MAX_CHARS` | Maximum prompt size for utility requests |
+
+Active turns do not have a default wall-clock limit. They time out only after
+`OPENCODE_ANTIGRAVITY_TURN_STALL_MS` has elapsed since the last ACP `session/update`.
+`OPENCODE_ANTIGRAVITY_PRINT_TIMEOUT_MS` covers setup RPCs and does not cut off an
+actively streaming turn.
+
+Code that creates an ACP worker may set `onActivity?: () => void` in
+`AcpWorkerOptions`. The callback runs for each accepted ACP `session/update`
+during an active turn. It is a heartbeat signal, not a completion callback.
+Active turns use this idle timeout behavior rather than a wall-clock deadline,
+so a stream can run as long as it keeps sending updates.
+
+## Supported input
+
+ACP text, image, and audio blocks are supported. Images and audio may be sent
+as base64 data URLs or local files inside the configured workspace. Remote URLs,
+PDFs, and video are rejected.
+
+The provider reports native ACP image/audio input capability. Antigravity tool
+activity is streamed as reasoning/status content because OpenCode's ordinary
+provider tool loop is separate from the ACP agent tool loop.
+
+Filesystem requests are restricted to the configured workspace. Terminal
+requests use sanitized environment variables and are controlled by the ACP
+permission policy. The adapter is not an operating-system sandbox.
+
+## Sessions and retries
+
+The adapter records requests before sending prompts to ACP. A repeated
+completed request replays the saved response. A request that failed or was
+interrupted after submission is rejected on retry; send a new message to
+continue. OpenCode V2's `model.request` hook does not expose a message ID, so
+V2 requests use a hash of the normalized conversation and current prompt as
+their replay identity. Identical retries are protected; a changed request body
+cannot use a host message ID to recover the previous receipt.
+Transient V2 `generate` requests use disposable ACP workers and never join the
+primary chat's persistent ACP session.
+
+Session turns and metadata updates use local process locks. Another OpenCode
+process cannot run a turn in the same session while one is active.
+
+`OPENCODE_ANTIGRAVITY_DATA_DIR` defaults to `$XDG_DATA_HOME/opencode-antigravity`, or
+`~/.local/share/opencode-antigravity`. It contains `sessions.json` and request receipts
+under `requests/`. Completed receipts include response events, including text,
+reasoning, and tool activity, up to 2 MB per request. Larger responses retain a
+completion marker and reject retries instead of executing again. Directories
+use mode `0700` and files use `0600` on POSIX filesystems. Request receipts remain
+after idle session metadata is pruned. Deleting them removes retry protection
+for those requests.
+
+## Local endpoints
+
+- `GET /health`;
+- `GET /v1/models`;
+- `GET /v1/usage`;
+- `POST /v1/messages`.
+
+Requests require the loopback marker `x-api-key: opencode-antigravity-local`.
+
+## Tests
+
+```sh
+npm run check
+```
+
+The test command requires Bun 1.3 or newer.
+
+The live test requires an authenticated official ACP server:
+
+```sh
+OPENCODE_ANTIGRAVITY_ACP_LIVE=1 \
+OPENCODE_ANTIGRAVITY_ACP_PATH=/absolute/path/to/agy_acp_server.par \
+OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD=oauth-personal \
+npm run test:live
+```
+
+Review Google's current [terms](https://antigravity.google/terms) before using
+subscription authentication through a third-party host.
