@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-antigravity",
+      "name": "@rasyid_rafi/opencode-antigravity",
       "dependencies": {
         "@agentclientprotocol/sdk": "^1.4.0",
         "@opencode/plugin": "2.0.22",

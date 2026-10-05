@@ -1,4 +1,4 @@
-# opencode-antigravity
+# @rasyid_rafi/opencode-antigravity
 
 An OpenCode V2 provider plugin for Google's official Antigravity ACP server.
 
@@ -46,7 +46,7 @@ Register the V2 plugin in `~/.config/opencode/opencode.jsonc`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": ["opencode-antigravity"]
+  "plugins": ["@rasyid_rafi/opencode-antigravity"]
 }
 ```
 

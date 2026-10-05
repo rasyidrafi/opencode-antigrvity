@@ -1,8 +1,16 @@
 {
-  "name": "opencode-antigravity",
+  "name": "@rasyid_rafi/opencode-antigravity",
   "version": "0.2.0",
   "description": "OpenCode V2 provider adapter for Google's official Antigravity ACP server",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rasyidrafi/opencode-antigrvity.git"
+  },
+  "homepage": "https://github.com/rasyidrafi/opencode-antigrvity#readme",
+  "bugs": {
+    "url": "https://github.com/rasyidrafi/opencode-antigrvity/issues"
+  },
   "type": "module",
   "main": "./src/index.ts",
   "module": "./src/index.ts",
