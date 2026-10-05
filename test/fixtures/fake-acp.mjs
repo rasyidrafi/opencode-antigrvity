@@ -56,8 +56,19 @@ async function handlePrompt(message) {
     await rpc("initialize", { protocolVersion: "2025-03-26" });
     const list = await rpc("tools/list");
     const name = list.result.tools[0].name;
+    if (text.includes("FAKE_MCP_ACTIVITY")) {
+      update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "GENUINE_THOUGHT_BEFORE" } });
+      update({ sessionUpdate: "tool_call", toolCallId: "activity-tool", title: "opencode_shell: duplicate-command", kind: "execute", status: "pending" });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "activity-tool", status: "in_progress" });
+    }
     const count = text.includes("FAKE_MCP_PARALLEL") ? 2 : 1;
     const results = await Promise.all(Array.from({ length: count }, (_, index) => rpc("tools/call", { name, arguments: { index } })));
+    if (text.includes("FAKE_MCP_ACTIVITY")) {
+      // Updates often omit MCP metadata and the original title.
+      update({ sessionUpdate: "tool_call_update", toolCallId: "activity-tool", status: "failed" });
+      update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "GENUINE_THOUGHT_AFTER" } });
+      update({ sessionUpdate: "compaction_update", compactionId: "activity-compaction", status: "completed" });
+    }
     update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(results.map((r) => r.result ?? r.error)) } });
     if (text.includes("FAKE_MCP_SEQUENCE")) {
       const second = await rpc("tools/call", { name, arguments: { index: 2 } });

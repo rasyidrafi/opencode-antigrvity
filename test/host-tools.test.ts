@@ -78,6 +78,38 @@ test("tool schema and media conversion retain the native host contract", () => {
   expect(results.get("a")?.content).toEqual([{ type: "image", data: "AA==", mimeType: "image/png" }]);
 });
 
+test("MCP tools render only as host calls while thinking and compaction notices survive", async () => {
+  for (const stream of [false, true]) {
+    const session = `activity-${stream}`;
+    const messages: any[] = [{ role: "user", content: "FAKE_MCP_ACTIVITY" }];
+    const firstResponse = await send(session, messages, { stream });
+    const firstText = await firstResponse.text();
+    expect(firstText).not.toContain("Antigravity ACP tool");
+    expect(firstText).not.toContain("duplicate-command");
+    let call: any;
+    if (stream) {
+      expect(firstText).toContain("GENUINE_THOUGHT_BEFORE");
+      const events = firstText.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
+      const starts = events.filter((event) => event.type === "content_block_start" && event.content_block.type === "tool_use");
+      expect(starts).toHaveLength(1);
+      call = starts[0].content_block;
+      call.input = JSON.parse(events.find((event) => event.index === starts[0].index && event.delta?.type === "input_json_delta").delta.partial_json);
+    } else {
+      const first = JSON.parse(firstText);
+      expect(first.stop_reason).toBe("tool_use");
+      expect(first.content.filter((part: any) => part.type === "tool_use")).toHaveLength(1);
+      call = first.content.find((part: any) => part.type === "tool_use");
+    }
+    messages.push({ role: "assistant", content: [call] }, { role: "user", content: [result(call.id, "HOST_TOOL_DENIED", true)] });
+    const finalText = await (await send(session, messages, { stream })).text();
+    expect(finalText).not.toContain("Antigravity ACP tool");
+    expect(finalText).toContain("GENUINE_THOUGHT_AFTER");
+    expect(finalText).toContain("context compacted");
+    expect(finalText).toContain("HOST_TOOL_DENIED");
+    expect(finalText).toContain('"stop_reason":"end_turn"');
+  }
+});
+
 test("waiting for host approval suspends the ACP stall watchdog and forwards changed instructions", async () => {
   const previous = process.env.OPENCODE_ANTIGRAVITY_TURN_STALL_MS;
   process.env.OPENCODE_ANTIGRAVITY_TURN_STALL_MS = "1000";

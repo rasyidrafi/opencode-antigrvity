@@ -176,6 +176,11 @@ export class HostBridge {
           yield { event: "host_tools", calls: [...this.pending.values()].map((p) => p.call) };
           return;
         }
+        // ACP already processed these updates for activity/lifecycle tracking.
+        // OpenCode renders the actual call and result through the MCP bridge;
+        // replaying ACP tool telemetry as thinking would duplicate that UI.
+        if (next.value.event === "update" &&
+            (next.value.update.sessionUpdate === "tool_call" || next.value.update.sessionUpdate === "tool_call_update")) continue;
         yield next.value;
         if (next.value.event === "result") { finished = true; this.active = false; await this.pumping; return; }
       }

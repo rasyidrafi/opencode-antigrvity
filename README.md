@@ -176,7 +176,8 @@ PDFs, and video are rejected.
 The provider reports ACP image/audio input capability and OpenCode tool support.
 Tool results preserve text, error status, and base64 images. Other tool-result
 media types are rejected explicitly. Tool calls and their results appear in
-OpenCode's normal tool UI; ACP progress may also appear as status content.
+OpenCode's normal tool UI. Duplicate ACP tool activity is suppressed in the MCP
+bridge; genuine model thinking and other status notices remain available.
 
 ## Sessions and retries
 
