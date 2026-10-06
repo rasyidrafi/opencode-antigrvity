@@ -21,14 +21,16 @@ import { fallbackAcpModelCatalog, resolveAcpModelSelection, type AcpModelCatalog
 import { ModelCatalog } from "./model-catalog.js";
 import { normalizePrompt } from "./prompt.js";
 import { detectMetaRequestKind } from "./request-kind.js";
-import { buildGenerateUtilityPrompt, buildUtilityPrompt, runAcpOneShot, type OneShotResult } from "./utility.js";
+import { buildGenerateUtilityPrompt, buildUtilityPrompt, runAcpOneShot, runSummary, type OneShotResult } from "./utility.js";
+import { sessionStore } from "./session-store.js";
+import { readContextSnapshot } from "./telemetry.js";
 import { sessionPool } from "./session-pool.js";
 import type { AcpEvent } from "./protocol.js";
-import { hostBridge, handleHostMcp, closeHostBridges, hostInstructions, type BridgeEvent } from "./host-tools.js";
+import { hostBridge, handleHostMcp, closeHostBridges, closeHostBridgesForScope, hostInstructions, type BridgeEvent } from "./host-tools.js";
 import {
-  addAnthropicUsage,
   appendResultWithoutDuplication,
   collectTurn,
+  hostVisibleContent,
   createAcpTranslationState,
   isMeaningfulEvent,
   mapAcpEvent,
@@ -71,10 +73,11 @@ let server: ReturnType<typeof Bun.serve> | null = null;
 let proxyPort: number | null = null;
 let runtime: RuntimeState | null = null;
 let startPromise: Promise<number> | null = null;
+let warnedTemperature = false;
 const workspaceRoots = new Set<string>();
 const catalogListeners = new Set<() => void>();
 
-export function onModelCatalogChange(listener: () => void): () => void {
+function localModelCatalogChange(listener: () => void): () => void {
   catalogListeners.add(listener);
   return () => { catalogListeners.delete(listener); };
 }
@@ -163,17 +166,29 @@ async function readJson(request: Request): Promise<AnthropicMessageRequest> {
   }
 }
 
-function errorType(error: AgyError): string {
+export function errorType(error: AgyError): string {
+  if (error.kind === "context_overflow") return "context_length_exceeded";
   if (error.kind === "auth") return "authentication_error";
-  if (error.kind === "quota") return "rate_limit_error";
+  if (error.kind === "quota") return "insufficient_quota";
+  if (error.kind === "rate_limit") return "rate_limit_error";
+  if (error.kind === "overload") return "overloaded_error";
+  if (error.kind === "refusal") return "content_policy_violation";
+  if (error.code === "agy_cancelled" || error.code === "agy_client_cancelled") return "invalid_request_error";
   if (error.kind === "invalid_request" || error.kind === "unsupported" || error.kind === "unknown_model") return "invalid_request_error";
   return "api_error";
+}
+
+function errorPayload(error: AgyError): { type: "error"; error: { type: string; message: string; code: string; retry_after?: number } } {
+  const retryAfter = retryAfterSeconds(error);
+  // The installed Anthropic stream decoder keeps only error.type/message.
+  // Include the normalized hint in message as well as the HTTP/body fields.
+  return { type: "error", error: { type: errorType(error), message: retryAfter === undefined ? error.message : `${error.message} (retry after ${retryAfter} seconds)`, code: error.code, ...(retryAfter !== undefined ? { retry_after: retryAfter } : {}) } };
 }
 
 function errorResponse(error: unknown): Response {
   const failure = asAgyError(error);
   const retryAfter = retryAfterSeconds(failure);
-  return Response.json({ type: "error", error: { type: errorType(failure), message: failure.message } }, {
+  return Response.json(errorPayload(failure), {
     status: failure.status,
     headers: retryAfter ? { "Retry-After": String(retryAfter) } : undefined,
   });
@@ -242,8 +257,8 @@ function streamAnthropic(
       let active: { index: number; kind: "text" | "thinking" } | undefined;
       let streamedText = "";
       let finishReason = "end_turn";
-      let stepUsage: AnthropicUsage | undefined;
       let resultUsage: AnthropicUsage | undefined;
+      let sawResult = false;
       const translation = createAcpTranslationState();
       const closeBlock = () => {
         if (!active) return;
@@ -287,8 +302,8 @@ function streamAnthropic(
           if (mapped.kind === "text") { streamedText += mapped.text; emitBlock("text", mapped.text); }
           else if (mapped.kind === "reasoning") emitBlock("thinking", mapped.text);
           else if (mapped.kind === "activity") emitBlock("thinking", mapped.text, true);
-          else if (mapped.kind === "usage") stepUsage = addAnthropicUsage(stepUsage, mapped.usage);
           else if (mapped.kind === "result") {
+            sawResult = true;
             resultUsage = mapped.usage;
             finishReason = mapped.finishReason;
             const suffix = appendResultWithoutDuplication(streamedText, mapped.response);
@@ -296,19 +311,20 @@ function streamAnthropic(
             if (suffix) { streamedText += suffix; emitBlock("text", suffix, true); }
           } else if (mapped.kind === "error") {
             closeBlock();
-            send({ type: "error", error: { type: errorType(mapped.error), message: mapped.error.message } });
+            send(errorPayload(mapped.error));
             if (!closed) controller.close();
             return;
           }
         }
+        if (!sawResult && finishReason !== "tool_use") throw new AgyProtocolError("The ACP agent ended a turn without a result");
         closeBlock();
-        send({ type: "message_delta", delta: { stop_reason: finishReason, stop_sequence: null }, usage: anthropicUsage(stepUsage ?? resultUsage) });
+        send({ type: "message_delta", delta: { stop_reason: finishReason, stop_sequence: null }, usage: anthropicUsage(resultUsage) });
         send({ type: "message_stop" });
         if (!closed) controller.close();
       } catch (error) {
         const failure = asAgyError(error);
         closeBlock();
-        send({ type: "error", error: { type: errorType(failure), message: failure.message } });
+        send(errorPayload(failure));
         if (!closed) controller.close();
       } finally {
         closed = true;
@@ -330,9 +346,7 @@ function utilityMessage(result: OneShotResult, model: string): Response {
 }
 
 function collectedMessage(collected: Awaited<ReturnType<typeof collectTurn>>, model: string): Response {
-  const content = collected.segments.map((segment, index) => segment.kind === "text"
-    ? { type: "text", text: segment.text }
-    : { type: "thinking", thinking: segment.text, signature: `agy-${index}` });
+  const content = hostVisibleContent(collected.segments).map((part, index) => part.type === "thinking" ? { ...part, signature: `agy-${index}` } : part);
   return Response.json({ id: completionId(), type: "message", role: "assistant", model, content, stop_reason: collected.finishReason, stop_sequence: null, usage: anthropicUsage(collected.usage) });
 }
 
@@ -355,6 +369,12 @@ function utilityStream(result: OneShotResult, model: string): Response {
 }
 
 async function handleMessages(request: Request, body: AnthropicMessageRequest): Promise<Response> {
+  const hostID = readHeader(request, SESSION_HEADER);
+  if (hostID && await sessionStore.isHostDeleted(hostID)) throw new AgyError("invalid_request", "This host session was deleted; late requests cannot recreate it");
+  if ((body.stop_sequences !== undefined && (!Array.isArray(body.stop_sequences) || body.stop_sequences.length > 0)) || body.top_p !== undefined || body.top_k !== undefined || body.output_config !== undefined || body.response_format !== undefined) throw new AgyError("unsupported", "ACP does not enforce native sampling, stop sequences or JSON-schema output. Use host structured-output tools instead.", { code: "agy_unsupported_control" });
+  if (body.temperature !== undefined && !warnedTemperature) { warnedTemperature = true; warn("Ignoring temperature: sampling is owned by ACP", { reason: "unsupported_temperature" }); }
+  if (body.max_tokens !== undefined && (typeof body.max_tokens !== "number" || !Number.isSafeInteger(body.max_tokens) || body.max_tokens <= 0)) throw new AgyError("invalid_request", "max_tokens must be a positive integer budget");
+  if (body.tool_choice !== undefined && body.tool_choice !== "auto" && !(body.tool_choice && typeof body.tool_choice === "object" && (body.tool_choice as any).type === "auto")) throw new AgyError("unsupported", "ACP currently supports automatic OpenCode tool selection only");
   if (!runtime) throw new AgyError("internal", "The Antigravity ACP proxy runtime is not initialized", { code: "agy_runtime_uninitialized" });
   await runtime.manager.refresh();
   if (runtime.catalog.source === "empty") throw runtime.manager.lastError ?? new AgyError("unknown_model", "Antigravity model discovery is unavailable");
@@ -366,23 +386,34 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
   const requestedEffort = readHeader(request, EFFORT_HEADER);
   const selected = resolveAcpModelSelection(requestedModel, requestedEffort, runtime.catalog);
   const mode: "accept-edits" | "plan" | undefined = process.env.OPENCODE_ANTIGRAVITY_MODE === "accept-edits" || process.env.OPENCODE_ANTIGRAVITY_MODE === "plan" ? process.env.OPENCODE_ANTIGRAVITY_MODE : undefined;
-  const settings = { cwd, model: selected.acpModel, ...(selected.effort ? { effort: selected.effort } : {}), ...(mode ? { mode } : {}), cliVersion: runtime.catalog.version, executable: runtime.catalog.executable, catalogScope: runtime.manager.scope, hostTools: true } as const;
+  const settings = { cwd, model: selected.acpModel, ...(typeof body.max_tokens === "number" ? { outputBudget: body.max_tokens } : {}), ...(selected.effort ? { effort: selected.effort } : {}), ...(mode ? { mode } : {}), cliVersion: runtime.catalog.version, executable: runtime.catalog.executable, catalogScope: runtime.manager.scope, hostTools: true } as const;
   const metaKind = detectMetaRequestKind(Array.isArray(requestMessages) ? requestMessages : [], readHeader(request, REQUEST_KIND_HEADER));
   if (metaKind) {
     try {
       const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true });
       const generated = metaKind === "generate" ? buildGenerateUtilityPrompt(normalized.messages) : undefined;
       const utilityPrompt = generated?.context ?? buildUtilityPrompt(metaKind, normalized.messages);
-      const utility = await runAcpOneShot(utilityPrompt, {
+      const hostSession = readHeader(request, SESSION_HEADER);
+      if (metaKind === "summary" && hostSession) {
+        await closeHostBridges(hostSession);
+        await sessionPool.quiesceHostSession(hostSession);
+        await sessionStore.compaction(hostSession, "pending", "generating");
+      }
+      const utility = await (metaKind === "summary" ? (prompt: string, options: Parameters<typeof runAcpOneShot>[1]) => runSummary(normalized.messages, options) : runAcpOneShot)(utilityPrompt, {
         cwd,
         model: selected.acpModel,
+        outputBudget: settings.outputBudget,
         ...(selected.effort ? { effort: selected.effort } : {}),
         executable: settings.executable,
         signal: request.signal,
         ...(generated ? { preserveRequest: generated.request } : {}),
       });
       return body.stream === true ? utilityStream(utility, responseModel(body.model, selected.requestedModel)) : utilityMessage(utility, responseModel(body.model, selected.requestedModel));
-    } catch (error) { return errorResponse(error); }
+    } catch (error) {
+      const hostSession = readHeader(request, SESSION_HEADER);
+      if (metaKind === "summary" && hostSession) await sessionStore.compaction(hostSession, "pending", "failed");
+      return errorResponse(error);
+    }
   }
   // The host session header is mandatory for tool continuations: inference
   // request content changes after every result and cannot identify a session.
@@ -390,12 +421,12 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
   if (body.tools !== undefined && !sessionID) throw new AgyError("invalid_request", "OpenCode tool requests require a session header");
   let events: AsyncIterable<BridgeEvent>;
   if (sessionID && (body.tools !== undefined || readHeader(request, "x-opencode-antigravity-host-tools") === "1")) {
-    if (body.tool_choice && typeof body.tool_choice === "object" && (body.tool_choice as any).type !== "auto") throw new AgyError("unsupported", "ACP currently supports automatic OpenCode tool selection only");
     events = hostBridge(`host-v1:${key}`, sessionID, cwd).request({ messages: body.messages, system: body.system, tools: body.tools, settings,
       baseURL: getProxyBaseUrl().replace(/\/v1$/, ""), requestId: readHeader(request, MESSAGE_HEADER), signal: request.signal });
   } else {
     const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true });
     events = sessionPool.turn({ key, requestId: readHeader(request, MESSAGE_HEADER), prompt: normalized.blocks,
+      messages: normalized.messages, hostSessionID: sessionID,
       priorMessages: normalized.priorMessages.filter((m) => m.role !== "system"), instructions: hostInstructions(body.system, cwd), settings, signal: request.signal });
   }
   const probed = await probeTurn(events);
@@ -407,7 +438,12 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
       if (calls.length) {
         const state = createAcpTranslationState();
         const content: unknown[] = [];
-        for (const event of acp) { const mapped = mapAcpEvent(event, state); if (mapped.kind === "text") content.push({ type: "text", text: mapped.text }); }
+        for (const event of acp) {
+          const mapped = mapAcpEvent(event, state);
+          if (mapped.kind === "error") throw mapped.error;
+          if (mapped.kind === "text") content.push({ type: "text", text: mapped.text });
+          if (mapped.kind === "reasoning" || mapped.kind === "activity") content.push({ type: "thinking", thinking: mapped.text, signature: `agy-${content.length}` });
+        }
         return Response.json({ id: completionId(), type: "message", role: "assistant", model: responseModel(body.model, selected.requestedModel),
           content: [...content, ...calls], stop_reason: "tool_use", stop_sequence: null, usage: anthropicUsage(undefined) });
       }
@@ -429,7 +465,11 @@ async function handleRequest(request: Request): Promise<Response> {
       acp: { executable: runtime?.catalog.executable, version: runtime?.catalog.version, ready, catalogSource: runtime?.catalog.source } });
   }
   if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) return Response.json({ object: "list", data: (runtime?.catalog ?? fallbackAcpModelCatalog()).models.map((model) => ({ id: model.id, object: "model", created: Math.floor(Date.now() / 1_000), owned_by: "antigravity" })) });
-  if (request.method === "GET" && (url.pathname === "/v1/usage" || url.pathname === "/usage")) return Response.json({ provider: "antigravity-acp", source: "acp", windows: {}, models: {} });
+  if (request.method === "GET" && (url.pathname === "/v1/usage" || url.pathname === "/usage")) {
+    const sessionID = request.headers.get(SESSION_HEADER);
+    if (!sessionID) return errorResponse(new AgyError("invalid_request", "Context usage requires a host session header"));
+    return Response.json(await readContextSnapshot(sessionID));
+  }
   if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
     try { return await handleMessages(request, await readJson(request)); }
     catch (error) { logError("message request failed", { kind: error instanceof AgyError ? error.kind : "internal" }); return errorResponse(error); }
@@ -440,7 +480,14 @@ async function handleRequest(request: Request): Promise<Response> {
 async function startProxyInternal(directory: string): Promise<number> {
   if (server && proxyPort) return proxyPort;
   sessionPool.open();
-  const manager = new ModelCatalog(directory, { onChange: () => { for (const listener of catalogListeners) listener(); } });
+  const manager = new ModelCatalog(directory, {
+    onChange: () => { for (const listener of catalogListeners) listener(); },
+    onScopeChange: async previous => {
+      await closeHostBridgesForScope(previous);
+      await sessionPool.retireCatalogScope(previous);
+      info("Retired incompatible ACP authentication scope", { reason: "scope_changed" });
+    },
+  });
   runtime = { directory, manager, get catalog() { return manager.catalog; } };
   const bound = Bun.serve({ hostname: "127.0.0.1", port: requestedPort(), idleTimeout: 0, fetch: handleRequest });
   server = bound;
@@ -451,14 +498,14 @@ async function startProxyInternal(directory: string): Promise<number> {
   return proxyPort;
 }
 
-export async function startProxy(directory = process.cwd()): Promise<number> {
+async function retainProxy(directory = process.cwd()): Promise<number> {
   workspaceRoots.add(resolvePath(directory));
   if (server && proxyPort) return proxyPort;
   if (!startPromise) startPromise = startProxyInternal(resolvePath(directory)).finally(() => { startPromise = null; });
   return startPromise;
 }
 
-export async function stopProxy(directory?: string): Promise<void> {
+async function releaseProxy(directory?: string): Promise<void> {
   if (directory) workspaceRoots.delete(resolvePath(directory)); else workspaceRoots.clear();
   if (workspaceRoots.size > 0) return;
   await closeHostBridges();
@@ -469,9 +516,32 @@ export async function stopProxy(directory?: string): Promise<void> {
   await sessionPool.close();
 }
 
-export function getProxyPort(): number | null { return proxyPort; }
-export function getProxyBaseUrl(): string { if (!proxyPort) throw new AgyError("internal", "The Antigravity ACP proxy is not listening", { code: "agy_proxy_not_started" }); return `http://127.0.0.1:${proxyPort}/v1`; }
-export function getProxyRuntime(): RuntimeState | null { return runtime; }
-export async function refreshModels(): Promise<AcpModelCatalog> {
+function localProxyPort(): number | null { return proxyPort; }
+function localProxyBaseUrl(): string { if (!proxyPort) throw new AgyError("internal", "The Antigravity ACP proxy is not listening", { code: "agy_proxy_not_started" }); return `http://127.0.0.1:${proxyPort}/v1`; }
+function localProxyRuntime(): RuntimeState | null { return runtime; }
+async function localRefreshModels(): Promise<AcpModelCatalog> {
   return runtime ? runtime.manager.refresh(true) : fallbackAcpModelCatalog();
 }
+
+type ProxyOwner = { refs: Map<string, number>; retain: typeof retainProxy; release: typeof releaseProxy; port: typeof localProxyPort; url: typeof localProxyBaseUrl; runtime: typeof localProxyRuntime; refresh: typeof localRefreshModels; listen: typeof localModelCatalogChange };
+const processOwner = globalThis as typeof globalThis & { __agyProxyV1?: ProxyOwner };
+const sharedProxy = processOwner.__agyProxyV1 ??= { refs: new Map(), retain: retainProxy, release: releaseProxy, port: localProxyPort, url: localProxyBaseUrl, runtime: localProxyRuntime, refresh: localRefreshModels, listen: localModelCatalogChange };
+export async function startProxy(directory = process.cwd()): Promise<number> {
+  const root = resolvePath(directory);
+  sharedProxy.refs.set(root, (sharedProxy.refs.get(root) ?? 0) + 1);
+  try { return await sharedProxy.retain(root); }
+  catch (error) { await stopProxy(root); throw error; }
+}
+export async function stopProxy(directory?: string): Promise<void> {
+  if (!directory) { sharedProxy.refs.clear(); return sharedProxy.release(); }
+  const root = resolvePath(directory);
+  const count = sharedProxy.refs.get(root) ?? 0;
+  if (count > 1) { sharedProxy.refs.set(root, count - 1); return; }
+  sharedProxy.refs.delete(root);
+  await sharedProxy.release(root);
+}
+export const getProxyPort = () => sharedProxy.port();
+export const getProxyBaseUrl = () => sharedProxy.url();
+export const getProxyRuntime = () => sharedProxy.runtime();
+export const refreshModels = () => sharedProxy.refresh();
+export const onModelCatalogChange = (listener: () => void) => sharedProxy.listen(listener);

@@ -89,6 +89,30 @@ test("cancelling a queued request leaves later turns behind the active turn", as
   // A request cancelled before submission remains safe to submit later.
   await collect(sessions.turn(request("queued")));
   expect(await promptCount(directory)).toBe(3);
+  await expect(collect(sessions.turn(request("message-only", "FAKE_QUOTA_MESSAGE_ONLY")))).rejects.toThrow("quota");
+  expect((await new SessionStore().receipt("session", "message-only"))?.state).toBe("uncertain");
+  await expect(collect(sessions.turn(request("message-only", "FAKE_QUOTA_MESSAGE_ONLY")))).rejects.toThrow("already started");
+});
+
+test("cancelled and abandoned turns retain non-replayable receipt evidence", async () => {
+  await setup();
+  const sessions = pool();
+  await collect(sessions.turn(request("cancelled", "FAKE_CANCELLED")));
+  expect((await new SessionStore().receipt("session", "cancelled"))?.state).toBe("interrupted");
+  await expect(collect(sessions.turn(request("cancelled", "FAKE_CANCELLED")))).rejects.toThrow("already started");
+  const events = sessions.turn(request("abandoned", "FAKE_PAUSE_STREAM"));
+  await events.next();
+  await events.return();
+  expect((await new SessionStore().receipt("session", "abandoned"))?.state).toBe("uncertain");
+});
+
+test("identical intentional text at a later host boundary is a new request", async () => {
+  const directory = await setup();
+  const sessions = pool();
+  const initial = { ...request(""), hostSessionID: "host", messages: [{ role: "user", content: "hello" }] };
+  await collect(sessions.turn(initial));
+  await collect(sessions.turn({ ...initial, messages: [...initial.messages, { role: "assistant", content: "FAKE_OK\n" }, { role: "user", content: "hello" }] }));
+  expect(await promptCount(directory)).toBe(2);
 });
 
 test("another pool cannot mutate a session while its turn is active", async () => {
@@ -107,4 +131,22 @@ test("request receipts survive idle metadata pruning", async () => {
   await new SessionStore().prune(-1);
   await collect(pool().turn(request("one")));
   expect(await promptCount(directory)).toBe(1);
+});
+
+test("definite quota rejection may resubmit but accepted activity cannot", async () => {
+  const directory = await setup();
+  const sessions = pool();
+  for (let attempt = 0; attempt < 2; attempt++) await expect(collect(sessions.turn(request("rejected", "FAKE_QUOTA_REJECTED")))).rejects.toThrow("quota");
+  expect((await new SessionStore().receipt("session", "rejected"))?.state).toBe("rejected-before-execution");
+  await expect(collect(sessions.turn(request("uncertain", "FAKE_QUOTA_UNCERTAIN")))).rejects.toThrow("quota");
+  expect((await new SessionStore().receipt("session", "uncertain"))?.state).toBe("uncertain");
+  await expect(collect(sessions.turn(request("uncertain", "FAKE_QUOTA_UNCERTAIN")))).rejects.toThrow("already started");
+  expect(await promptCount(directory)).toBe(3);
+});
+
+test("completed tombstones never execute again without a payload", async () => {
+  const directory = await setup();
+  await new SessionStore().saveReceipt("session", "large", { state: "completed" });
+  await expect(collect(pool().turn(request("large")))).rejects.toThrow("response payload is unavailable");
+  await expect(readFile(join(directory, "prompts.jsonl"))).rejects.toThrow();
 });

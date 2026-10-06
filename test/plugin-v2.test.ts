@@ -1,5 +1,9 @@
-import { afterEach, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { afterAll, beforeAll, afterEach, expect, test } from "bun:test";
+import { fixtureCompatibility } from "./fixtures/compatibility.js";
+let compatibility: ReturnType<typeof fixtureCompatibility>;
+beforeAll(() => { compatibility = fixtureCompatibility(); });
+afterAll(() => { compatibility.mockRestore(); });
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AntigravityCliPlugin, AUTH_METHOD_ID, INTEGRATION_ID, PLUGIN_ID } from "../src/index.js";
@@ -16,12 +20,14 @@ import {
 import { getProxyPort, getProxyRuntime } from "../src/proxy.js";
 import { emitAcpCatalog } from "../src/catalog-events.js";
 import { acpModelCatalog } from "../src/models.js";
+import { AsyncEventQueue } from "../src/acp-process.js";
+import { sessionStore } from "../src/session-store.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const temporaryDirectories: string[] = [];
 const cleanupTasks: Array<() => Promise<void>> = [];
 const savedEnvironment = new Map<string, string | undefined>();
-const environmentKeys = ["OPENCODE_ANTIGRAVITY_ACP_PATH", "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV"];
+const environmentKeys = ["OPENCODE_ANTIGRAVITY_ACP_PATH", "OPENCODE_ANTIGRAVITY_DATA_DIR", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_PROMPT_LOG"];
 
 afterEach(async () => {
   await Promise.all(cleanupTasks.splice(0).map((cleanup) => cleanup()));
@@ -50,6 +56,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
   process.env.GEMINI_HOME = geminiHome;
   process.env.OPENCODE_ANTIGRAVITY_MODELS_DEV = "0";
+  process.env.FAKE_ACP_PROMPT_LOG = join(root, "event-prompts.jsonl");
   await chmod(fixture, 0o755);
 
   const providers: any[] = [];
@@ -59,7 +66,26 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   let marker: any;
   const sessionDirectories = new Map<string, string>();
   const hooks = new Map<string, { callback: (event: any) => Promise<void>; options?: unknown }>();
+  const subscriptions: AsyncEventQueue<any>[] = [];
+  const checkpoints = new Map<string, string[]>();
+  const contextReadGates = new Map<string, () => Promise<void>>();
+  const hostModels = new Map<string, any>();
+  const hostModelUpdates: any[] = [];
   const context = {
+    event: { subscribe: ({ signal }: { signal: AbortSignal }) => {
+      const queue = new AsyncEventQueue<any>(); subscriptions.push(queue);
+      signal.addEventListener("abort", () => queue.close(), { once: true });
+      return { async *[Symbol.asyncIterator]() {
+        while (true) {
+          const next = await queue.next(); if (next.done) return;
+          if (next.value.type === "session.compaction.ended") {
+            const host = next.value.data.sessionID;
+            checkpoints.set(host, [...new Set([...(checkpoints.get(host) ?? []), next.value.id.replace(/^evt_/, "msg_")])]);
+          }
+          yield next.value;
+        }
+      } };
+    } },
     location: { directory: root },
     options: {},
     integration: {
@@ -85,12 +111,20 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
       },
     },
     session: {
+      switchModel: async (input: any) => { hostModelUpdates.push(input); hostModels.set(input.sessionID, input.model); },
+      context: async ({ sessionID }: { sessionID: string }) => {
+        const snapshot = [...(checkpoints.get(sessionID) ?? [])];
+        const gate = contextReadGates.get(sessionID); contextReadGates.delete(sessionID);
+        if (gate) await gate();
+        return snapshot.map(id => ({ type: "compaction", status: "completed", id, time: { created: Date.now() }, reason: "manual", summary: "Authoritative checkpoint", recent: "" }));
+      },
       hook: async (name: string, callback: (event: any) => Promise<void>, options?: unknown) => {
         hooks.set(name, { callback, options });
         return { dispose: async () => hooks.delete(name) };
       },
       get: async ({ sessionID }: { sessionID: string }) => ({
         location: { directory: sessionDirectories.get(sessionID) ?? sessionDirectory },
+        model: hostModels.get(sessionID),
       }),
     },
   };
@@ -141,6 +175,13 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   }
 
   const modelRequest = hooks.get("model.request")!;
+  const retry = hooks.get("retry")!;
+  const retryEvent = { error: { type: "rate-limit", message: "rate limit; retry in 2 minutes" }, decision: { retry: true, delay: 10 } };
+  await retry.callback(retryEvent);
+  expect(retryEvent.decision.delay).toBe(120_000);
+  const rejectedRetry = { ...retryEvent, decision: { retry: false } };
+  await retry.callback(rejectedRetry);
+  expect(rejectedRetry.decision).toEqual({ retry: false });
   expect(modelRequest.options).toEqual({ providerID: PROVIDER_ID });
   const event = {
     sessionID: "session-v2",
@@ -181,12 +222,165 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
     modelRequest.callback({ ...event, sessionID, headers: {} }),
   ));
 
+  // Exercise the real lifecycle subscriber, not only the store's epoch ledger.
+  const waitEpoch = async (host: string, epoch: number) => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if ((await sessionStore.lifecycle(host)).epoch === epoch) return;
+      await Bun.sleep(10);
+    }
+    throw new Error(`Lifecycle subscriber did not reach epoch ${epoch} for ${host}`);
+  };
+  const committed = { id: "evt_deduplication_commit", type: "session.compaction.ended", data: { sessionID: "deduplication-host" } };
+  const failed = { id: "evt_deduplication_old_failure", type: "session.compaction.failed", data: { sessionID: "deduplication-host" } };
+  subscriptions[0].push(failed);
+  subscriptions[0].push(committed);
+  await waitEpoch("deduplication-host", 1);
+  expect((await sessionStore.lifecycle("deduplication-host")).failures).toContain(failed.id);
+  expect((await sessionStore.lifecycle("deduplication-host")).transaction!.id).toBe(committed.id);
+  const toolEvent = { ...event, sessionID: "deduplication-host", headers: {} };
+  await modelRequest.callback(toolEvent);
+  const toolMessages: any[] = [{ role: "user", content: "FAKE_MCP DUPLICATE_EVENT_NEW_WORK" }];
+  const tools = [{ name: "shell", input_schema: { type: "object", properties: { index: { type: "integer" } } } }];
+  const sendTools = () => fetch(toolEvent.baseURL + "/messages", { method: "POST", headers: { ...toolEvent.headers, "content-type": "application/json" }, body: JSON.stringify({ model: "gemini-3.8-flash", messages: toolMessages, tools }) });
+  const parked = await (await sendTools()).json();
+  expect(parked.stop_reason).toBe("tool_use");
+  await sessionStore.saveAutoAdmission("deduplication-host", { version: 1, epoch: 1, baseline: "new-work", id: "msg_new_work", phase: "admitted" });
+  const call = parked.content.find((part: any) => part.type === "tool_use");
+  subscriptions[0].push(committed);
+  subscriptions[0].push(failed);
+  subscriptions[0].push({ id: "evt_deduplication_barrier", type: "session.compaction.ended", data: { sessionID: "deduplication-barrier" } });
+  await waitEpoch("deduplication-barrier", 1);
+  expect((await sessionStore.autoAdmission("deduplication-host"))?.phase).toBe("admitted");
+  toolMessages.push({ role: "assistant", content: parked.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: "NEW_WORK_RESULT_PRESERVED" }] });
+  const continued = await (await sendTools()).json();
+  expect(continued.stop_reason).toBe("end_turn");
+  expect(JSON.stringify(continued)).toContain("NEW_WORK_RESULT_PRESERVED");
+  expect((await sessionStore.lifecycle("deduplication-host")).epoch).toBe(1);
+  expect((await sessionStore.lifecycle("deduplication-host")).transaction!.id).toBe(committed.id);
+  const submitted = (await readFile(process.env.FAKE_ACP_PROMPT_LOG!, "utf8")).trim().split("\n").map(line => JSON.parse(line)).filter(entry => entry.text.includes("DUPLICATE_EVENT_NEW_WORK"));
+  expect(submitted).toHaveLength(1);
+
+  const fallbackEvent = { ...event, sessionID: "fallback-selection", model: { ...event.model, variant: "default" }, headers: {} };
+  await modelRequest.callback(fallbackEvent);
+  hostModels.set("fallback-selection", { providerID: PROVIDER_ID, id: "gemini-3.8-flash", variant: "medium" });
+  expect((await fetch(fallbackEvent.baseURL + "/messages", { method: "POST", headers: { ...fallbackEvent.headers, "content-type": "application/json" }, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FAKE_FALLBACK_AVAILABLE" }] }) })).status).toBe(200);
+  expect(await sessionStore.contextSnapshot("fallback-selection")).toMatchObject({ requestedModel: "gemini-3.8-flash-high", model: "gemini-3.8-flash-low" });
+  expect(hostModelUpdates).toHaveLength(0);
+  expect(hostModels.get("fallback-selection").variant).toBe("medium");
+
+  // Exact reviewer interleaving: hook A waits on context, B (hook or event)
+  // retires the old parked pump/advances the epoch, then a NEW bridge parks.
+  // A's stale observation must not retire that newer bridge or advance again.
+  for (const winner of ["hook", "event"] as const) {
+    const host = `checkpoint-race-${winner}`;
+    const older = { ...event, sessionID: host, headers: {} };
+    await modelRequest.callback(older);
+    const send = (request: any, messages: any[]) => fetch(request.baseURL + "/messages", { method: "POST", headers: { ...request.headers, "content-type": "application/json" }, body: JSON.stringify({ model: "gemini-3.8-flash", messages, tools }) });
+    expect((await (await send(older, [{ role: "user", content: `FAKE_MCP OLD_${winner}` }])).json()).stop_reason).toBe("tool_use");
+    const checkpoint = `msg_checkpoint_race_${winner}`;
+    checkpoints.set(host, [checkpoint]);
+    let enter!: () => void; let resume!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const resumeRead = new Promise<void>(resolve => { resume = resolve; });
+    contextReadGates.set(host, async () => { enter(); await resumeRead; });
+    const delayed = modelRequest.callback({ ...event, sessionID: host, headers: {} });
+    await entered;
+    try {
+      const newer = { ...event, sessionID: host, headers: {} };
+      if (winner === "hook") await modelRequest.callback(newer);
+      else {
+        subscriptions[0].push({ id: checkpoint.replace(/^msg_/, "evt_"), type: "session.compaction.ended", data: { sessionID: host } });
+        subscriptions[0].push({ id: "evt_race_event_barrier", type: "session.compaction.ended", data: { sessionID: "race-event-barrier" } });
+        await waitEpoch("race-event-barrier", 1);
+        await modelRequest.callback(newer);
+      }
+      expect((await sessionStore.lifecycle(host)).epoch).toBe(1);
+      const messages: any[] = [{ role: "user", content: `FAKE_MCP NEW_${winner}` }];
+      const parked = await (await send(newer, messages)).json();
+      expect(parked.stop_reason).toBe("tool_use");
+      const [key, record] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+      const { sessionPool } = await import("../src/session-pool.js");
+      expect((await sessionPool.status(key)).active).toBe(true);
+      resume(); await delayed;
+      expect((await sessionStore.lifecycle(host)).epoch).toBe(1);
+      expect((await sessionStore.get(key))?.revision).toBe(record.revision);
+      expect((await sessionPool.status(key)).active).toBe(true);
+      const call = parked.content.find((part: any) => part.type === "tool_use");
+      messages.push({ role: "assistant", content: parked.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: `NEW_BRIDGE_SURVIVED_${winner}` }] });
+      const continued = await (await send(newer, messages)).json();
+      expect(continued.stop_reason).toBe("end_turn");
+      expect(JSON.stringify(continued)).toContain(`NEW_BRIDGE_SURVIVED_${winner}`);
+    } finally { resume(); await delayed; }
+  }
+
+  const terminalEvent = { ...event, sessionID: "terminal-accepted", headers: {} };
+  await modelRequest.callback(terminalEvent);
+  const terminal = await (await fetch(terminalEvent.baseURL + "/messages", {
+    method: "POST", headers: { ...terminalEvent.headers, "content-type": "application/json" },
+    body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FAKE_MCP" }], tools: [{ name: "StructuredOutput", input_schema: { type: "object" } }] }),
+  })).json();
+  expect(terminal.stop_reason).toBe("tool_use");
+  const [terminalKey] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === "terminal-accepted")!;
+  const { sessionPool } = await import("../src/session-pool.js");
+  expect((await sessionPool.status(terminalKey)).active).toBe(true);
+  subscriptions[0].push({ id: "evt_terminal_accepted", type: "session.tool.success", data: { sessionID: "terminal-accepted", id: terminal.content[0].id, assistantMessageID: "msg_terminal_a", content: [{ type: "text", text: "host validated" }], executed: true } });
+  subscriptions[0].push({ id: "evt_terminal_barrier", type: "session.compaction.ended", data: { sessionID: "terminal-barrier" } });
+  await waitEpoch("terminal-barrier", 1);
+  expect((await sessionPool.status(terminalKey)).active).toBe(true);
+  expect((await sessionStore.toolCall(terminalKey, terminal.content[0].id))?.result).toBeUndefined();
+  expect((await sessionStore.toolCall(terminalKey, terminal.content[0].id))?.terminalAcceptance).toBeDefined();
+  const afterTerminal = await (await fetch(terminalEvent.baseURL + "/messages", {
+    method: "POST", headers: { ...terminalEvent.headers, "content-type": "application/json" },
+    body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FAKE_MCP" }, { role: "assistant", content: terminal.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: terminal.content[0].id, content: "ORIGINAL_HOST_STRUCTURED_RESULT" }, { type: "text", text: "continue after accepted output" }] }], tools: [{ name: "StructuredOutput", input_schema: { type: "object" } }] }),
+  })).json();
+  expect(afterTerminal.stop_reason).toBe("end_turn");
+  expect(afterTerminal.content.some((p: any) => p.type === "tool_use")).toBe(false);
+  expect(JSON.stringify(afterTerminal)).toContain("ORIGINAL_HOST_STRUCTURED_RESULT");
+  expect((await sessionStore.toolCall(terminalKey, terminal.content[0].id))?.delivery).toBe("locally-handed-off");
+
+  const terminalB = await (await fetch(terminalEvent.baseURL + "/messages", {
+    method: "POST", headers: { ...terminalEvent.headers, "content-type": "application/json" },
+    body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FAKE_MCP TERMINAL_B" }], tools: [{ name: "StructuredOutput", input_schema: { type: "object" } }] }),
+  })).json();
+  expect(terminalB.stop_reason).toBe("tool_use");
+  subscriptions[0].push({ id: "evt_delayed_execution_a", type: "session.execution.succeeded", data: { sessionID: "terminal-accepted" } });
+  subscriptions[0].push({ id: "evt_duplicate_tool_a", type: "session.tool.success", data: { sessionID: "terminal-accepted", id: terminal.content[0].id } });
+  subscriptions[0].push({ id: "evt_delayed_barrier", type: "session.compaction.ended", data: { sessionID: "delayed-barrier" } });
+  await waitEpoch("delayed-barrier", 1);
+  expect((await sessionPool.status(terminalKey)).active).toBe(true);
+  expect((await sessionStore.toolCall(terminalKey, terminalB.content[0].id))?.terminalAcceptance).toBeUndefined();
+
+  checkpoints.set("deduplication-host", [...checkpoints.get("deduplication-host")!, "msg_missed_host_checkpoint"]);
+  subscriptions[0].close(new Error("synthetic unexpected lifecycle disconnect"));
+  for (let i = 0; i < 200 && subscriptions.length < 2; i++) await Bun.sleep(10);
+  expect(subscriptions.length).toBe(2);
+  expect((await sessionPool.status(terminalKey)).active).toBe(false);
+  expect((await sessionStore.get(terminalKey))?.conversation?.resumable).toBe(false);
+  expect((await sessionStore.lifecycle("deduplication-host")).epoch).toBe(2);
+  subscriptions[1].push({ id: "evt_missed_host_checkpoint", type: "session.compaction.ended", data: { sessionID: "deduplication-host" } });
+  subscriptions[1].push({ id: "evt_reconnected_barrier", type: "session.compaction.ended", data: { sessionID: "reconnected-barrier" } });
+  await waitEpoch("reconnected-barrier", 1);
+  expect((await sessionStore.lifecycle("deduplication-host")).epoch).toBe(2);
+  subscriptions[1].push({ id: "evt_deleted_terminal", type: "session.deleted", data: { sessionID: "terminal-accepted" } });
+  subscriptions[1].push({ id: "evt_deleted_barrier", type: "session.compaction.ended", data: { sessionID: "deleted-barrier" } });
+  await waitEpoch("deleted-barrier", 1);
+  expect(await sessionStore.get(terminalKey)).toBeUndefined();
+  expect(await sessionStore.toolCall(terminalKey, terminalB.content[0].id)).toBeUndefined();
+  expect(await sessionStore.isHostDeleted("terminal-accepted")).toBe(true);
+  const lateDeleted = await fetch(terminalEvent.baseURL + "/messages", { method: "POST", headers: { ...terminalEvent.headers, "content-type": "application/json" }, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "late deleted request" }] }) });
+  expect(lateDeleted.status).toBe(400);
+
   const runtime = getProxyRuntime()!;
   emitAcpCatalog(runtime.manager.scope, acpModelCatalog(fixture, "test", [["future-opaque", "Future model"]]));
   expect(providers.at(-1).models.map((model: any) => model.id)).toEqual(["future-opaque"]);
   expect(runtime.catalog.exactModels.map((model) => model.id)).toEqual(["future-opaque"]);
 
+  // Two plugin instances acquire the same root. Each acquisition must release
+  // at the proxy's single ownership layer, including identical workspace roots.
+  const peerCleanup = await (AntigravityCliPlugin as any).setup(context);
   await Promise.all([cleanup(), cleanup()]);
+  expect(getProxyPort()).not.toBeNull();
+  await peerCleanup();
   cleanupTasks.pop();
   expect(getProxyPort()).toBeNull();
 

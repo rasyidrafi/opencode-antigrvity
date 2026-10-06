@@ -1,40 +1,45 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createAcpWorker } from "./acp-process.js";
 import { ensureAcpServer } from "./acp-detect.js";
 import { onAcpCatalog } from "./catalog-events.js";
 import { acpModelCatalog, fallbackAcpModelCatalog, type AcpModelCatalog } from "./models.js";
 import { warn } from "./log.js";
+import { effectiveAuth } from "./effective-auth.js";
 
 export type CatalogContext = { scope: string; executable: string; args: string[]; cacheDirectory: string };
 
 async function jsonFile(path: string): Promise<Record<string, any>> {
+  let raw: string | undefined;
   try {
-    const value = JSON.parse(await readFile(path, "utf8"));
+    raw = await readFile(path, "utf8");
+    const value = JSON.parse(raw);
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   }
-  catch { return {}; }
+  catch (error) {
+    if (error instanceof SyntaxError && raw !== undefined) {
+      const directory = join(dirname(path), "quarantine");
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const target = join(directory, `${createHash("sha256").update(path + raw).digest("hex")}.json`);
+      const temporary = `${target}.${randomUUID()}.tmp`;
+      try { await writeFile(temporary, JSON.stringify({ reason: "invalid_catalog_cache", raw }), { mode: 0o600, flag: "wx" }); await rename(temporary, target); }
+      finally { await rm(temporary, { force: true }); }
+      warn("Corrupt model catalog cache quarantined; probing account inventory", { reason: "catalog_cache_corrupt" });
+    }
+    return {};
+  }
 }
 
 /** Cache filenames contain only a digest. Never persist or log source credentials. */
 export async function catalogContext(): Promise<CatalogContext> {
   const detection = await ensureAcpServer();
   const binary = await stat(detection.executable);
-  const home = process.env.GEMINI_HOME?.trim() || join(homedir(), ".gemini");
-  const cli = await jsonFile(join(home, "antigravity-cli", "antigravity-oauth-token"));
-  const settings = await jsonFile(join(home, "antigravity-acp", "settings.json"));
-  const personal = await jsonFile(join(home, "antigravity-acp", "acp_token.json"));
-  const business = await jsonFile(join(home, "antigravity-acp", "acp_business_token.json"));
-  const method = process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim() || settings.auth?.type || "oauth-personal";
+  const auth = await effectiveAuth();
   const scope = createHash("sha256").update(JSON.stringify({
-    client: "opencode-antigravity", protocol: 1, home, method,
+    client: "opencode-antigravity", protocol: 1, auth: auth.scope,
     executable: detection.executable, args: detection.args, size: binary.size, modified: binary.mtimeMs,
-    account: method === "oauth-personal" ? cli.token?.refresh_token || personal.refresh_token : business.refresh_token,
-    apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
-    settingsAuth: { ...(settings.auth ?? {}), type: method },
-    cliMethod: cli.auth_method,
   })).digest("hex");
   const data = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR?.trim() ||
     join(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"), "opencode-antigravity");
@@ -57,6 +62,7 @@ type Options = {
   context?: () => Promise<CatalogContext>;
   probe?: typeof probe;
   onChange?: (catalog: AcpModelCatalog) => void;
+  onScopeChange?: (previous: string, next: string) => Promise<void>;
   ttlMs?: number;
 };
 
@@ -98,10 +104,12 @@ export class ModelCatalog {
       if (this.closed) return this.catalog;
       const changed = context.scope !== this.scope;
       if (changed) {
+        const previous = this.scope;
         this.scope = context.scope;
         this.context = context;
         this.lastAttempt = 0;
         this.adopt(fallbackAcpModelCatalog(context.executable), false);
+        if (previous) await this.options.onScopeChange?.(previous, context.scope);
         await this.loadCache(context);
       }
       const ttl = this.options.ttlMs ?? 10 * 60_000;
@@ -114,10 +122,12 @@ export class ModelCatalog {
       const latest = await (this.options.context ?? catalogContext)();
       if (!this.closed && latest.scope === context.scope) { this.adopt(catalog); this.lastError = undefined; }
       else if (!this.closed) {
+        const previous = this.scope;
         this.scope = latest.scope;
         this.context = latest;
         this.lastAttempt = 0;
         this.adopt(fallbackAcpModelCatalog(latest.executable), false);
+        if (previous) await this.options.onScopeChange?.(previous, latest.scope);
         await this.loadCache(latest);
       }
     } catch (error) {

@@ -5,16 +5,20 @@ import { describe, expect, test } from "bun:test";
 import { SessionPool } from "../src/session-pool.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
+const contexts = new Map<string, Array<{ role: string; content: string }>>();
 
 async function turn(pool: SessionPool, key: string, prompt: string): Promise<string> {
   let response = "";
+  const messages = [...(contexts.get(key) ?? []), { role: "user", content: prompt }];
   for await (const event of pool.turn({
     key,
+    messages,
     prompt: [{ type: "text", text: prompt }],
     settings: { cwd: process.cwd(), model: "fake-model-low", executable: fixture },
   })) {
     if (event.event === "update" && event.update.sessionUpdate === "agent_message_chunk" && event.update.content.type === "text") response += event.update.content.text;
   }
+  contexts.set(key, [...messages, { role: "assistant", content: response }]);
   return response;
 }
 

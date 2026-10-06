@@ -80,7 +80,7 @@ export async function bridgeCliAuthentication(environment: NodeJS.ProcessEnv = p
   if (requestedMethod && requestedMethod !== "oauth-personal") return false;
   const settings = await readObject(settingsPath);
   const auth = settings.auth && typeof settings.auth === "object" ? settings.auth : {};
-  if (auth.type && auth.type !== "oauth-personal") return false;
+  if (!requestedMethod && auth.type && auth.type !== "oauth-personal") return false;
   const existing = await readObject(acpPath);
   if (existing.refresh_token !== token.refresh_token || existing.client_id !== OAUTH_CLIENT_ID ||
       existing.client_secret !== OAUTH_CLIENT_SECRET || existing.token_uri !== OAUTH_TOKEN_URI ||
@@ -97,7 +97,7 @@ export async function bridgeCliAuthentication(environment: NodeJS.ProcessEnv = p
     await mkdir(acpDir, { recursive: true, mode: 0o700 });
     await writePrivateJson(acpPath, credentials);
   }
-  if (auth.type !== "oauth-personal") {
+  if (!requestedMethod && auth.type !== "oauth-personal") {
     await mkdir(acpDir, { recursive: true, mode: 0o700 });
     await writePrivateJson(settingsPath, { ...settings, auth: { ...auth, type: "oauth-personal" } });
   }

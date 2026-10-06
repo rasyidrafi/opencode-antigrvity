@@ -3,6 +3,8 @@
 import readline from "node:readline";
 import fs from "node:fs";
 
+if (process.env.FAKE_ACP_PID_LOG) fs.appendFileSync(process.env.FAKE_ACP_PID_LOG, `${process.pid}\n`);
+
 let nextRequestId = 100;
 let sessionId = "fake-acp-session-1";
 const stateFile = process.env.FAKE_ACP_STATE_FILE;
@@ -20,8 +22,8 @@ function respond(id, result) {
   send({ jsonrpc: "2.0", id, result });
 }
 
-function fail(id, code, message) {
-  send({ jsonrpc: "2.0", id, error: { code, message } });
+function fail(id, code, message, data) {
+  send({ jsonrpc: "2.0", id, error: { code, message, ...(data ? { data } : {}) } });
 }
 
 function request(method, params) {
@@ -46,9 +48,22 @@ function update(update) {
 async function handlePrompt(message) {
   const id = message.id;
   const text = textFromPrompt(message.params?.prompt);
-  if (process.env.FAKE_ACP_PROMPT_LOG) fs.appendFileSync(process.env.FAKE_ACP_PROMPT_LOG, JSON.stringify({ text }) + "\n");
+  if (process.env.FAKE_ACP_PROMPT_LOG) fs.appendFileSync(process.env.FAKE_ACP_PROMPT_LOG, JSON.stringify({ text, prompt: message.params?.prompt }) + "\n");
   activePrompt = { id, cancelled: false };
-  if (text.includes("FAKE_MCP")) {
+  if (text.includes("FAKE_QUOTA_MESSAGE_ONLY")) { fail(id, -32000, "quota exceeded"); activePrompt = undefined; return; }
+  if (text.includes("FAKE_CANCELLED")) { respond(id, { stopReason: "cancelled" }); activePrompt = undefined; return; }
+  if (text.includes("FAKE_QUOTA_REJECTED") || text.includes("FAKE_QUOTA_UNCERTAIN")) {
+    if (text.includes("FAKE_QUOTA_UNCERTAIN")) update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "accepted work" } });
+    fail(id, -32000, "quota exceeded; retry in 120000ms", { retryAfter: "120000ms", execution: "rejected-before-execution" });
+    activePrompt = undefined; return;
+  }
+  if (text.includes("FAKE_OVERFLOW")) { fail(id, -32000, "model_context_window_exceeded"); activePrompt = undefined; return; }
+  if (text.includes("FAKE_LATE_RATE")) {
+    update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial answer" } });
+    fail(id, -32000, "rate limit; retry in 2 minutes", { retryAfter: "2 minutes" });
+    activePrompt = undefined; return;
+  }
+  if (text.includes("FAKE_MCP") && !text.includes("[tool result") && !text.includes("[host accepted terminal output")) {
     const url = mcpServers[0]?.url;
     if (!url) { fail(id, -32603, "Missing MCP bridge"); return; }
     const rpc = async (method, params = {}) => (await (await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
@@ -63,6 +78,11 @@ async function handlePrompt(message) {
     }
     const count = text.includes("FAKE_MCP_PARALLEL") ? 2 : 1;
     const results = await Promise.all(Array.from({ length: count }, (_, index) => rpc("tools/call", { name, arguments: { index } })));
+    if (process.env.FAKE_ACP_MCP_RESULT_LOG) fs.appendFileSync(process.env.FAKE_ACP_MCP_RESULT_LOG, JSON.stringify(results) + "\n");
+    if (text.includes("FAKE_MCP_QUOTA")) {
+      fail(id, -32000, "quota exceeded after tool work", { execution: "rejected-before-execution" });
+      activePrompt = undefined; return;
+    }
     if (text.includes("FAKE_MCP_ACTIVITY")) {
       // Updates often omit MCP metadata and the original title.
       update({ sessionUpdate: "tool_call_update", toolCallId: "activity-tool", status: "failed" });
@@ -134,6 +154,9 @@ async function handlePrompt(message) {
   if (text.includes("[image]")) response = "IMAGE_OK\n";
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: response.slice(0, -1) } });
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
+  if (text.includes("FAKE_FALLBACK_AVAILABLE")) update({ sessionUpdate: "config_option_update", configOptions: [{ id: "model", category: "model", type: "select", name: "Model", currentValue: "gemini-3.8-flash-low", options: [
+    { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }, { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" }, { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+  ] }] });
   update({ sessionUpdate: "usage_update", used: 12, size: 1000 });
   if (text.includes("FAKE_CATALOG_UPDATE")) {
     update({ sessionUpdate: "config_option_update", configOptions: [{
@@ -141,7 +164,7 @@ async function handlePrompt(message) {
       options: [{ value: "new-server-model", name: "Server-added model" }],
     }] });
   }
-  respond(id, { stopReason: text.includes("FAKE_MAX_TOKENS") ? "max_tokens" : text.includes("FAKE_MAX_TURNS") ? "max_turn_requests" : "end_turn", usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, thoughtTokens: 0 } });
+  respond(id, { stopReason: text.includes("FAKE_REFUSAL") ? "refusal" : text.includes("FAKE_MAX_TOKENS") ? "max_tokens" : text.includes("FAKE_MAX_TURNS") ? "max_turn_requests" : "end_turn", usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, thoughtTokens: 0 } });
   activePrompt = undefined;
 }
 
@@ -178,6 +201,7 @@ input.on("line", (line) => {
           { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
           { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
           { value: "fake-model-low", name: "Fake Model" },
+          ...(process.env.FAKE_ACP_EXTRA_MODEL ? [{ value: process.env.FAKE_ACP_EXTRA_MODEL, name: process.env.FAKE_ACP_EXTRA_MODEL }] : []),
         ] },
         { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }, { value: "plan", name: "Plan" }, { value: "default", name: "Default" }] },
       ],

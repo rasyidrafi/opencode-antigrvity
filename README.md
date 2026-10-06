@@ -2,6 +2,11 @@
 
 An OpenCode V2 provider plugin for Google's official Antigravity ACP server.
 
+This checkout is unreleased lifecycle work, not a completed release. See
+[`docs/phase8-validation.md`](docs/phase8-validation.md) for F01–F18 evidence
+and remaining acceptance gates. Published installation instructions below do
+not imply that the registry package contains this checkout's changes.
+
 ```text
 OpenCode → loopback Anthropic Messages proxy → ACP JSON-RPC client →
 agy_acp_server.par
@@ -37,6 +42,26 @@ Or register it in `~/.config/opencode/opencode.jsonc`:
 Select an **Antigravity ACP** model and send a message. No `/connect`, API key,
 or second Google sign-in is needed when the CLI is already authenticated.
 This also applies to OpenChamber.
+
+## Dual context and checkpoint lifecycle
+
+OpenCode owns authoritative conversation, instructions, edits and checkpoints.
+ACP context is a replaceable execution cache. A proven append sends the unseen
+chronological suffix; edits, deletions, reorderings, incompatible profiles and
+missing alignment evidence rebuild instead of resuming unverified remote memory.
+Forked host sessions have separate bindings.
+
+Summary generation uses isolated tool-free utility workers and is not a commit.
+The host's `session.compaction.ended` checkpoint advances the durable epoch;
+failure preserves the prior host baseline. The next primary turn reconstructs
+the accepted summary, host-retained recent tail and current instructions in a
+fresh ACP session. Late events and old-epoch telemetry cannot commit twice.
+Oversized summaries use ordered bounded reduction; empty, cancelled or truncated
+summaries fail rather than becoming successful checkpoints. Budget estimates are
+conservative byte-based estimates, not exact tokenizer measurements.
+
+ACP internal compaction changes occupancy, not the OpenCode checkpoint or host
+conversation. Instructions are explicit envelopes, not native system authority.
 
 The plugin reuses an installed ACP server. If missing, the first request downloads
 Google's official ACP **1.3.0** server and companion automatically into
@@ -95,8 +120,9 @@ ACP still receives user content, not a native system-role override.
 
 Parallel calls can share a host step. Partial results are retained until all
 calls in that step have results. Cancelling the OpenCode session interrupts its
-ACP turn and invalidates its MCP endpoint. A lost/restarted bridge rejects orphan
-tool results instead of re-executing tools. Tool selection currently supports
+ACP turn and invalidates its MCP endpoint. A lost/restarted bridge reconciles
+saved calls and original host results; uncertain execution fails closed rather
+than re-executing tools. Tool selection currently supports
 `auto`; forced/required tool choices are rejected explicitly.
 
 ### Dynamic model catalog
@@ -169,15 +195,80 @@ so a stream can run as long as it keeps sending updates.
 
 ## Supported input
 
-ACP text, image, and audio blocks are supported. Images and audio may be sent
-as base64 data URLs or local files inside the configured workspace. Remote URLs,
-PDFs, and video are rejected.
+Text and image input, with text output, are supported. Images may be sent
+as base64 data URLs or local files inside the configured workspace. Audio,
+file/document/PDF blocks, remote URLs and video are rejected before inference.
 
-The provider reports ACP image/audio input capability and OpenCode tool support.
+The provider advertises text/image input and OpenCode tool support only.
 Tool results preserve text, error status, and base64 images. Other tool-result
 media types are rejected explicitly. Tool calls and their results appear in
 OpenCode's normal tool UI. Duplicate ACP tool activity is suppressed in the MCP
 bridge; genuine model thinking and other status notices remain available.
+
+Promoted tool-result images are associated by call metadata or an unambiguous
+immediate result group. Ambiguous images remain ordered user context. Image
+steering during a parked tool continuation is carried through MCP with text.
+
+| Request control | Contract |
+| --- | --- |
+| Model / effort | Exact discovered ACP IDs; explicit effort wins. Family defaults are stable across sessions. Requested/actual fallback IDs are telemetry, not an automatic host selection override. |
+| Tool choice | `auto` only; forced/required/none modes are rejected. |
+| Temperature | Intentionally stripped; ACP owns sampling. One bounded diagnostic per loaded module. |
+| top-p / top-k / stop sequences | Explicit overrides rejected; no native enforcement claimed. |
+| Native JSON schema | Unsupported. A host tool named `StructuredOutput` retains ordinary host validation and original result delivery; its name or success event does not stop the provider turn. Completion awaits the real ACP terminal response. |
+| max_tokens | Advisory routine budget accepted; never subtracted from the adapter's input-byte cap. Planning reserves the advertised model output/window independently. Not a backend generation-limit guarantee. |
+
+Host-tool execution requires a reviewed binary/companion compatibility profile,
+not a version string. Currently only the exact official ACP 1.3.0 Linux x64
+distribution is reviewed. Other platforms/builds and unknown overrides fail
+closed with `agy_acp_compatibility`; they need a reviewed profile before use.
+Tests inject a fixture validator in test code, not a production environment bypass.
+
+Discovery and workers share one effective authentication scope, including method,
+account credential revision, GCP configuration, endpoint and ADC context. Keys
+contain digests only. Overrides are reflected in isolated settings; original
+CLI authentication settings are not changed to apply an override.
+
+Completed response payloads expire after seven days; compact replay tombstones
+remain, and missing payloads never authorize repeat execution. Legacy payloads
+begin their retention window on migration. Active, parked, uncertain and durable
+tool-result recovery evidence is retained conservatively. Large completed tool
+results expire only with a completed originating receipt and no live owner;
+call identity, arguments/result digests and profile remain, allowing matching
+host-authoritative results to rehydrate the tombstone. Corrupt request receipts
+are privately quarantined and replaced by fail-closed uncertain tombstones.
+Abandoned private utility directories are collected after seven days only when
+their owner is provably dead. GC never targets source CLI credentials or unrelated
+caches. Isolated auth homes and legacy/unattributed tool-result records currently
+remain conservative evidence rather than receiving blanket age-based deletion.
+
+MCP body reads have an 8 MiB limit and 15-second deadline. Cancellation maps the
+MCP request ID to its bridge and interrupts the originating turn; it is never a
+successful empty result. Requests with `_meta.progressToken` that accept SSE
+receive an initial waiting notification and transport keepalive comments until
+the real result/error. JSON-only peers receive JSON, not a keepalive guarantee.
+The bridge's idle TTL is not a transport timeout guarantee.
+
+Host lifecycle subscriptions reconnect with bounded exponential backoff/jitter.
+After unexpected loss, telemetry is stale; reconnection retires questionable
+bindings. The public active-context API reconciles new completed checkpoint IDs
+against the durable observed baseline, including missed completion events; late
+events cannot advance the same checkpoint twice. Without a prior baseline, the
+next request remains the conservative reconstruction backstop. Missing checkpoints
+alone never prove compaction failure. Durable tool results survive reconciliation.
+
+Host session deletion tombstones late requests immediately, retires workers, and
+cleans indexed private records only after turn/result ownership is released.
+Pending cleanup retries and is rediscovered on restart. Source CLI credentials,
+shared isolated authentication homes and unattributed legacy evidence are untouched.
+Lifecycle, context, admission, tool, deletion/index and malformed inventory-cache
+records are quarantined privately and fail closed (optional caches rediscover).
+
+Automatic host fallback selection remains blocked: V2's public `switchModel`
+accepts only session/model, with no expected-selection or revision condition.
+Read-then-write can overwrite a concurrent newer user selection. Until the host
+provides an atomic guard or serialized selection facility, fallback is telemetry
+only; this plugin does not claim race-safe automatic selection updates.
 
 ## Sessions and retries
 
@@ -235,3 +326,66 @@ npm run test:live
 
 Review Google's current [terms](https://antigravity.google/terms) before using
 subscription authentication through a third-party host.
+## Context telemetry (V2)
+
+The plugin records ACP `usage_update.used/size` as replacement occupancy snapshots,
+not billed token usage. Snapshots are version 1 and scoped to the host compaction
+epoch. A committed host checkpoint reads as `unknown` until fresh telemetry;
+measurements older than five minutes read as `stale`. ACP internal compaction
+does not commit a host checkpoint.
+
+Authenticated `GET /v1/usage` requires the same local API key as `/v1/messages`
+and the `x-opencode-antigravity-session` host-session header. It returns one snapshot,
+never all sessions. The V2 RPC domain `antigravity-context-v1` exposes `read`
+with `{sessionID}` and the live-only `changed` event. RPC reads and events are
+restricted to the plugin location. Resync with `read` after reconnecting; events
+may be missed. The snapshot includes epoch, sequence, observation time, source
+ACP session, requested model, used, size, and state. `model` is present only when
+ACP reports its actual current model; `requestedModel` is never substituted for
+that evidence. Race-safe automatic host model-selection updates remain blocked.
+
+Clients can import the versioned RPC definition:
+
+The sibling OpenChamber integration is implemented and independently reviewed
+(73 reported passing client tests), but is a separate unreleased client change.
+It prefers matching fresh ACP occupancy, resyncs after missed events, and shows
+unknown/stale rather than substituting billing totals. The core OpenCode TUI
+meter is unchanged. This plugin alone does not ship that client UI.
+
+```ts
+import { ContextTelemetry } from "@rasyid_rafi/opencode-antigravity/rpc"
+
+const telemetry = client.rpc(ContextTelemetry)
+const snapshot = await telemetry.read({ sessionID })
+const unsubscribe = telemetry.events.on("changed", event => {
+  // Check event.location, hostSessionID, epoch, and sequence before displaying.
+  console.log(event.data)
+})
+```
+
+Automatic occupancy-driven admission is **blocked on the installed V2 API**:
+`@opencode/plugin` 2.0.22 supplies `ctx.session.compact`, but neither its Promise
+nor Effect context exposes effective `compaction.auto/buffer` configuration.
+Plugin options are not those settings. The tested durable admission engine
+remains inactive rather than ignore `auto: false`, guess a buffer, or discover
+an unrelated service. Manual host compaction still works. See
+[`docs/phase3-4-validation.md`](docs/phase3-4-validation.md) for exact evidence.
+
+Occupancy never establishes measured billing. Terminal ACP usage is a turn
+aggregate, not a delta per repeated result. Inclusive `inputTokens` is lowered
+to Anthropic non-cached input by subtracting `cachedReadTokens` and
+`cachedWriteTokens`; those counts retain their separate cache fields. Reasoning
+is retained as an output subset. Missing accounting remains protocol zero
+placeholders, not measured zero usage. Contradictory cache totals are not used.
+Submitted/uncertain replay receipts fail closed; only verified completed cached
+responses replay without executing again. Legacy hashes remain conservative
+tombstones. Definite structured pre-execution rejection may resubmit; a quota
+message alone, even before any text, is not evidence that work was rejected.
+
+Remaining acceptance gates include OS-kill injection at every call/result/delivery
+boundary, independently recorded delivery/acknowledgement transitions and complete
+tool-record migration/quarantine validation. Durable recovery requires the
+originating host assistant call and original results; missing evidence fails
+closed, not permission to repeat a side effect. The disposable live host proved
+shell/skill/foreground-child execution and manual checkpoint continuation, not
+the entire deterministic failure matrix.

@@ -1,6 +1,6 @@
 {
   "name": "@rasyid_rafi/opencode-antigravity",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "OpenCode V2 provider adapter for Google's official Antigravity ACP server",
   "license": "MIT",
   "repository": {
@@ -16,6 +16,11 @@
   "module": "./src/index.ts",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./rpc": {
+      "types": "./dist/telemetry-rpc.d.ts",
+      "import": "./src/telemetry-rpc.ts",
+      "default": "./src/telemetry-rpc.ts"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./src/index.ts",
@@ -25,6 +30,7 @@
   "files": [
     "dist",
     "src",
+    "docs",
     "README.md",
     "LICENSE"
   ],

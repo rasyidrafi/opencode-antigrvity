@@ -24,6 +24,7 @@ import type { AcpEvent } from "./protocol.js";
 import { catalogFromSession, type AcpModelCatalog } from "./models.js";
 import { emitAcpCatalog } from "./catalog-events.js";
 import { hostEnvironment } from "./host-environment.js";
+import { assertHostToolCompatibility } from "./acp-compatibility.js";
 export type { AcpEvent } from "./protocol.js";
 
 export type AcpWorkerState = "created" | "starting" | "ready" | "turn_active" | "closing" | "closed" | "failed";
@@ -174,11 +175,22 @@ type TerminalRecord = {
 function asAcpError(error: unknown, fallback: string): AgyError {
   if (error instanceof AgyError) return error;
   const message = error instanceof Error ? error.message : String(error);
-  const lower = message.toLowerCase();
-  if (/auth|login|authenticate|credential/.test(lower)) {
-    return new AgyError("auth", `${message}. Authenticate the official ACP server with the provider auth action or OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD.`, { code: "agy_acp_auth" });
+  const rpc = error && typeof error === "object" ? error as { code?: unknown; data?: unknown } : {};
+  const data = rpc.data && typeof rpc.data === "object" ? rpc.data as Record<string, unknown> : {};
+  const inner = data.error && typeof data.error === "object" ? data.error as Record<string, unknown> : {};
+  const lower = [message, data.type, data.code, inner.type, inner.code].filter(value => typeof value === "string").join(" ").toLowerCase();
+  const details = { ...data, ...(rpc.code === -32600 || rpc.code === -32602 ? { execution: "rejected-before-execution" } : {}) };
+  if (/context_length_exceeded|model_context_window_exceeded|request_too_large|context (?:window|length).*(?:exceed|overflow)|too many tokens/.test(lower)) {
+    return new AgyError("context_overflow", message, { code: "context_length_exceeded", details });
   }
-  if (/quota|rate limit|resource exhausted/.test(lower)) return new AgyError("quota", message, { code: "agy_acp_quota" });
+  if (/auth|login|authenticate|credential/.test(lower)) {
+    return new AgyError("auth", `${message}. Authenticate the official ACP server with the provider auth action or OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD.`, { code: "agy_acp_auth", details });
+  }
+  if (/rate.?limit|too many requests/.test(lower)) return new AgyError("rate_limit", message, { code: "agy_acp_rate_limit", details });
+  if (/quota|resource[ _]exhausted/.test(lower)) return new AgyError("quota", message, { code: "agy_acp_quota", details });
+  if (/overload|temporarily unavailable/.test(lower)) return new AgyError("overload", message, { details });
+  if (/refusal|content.policy/.test(lower)) return new AgyError("refusal", message, { details });
+  if (rpc.code === -32600 || rpc.code === -32602) return new AgyError("invalid_request", message, { details });
   if (/cancel|abort/.test(lower)) return new AgyAbortError(message);
   return new AgyProcessError(message || fallback, error);
 }
@@ -235,6 +247,8 @@ export class AcpWorker {
   private terminals = new Map<string, TerminalRecord>();
   private roots: string[] = [];
   private stderrDiagnostic = "";
+  private actualModelValue?: string;
+  private executionActivity = false;
 
   constructor(options: AcpWorkerOptions, executable: string) {
     this.options = { ...options };
@@ -246,9 +260,17 @@ export class AcpWorker {
   get resumed(): boolean { return this.resumedValue; }
   get sessionId(): string | undefined { return this.sessionIdValue; }
   get init(): InitializeResponse | null { return this.initValue; }
+  get actualModel(): string | undefined { return this.actualModelValue; }
+  get hasExecutionActivity(): boolean { return this.executionActivity; }
   catalog: AcpModelCatalog | undefined;
 
   private recordModels(response: unknown): void {
+    if (response && typeof response === "object") {
+      const value = response as { configOptions?: Array<{ id?: string; category?: string; currentValue?: unknown }>; models?: { currentModelId?: unknown } };
+      const selector = value.configOptions?.find(option => option.category === "model" || option.id === "model");
+      const current = selector?.currentValue ?? value.models?.currentModelId;
+      if (typeof current === "string" && current) this.actualModelValue = current;
+    }
     const catalog = catalogFromSession(response, this.executable, this.initValue?.agentInfo?.version ?? null);
     if (!catalog) return;
     this.catalog = catalog;
@@ -395,6 +417,7 @@ export class AcpWorker {
           details: { configId: String(option.id), available: values },
         });
       }
+      if (item.ids[0] === "model") this.actualModelValue = undefined;
       const updated = await this.withSignal(agent.request(methods.agent.session.setConfigOption, {
         sessionId: this.sessionIdValue,
         configId: String(option.id),
@@ -423,6 +446,7 @@ export class AcpWorker {
     if (this.activeTurn) throw new AgyProcessError("The ACP worker already has an active turn");
     if (signal?.aborted) throw new AgyAbortError();
     this.activeTurn = true;
+    this.executionActivity = false;
     this.stateValue = "turn_active";
     this.turnEvents = new AsyncEventQueue<AcpEvent>();
     let result: PromptResponse | undefined;
@@ -584,6 +608,7 @@ export class AcpWorker {
   }
 
   private async requestPermission(params: import("@agentclientprotocol/sdk").RequestPermissionRequest): Promise<import("@agentclientprotocol/sdk").RequestPermissionResponse> {
+    this.executionActivity = true;
     if (this.options.hostTools) {
       const meta = (params.toolCall as { _meta?: { mcp?: { server?: string } } })._meta;
       // Malformed MCP envelopes have no parsed _meta yet. Let the MCP
@@ -607,6 +632,7 @@ export class AcpWorker {
   }
 
   private async readTextFile(params: import("@agentclientprotocol/sdk").ReadTextFileRequest): Promise<import("@agentclientprotocol/sdk").ReadTextFileResponse> {
+    this.executionActivity = true;
     if (this.options.hostTools) throw new AgyError("unsupported", "File access must use OpenCode tools");
     const path = await this.allowedPath(params.path, false);
     const content = await readFile(path, "utf8");
@@ -617,6 +643,7 @@ export class AcpWorker {
   }
 
   private async writeTextFile(params: import("@agentclientprotocol/sdk").WriteTextFileRequest): Promise<import("@agentclientprotocol/sdk").WriteTextFileResponse> {
+    this.executionActivity = true;
     if (this.options.hostTools) throw new AgyError("unsupported", "File access must use OpenCode tools");
     const path = await this.allowedPath(params.path, true);
     await mkdir(dirname(path), { recursive: true });
@@ -647,6 +674,7 @@ export class AcpWorker {
   }
 
   private async createTerminal(params: import("@agentclientprotocol/sdk").CreateTerminalRequest): Promise<import("@agentclientprotocol/sdk").CreateTerminalResponse> {
+    this.executionActivity = true;
     if (this.options.hostTools) throw new AgyError("unsupported", "Terminal access must use OpenCode tools");
     const cwd = await this.allowedPath(params.cwd ?? this.options.cwd, false);
     const child = spawn(params.command, params.args ?? [], {
@@ -759,8 +787,13 @@ export class AcpWorker {
 }
 
 export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortSignal): Promise<AcpWorker> {
+  const detection = options.executable
+    ? { executable: options.executable, args: options.executableArgs }
+    : await ensureAcpServer();
+  if (options.hostTools) await assertHostToolCompatibility(detection.executable);
   if (options.hostTools) {
-    const isolated = await hostEnvironment({ ...process.env, ...options.environment }, options.catalogScope);
+    const isolated = await hostEnvironment({ ...process.env, ...options.environment,
+      ...(options.authMethod ? { OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: options.authMethod } : {}) }, options.catalogScope);
     options = { ...options, ...isolated };
   }
   await bridgeCliAuthentication({
@@ -768,9 +801,6 @@ export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortS
     ...options.environment,
     ...(options.authMethod ? { OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: options.authMethod } : {}),
   });
-  const detection = options.executable
-    ? { executable: options.executable, args: options.executableArgs }
-    : await ensureAcpServer();
   const worker = new AcpWorker({
     ...options,
     executableArgs: options.executableArgs ?? detection.args,

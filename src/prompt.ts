@@ -111,12 +111,12 @@ async function binaryBlock(value: string, mimeType: string | undefined, roots: s
 
 function mediaBlock(data: string, mimeType: string): ContentBlock {
   if (mimeType.startsWith("image/")) return { type: "image", data, mimeType };
-  if (mimeType.startsWith("audio/")) return { type: "audio", data, mimeType };
   throw new UnsupportedMediaError(mimeType);
 }
 
 async function attachmentPart(part: MessageContentPart, roots: string[]): Promise<ContentBlock> {
   const type = typeof part.type === "string" ? part.type : "";
+  if (["audio", "input_audio", "file", "input_file", "document", "pdf", "video"].includes(type)) throw new UnsupportedMediaError(type);
   if (type === "text" || type === "input_text") return { type: "text", text: blockText(part) };
 
   if (type === "image_url" || type === "input_image" || type === "image" || type === "audio" || type === "input_audio") {
@@ -218,7 +218,9 @@ export async function normalizePrompt(messages: unknown, options: { allowedRoots
     if (messageRole(normalized[index]) === "user") { latestUserIndex = index; break; }
   }
   if (latestUserIndex < 0) throw new AgyError("invalid_request", "At least one user message is required", { code: "agy_missing_user_message" });
-  const blocks = await messageContentToAcp(normalized[latestUserIndex].content, options.allowedRoots ?? []);
+  const current = normalized[latestUserIndex].content;
+  const hasResults = options.hostTools && Array.isArray(current) && current.some(p => p?.type === "tool_result");
+  const blocks = hasResults ? await hostResultMessageToAcp(normalized[latestUserIndex], options.allowedRoots ?? []) : await messageContentToAcp(current, options.allowedRoots ?? []);
   const text = blocks.filter((block) => block.type === "text").map((block) => block.text).join("\n");
   if (!blocks.length || (!text.trim() && blocks.every((block) => block.type === "text"))) {
     throw new AgyError("invalid_request", "The latest user message is empty", { code: "agy_empty_user_message" });
@@ -226,19 +228,40 @@ export async function normalizePrompt(messages: unknown, options: { allowedRoots
   return { blocks, text, latestUserIndex, priorMessages: normalized.slice(0, latestUserIndex), messages: normalized };
 }
 
+/** Recover tool results as causal historical data without flattening images.
+ * The explicit envelope is not a claim of native ACP history mutation. */
+export async function hostResultMessageToAcp(message: HostMessage, roots: string[]): Promise<ContentBlock[]> {
+  if (!Array.isArray(message.content)) return messageContentToAcp(message.content, roots);
+  const blocks: ContentBlock[] = [{ type: "text", text: "[host tool continuation]\nThe tool calls in the preceding assistant message have already executed in OpenCode. The following are their original results, not a new request to execute those calls. Continue from these results; do not repeat completed calls merely because this ACP context was rebuilt. Preserve any new user steering below.\n[user]" }];
+  for (const part of message.content) {
+    if (part?.type === "tool_result") {
+      blocks.push({ type: "text", text: `[tool result ${String(part.tool_use_id)}${part.is_error ? " error" : ""}]` });
+      blocks.push(...await messageContentToAcp(part.content, roots));
+    } else blocks.push(...await messageContentToAcp([part], roots));
+  }
+  return blocks;
+}
+
+export function quotedHostMessage(message: HostMessage): string {
+  const text = [extractTextContent(message.content).trim(), message.tool_calls ? JSON.stringify(message.tool_calls) : "", message.tool_call_id ? `[tool result ${String(message.tool_call_id)}]` : ""].filter(Boolean).join("\n");
+  return text ? `[${messageRole(message)}]\n${text}` : "";
+}
+
 export function buildBoundedHistory(messages: HostMessage[], maxChars = Number(process.env.OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS) || DEFAULT_HISTORY_MAX_CHARS): string {
   if (maxChars <= 0 || messages.length === 0) return "";
-  const entries = messages.map((message) => {
-    const role = messageRole(message) === "system" ? "system" : messageRole(message) === "assistant" ? "assistant" : "user";
-    const text = extractTextContent(message.content).trim();
-    return text ? `[${role}]\n${text}` : "";
-  }).filter(Boolean);
+  const entries = messages.map(quotedHostMessage).filter(Boolean);
   const selected: string[] = [];
   let length = 0;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     const next = entry.length + (selected.length ? 2 : 0);
-    if (length + next > maxChars) break;
+    if (length + next > maxChars) {
+      const remaining = Math.max(0, maxChars - length - (selected.length ? 2 : 0));
+      const marker = "[earlier context omitted]\n".slice(0, remaining);
+      const available = remaining - marker.length;
+      if (remaining) selected.unshift(marker + (available > 0 ? entry.slice(-available) : ""));
+      break;
+    }
     selected.unshift(entry);
     length += next;
   }

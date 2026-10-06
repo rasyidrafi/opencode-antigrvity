@@ -1,6 +1,7 @@
 import { AgyAbortError, AgyError } from "./errors.js";
 import type { AcpEvent } from "./protocol.js";
 import type { ContentBlock, PromptResponse, SessionUpdate } from "@agentclientprotocol/sdk";
+import { canonical } from "./coordinator.js";
 
 export type AnthropicUsage = {
   input_tokens: number;
@@ -10,9 +11,14 @@ export type AnthropicUsage = {
   output_tokens_details?: { thinking_tokens?: number };
 };
 
-export type AnthropicFinishReason = "end_turn" | "max_tokens" | "stop_sequence";
+export type AnthropicFinishReason = "end_turn" | "max_tokens" | "stop_sequence" | "refusal";
 export type OrderedSegment = { kind: "text" | "thinking" | "activity"; text: string };
-export type AcpTranslationState = { tools: Map<string, { title: string; failureShown?: boolean }> };
+
+/** The same ordered blocks used by the Anthropic response and durable boundary. */
+export function hostVisibleContent(segments: OrderedSegment[]): Array<{ type: "text"; text: string } | { type: "thinking"; thinking: string }> {
+  return segments.map(segment => segment.kind === "text" ? { type: "text", text: segment.text } : { type: "thinking", thinking: segment.text });
+}
+export type AcpTranslationState = { tools: Map<string, { title: string; failureShown?: boolean }>; terminal?: string };
 
 export function createAcpTranslationState(): AcpTranslationState {
   return { tools: new Map() };
@@ -22,29 +28,30 @@ export type MappedAcpEvent =
   | { kind: "text"; text: string }
   | { kind: "reasoning"; text: string }
   | { kind: "activity"; text: string }
-  | { kind: "usage"; usage: AnthropicUsage }
   | { kind: "result"; result: PromptResponse; response: string; finishReason: AnthropicFinishReason; usage?: AnthropicUsage }
   | { kind: "error"; error: AgyError; usage?: AnthropicUsage }
   | { kind: "ignore" };
 
 function nonNegativeInteger(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-  return Math.max(0, Math.floor(value));
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 export function usageFromAcp(usage: unknown): AnthropicUsage | undefined {
   if (!usage || typeof usage !== "object") return undefined;
   const value = usage as Record<string, unknown>;
-  const input = nonNegativeInteger(value.inputTokens ?? value.input_tokens) ?? 0;
-  const output = nonNegativeInteger(value.outputTokens ?? value.output_tokens) ?? 0;
+  const input = nonNegativeInteger(value.inputTokens ?? value.input_tokens);
+  const output = nonNegativeInteger(value.outputTokens ?? value.output_tokens);
   const thinking = nonNegativeInteger(value.thoughtTokens ?? value.thinking_tokens ?? value.reasoning_tokens);
-  const cached = nonNegativeInteger(value.cacheReadTokens ?? value.cache_read_tokens ?? value.cachedInputTokens);
-  const created = nonNegativeInteger(value.cacheCreationTokens ?? value.cache_creation_input_tokens);
-  const total = nonNegativeInteger(value.totalTokens ?? value.total_tokens);
-  if (input === 0 && output === 0 && !total && cached === undefined && created === undefined && thinking === undefined) return undefined;
+  const cached = nonNegativeInteger(value.cachedReadTokens ?? value.cacheReadTokens ?? value.cache_read_tokens ?? value.cachedInputTokens);
+  const created = nonNegativeInteger(value.cachedWriteTokens ?? value.cacheCreationTokens ?? value.cache_creation_input_tokens);
+  if (input !== undefined && (cached ?? 0) + (created ?? 0) > input) return undefined;
+  if (input === undefined && output === undefined && cached === undefined && created === undefined && thinking === undefined) return undefined;
+  // ACP totals are inclusive. Anthropic input_tokens excludes cache reads and
+  // writes; otherwise the host encoder would count those tokens twice. Missing
+  // totals remain required wire placeholders, not inferred measurements.
   return {
-    input_tokens: input,
-    output_tokens: output,
+    input_tokens: input === undefined ? 0 : Math.max(0, input - (cached ?? 0) - (created ?? 0)),
+    output_tokens: output ?? 0,
     ...(cached !== undefined ? { cache_read_input_tokens: cached } : {}),
     ...(created !== undefined ? { cache_creation_input_tokens: created } : {}),
     ...(thinking !== undefined ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
@@ -158,8 +165,8 @@ function statusActivity(update: SessionUpdate): string | undefined {
     case "current_mode_update": return `[Antigravity ACP mode: ${typeof value.currentModeId === "string" ? value.currentModeId : "updated"}]`;
     case "config_option_update": return "[Antigravity ACP configuration updated]";
     case "session_info_update": return typeof value.title === "string" ? `[Antigravity ACP: ${value.title}]` : "[Antigravity ACP session updated]";
-    case "compaction_update":
-    case "compaction_summary_chunk": return "[Antigravity ACP context compacted]";
+    case "compaction_update": return value.status === "completed" ? "[Antigravity ACP context compacted]" : `[Antigravity ACP compaction: ${typeof value.status === "string" ? value.status : "updated"}]`;
+    case "compaction_summary_chunk": return "[Antigravity ACP compaction summary]";
     default: return undefined;
   }
 }
@@ -181,9 +188,15 @@ export function mapAcpEvent(event: AcpEvent, state?: AcpTranslationState): Mappe
     if (status) return { kind: "activity", text: status };
     return { kind: "ignore" };
   }
+  if (state) {
+    const terminal = canonical(event.result);
+    if (state.terminal === terminal) return { kind: "ignore" };
+    if (state.terminal) return { kind: "error", error: new AgyError("protocol", "Conflicting terminal ACP responses") };
+    state.terminal = terminal;
+  }
   const usage = usageFromAcp(event.result.usage);
   if (event.result.stopReason === "cancelled") return { kind: "error", error: new AgyAbortError(), ...(usage ? { usage } : {}) };
-  const finishReason: AnthropicFinishReason = event.result.stopReason === "max_tokens" || event.result.stopReason === "max_turn_requests" ? "max_tokens" : "end_turn";
+  const finishReason: AnthropicFinishReason = event.result.stopReason === "refusal" ? "refusal" : event.result.stopReason === "max_tokens" || event.result.stopReason === "max_turn_requests" ? "max_tokens" : "end_turn";
   return { kind: "result", result: event.result, response: "", finishReason, ...(usage ? { usage } : {}) };
 }
 
@@ -204,7 +217,6 @@ export type CollectedTurn = {
 export async function collectTurn(events: AsyncIterable<AcpEvent>): Promise<CollectedTurn> {
   let content = "";
   let reasoning = "";
-  let stepUsage: AnthropicUsage | undefined;
   let resultUsage: AnthropicUsage | undefined;
   let result: PromptResponse | undefined;
   let finishReason: AnthropicFinishReason = "end_turn";
@@ -224,8 +236,7 @@ export async function collectTurn(events: AsyncIterable<AcpEvent>): Promise<Coll
       else segments.push({ kind: "thinking", text: mapped.text });
     } else if (mapped.kind === "activity") {
       segments.push({ kind: "activity", text: mapped.text });
-    } else if (mapped.kind === "usage") stepUsage = addAnthropicUsage(stepUsage, mapped.usage);
-    else if (mapped.kind === "error") throw mapped.error;
+    } else if (mapped.kind === "error") throw mapped.error;
     else if (mapped.kind === "result") {
       result = mapped.result;
       resultUsage = mapped.usage;
@@ -233,7 +244,7 @@ export async function collectTurn(events: AsyncIterable<AcpEvent>): Promise<Coll
     }
   }
   if (!result) throw new AgyError("protocol", "The ACP agent ended a turn without a result", { code: "agy_acp_missing_result" });
-  return { content, reasoning, ...(stepUsage ?? resultUsage ? { usage: stepUsage ?? resultUsage } : {}), result, finishReason, segments };
+  return { content, reasoning, ...(resultUsage ? { usage: resultUsage } : {}), result, finishReason, segments };
 }
 
 export function appendResultWithoutDuplication(streamed: string, result: string): string | undefined {

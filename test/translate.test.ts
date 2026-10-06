@@ -4,7 +4,7 @@ import { mapAcpEvent, usageFromAcp, appendResultWithoutDuplication, collectTurn,
 describe("ACP to Anthropic translation", () => {
   test("maps token usage without inventing price", () => {
     expect(usageFromAcp({ inputTokens: 10, outputTokens: 4, thoughtTokens: 3, cacheReadTokens: 2, totalTokens: 14 })).toEqual({
-      input_tokens: 10,
+      input_tokens: 8,
       output_tokens: 4,
       cache_read_input_tokens: 2,
       output_tokens_details: { thinking_tokens: 3 },

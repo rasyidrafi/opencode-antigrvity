@@ -50,7 +50,7 @@ describe("isolated utility request detection", () => {
       { role: "user", content: current },
     ]);
     expect(generated.request).toBe(current);
-    expect(generated.context).not.toContain("OLDER_CONTEXT_END");
+    expect(generated.context).toContain("OLDER_CONTEXT_END");
     expect(buildUtilityPrompt("generate", [
       { role: "user", content: current },
     ])).toContain(current);

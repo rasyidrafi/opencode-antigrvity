@@ -15,13 +15,19 @@ import {
 } from "./constants.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { AcpEvent } from "./acp-process.js";
-import { buildBoundedHistory } from "./prompt.js";
+import { buildBoundedHistory, extractTextContent, messageContentToAcp, hostResultMessageToAcp, type HostMessage } from "./prompt.js";
+import { canonical, extendsBoundary, fingerprints, type ConversationState } from "./coordinator.js";
 import { sessionStore, type SessionRecord } from "./session-store.js";
 import { debug, info, warn } from "./log.js";
+import { collectTurn, hostVisibleContent } from "./translate.js";
+import { blockBytes, boundHistoricalBlocks, HISTORY_OMISSION, modelTranscriptBudget } from "./budget.js";
+import { DEFAULT_HISTORY_MAX_CHARS } from "./constants.js";
+import { observeContext } from "./telemetry.js";
 
 export type SessionSettings = {
   cwd: string;
   model: string;
+  outputBudget?: number;
   effort?: AcpEffort;
   mode?: "accept-edits" | "plan";
   cliVersion?: string | null;
@@ -30,6 +36,7 @@ export type SessionSettings = {
   hostTools?: boolean;
   mcpServers?: AcpWorkerOptions["mcpServers"];
   waitingForTools?: () => boolean;
+  hasToolActivity?: () => boolean;
 };
 
 export type SessionTurnRequest = {
@@ -40,6 +47,11 @@ export type SessionTurnRequest = {
   settings: SessionSettings;
   signal?: AbortSignal;
   instructions?: string;
+  messages?: HostMessage[];
+  hostSessionID?: string;
+  responseCursor?: { start: number; events: number };
+  identity?: { value?: string };
+  suppressToolTelemetry?: boolean;
 };
 
 type SessionEntry = {
@@ -51,6 +63,7 @@ type SessionEntry = {
   record?: SessionRecord;
   turnCount: number;
   historyTransferred: boolean;
+  conversation?: ConversationState;
 };
 
 function settingsSignature(settings: SessionSettings): string {
@@ -91,11 +104,7 @@ function combineSignals(left: AbortSignal | undefined, right: AbortSignal): Abor
     controller.abort();
     return controller.signal;
   }
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  left.addEventListener("abort", abort, { once: true });
-  right.addEventListener("abort", abort, { once: true });
-  return controller.signal;
+  return AbortSignal.any([left, right]);
 }
 
 function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorkerOptions {
@@ -140,11 +149,17 @@ export class SessionPool {
   get size(): number {
     return this.entries.size;
   }
+  get capacity(): number { return this.maxSessions; }
 
   async *turn(request: SessionTurnRequest): AsyncGenerator<AcpEvent> {
+    if (request.hostSessionID && await sessionStore.isHostDeleted(request.hostSessionID)) throw new AgyError("invalid_request", "This host session was deleted; late requests cannot recreate its execution state");
     if (this.disposed) throw new AgyProcessError("The Antigravity session pool has been shut down");
     let entry = this.entries.get(request.key);
     if (!entry) {
+      if (this.entries.size >= this.maxSessions) {
+        const idle = [...this.entries].filter(([, value]) => value.pending === 0).sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)[0];
+        if (idle) await this.forgetWorker(idle[0]);
+      }
       if (this.entries.size >= this.maxSessions) throw new AgyBusyError("The Antigravity session pool has reached its session limit");
       entry = { tail: Promise.resolve(), pending: 0, lastUsedAt: Date.now(), turnCount: 0, historyTransferred: false };
       this.entries.set(request.key, entry);
@@ -162,18 +177,27 @@ export class SessionPool {
       await waitForPrevious(previous, signal);
       if (this.disposed) throw new AgyProcessError("The Antigravity session pool has been shut down");
       if (signal.aborted) throw new AgyAbortError();
-      const unlock = await sessionStore.lockTurn(request.key);
+      const unlock = await sessionStore.lockTurn(request.hostSessionID ? `host:${request.hostSessionID}` : request.key);
       try {
         if (signal.aborted) throw new AgyAbortError();
-        const identity = request.requestId || createHash("sha256").update(JSON.stringify({
+        const identity = request.requestId || createHash("sha256").update(canonical({
           prior: request.priorMessages, prompt: request.prompt,
+          messages: request.messages ? fingerprints(request.messages) : undefined,
+          hostEpoch: request.hostSessionID ? (await sessionStore.lifecycle(request.hostSessionID)).epoch : 0,
           instructions: request.instructions, model: request.settings.model,
         })).digest("hex");
+        const legacyIdentity = request.requestId || createHash("sha256").update(JSON.stringify({ prior: request.priorMessages, prompt: request.prompt, instructions: request.instructions, model: request.settings.model })).digest("hex");
         const receipt = await sessionStore.receipt(request.key, identity);
-        if (receipt) {
+        // Legacy hashes carry no epoch/boundary evidence. Preserve them only
+        // as tombstones; never replay an unverified old response into a new
+        // accepted host baseline.
+        if (!receipt && identity !== legacyIdentity && await sessionStore.receipt(request.key, legacyIdentity)) throw new AgyError("invalid_request", "A legacy Antigravity receipt prevents replay without verified host alignment", { code: "agy_legacy_replay_tombstone" });
+        if (receipt && receipt.state !== "rejected-before-execution" && receipt.state !== "prepared") {
           if (receipt.state === "completed" && receipt.events) { yield* receipt.events; return; }
-          throw new AgyError("invalid_request", "This request already started in Antigravity. Send a new message to continue; retrying could repeat workspace changes.", { code: "agy_request_already_started", status: 409 });
+          if (receipt.state === "completed") throw new AgyError("invalid_request", "This Antigravity request completed, but its response payload is unavailable. It cannot be executed again.", { code: "agy_completed_response_unavailable" });
+          throw new AgyError("invalid_request", "This request already started in Antigravity. Send a new message to continue; retrying could repeat workspace changes.", { code: "agy_request_already_started" });
         }
+        if (request.identity) request.identity.value = identity;
         yield* this.runTurn(entry, { ...request, signal }, identity);
       } finally { await unlock(); }
     } finally {
@@ -185,10 +209,21 @@ export class SessionPool {
 
   private async *runTurn(entry: SessionEntry, request: SessionTurnRequest, identity: string): AsyncGenerator<AcpEvent> {
     const signature = settingsSignature(request.settings);
+    const profile = createHash("sha256").update(signature).digest("hex");
     const record = await sessionStore.get(request.key);
+    const incoming = request.messages ? fingerprints(request.messages) : undefined;
+    const accepted = record?.conversation ?? entry.conversation;
+    const hostEpoch = request.hostSessionID ? (await sessionStore.lifecycle(request.hostSessionID)).epoch : 0;
+    const aligned = request.messages ? Boolean(incoming && accepted?.resumable && record?.executionProfile === profile && accepted.hostEpoch === hostEpoch && extendsBoundary(accepted.boundary, incoming)) : Boolean(entry.worker && entry.settingsSignature === signature);
+    if (entry.worker && !aligned) {
+      await entry.worker.stop();
+      entry.worker = undefined;
+      entry.historyTransferred = false;
+    }
+    entry.conversation = aligned ? accepted : { version: 1, epoch: Math.max((accepted?.epoch ?? -1) + 1, hostEpoch), hostEpoch, boundary: [], instructions: request.instructions ?? "", hostSessionID: request.hostSessionID, resumable: false };
     // Another process may have advanced or replaced this session since our
     // last turn. Reload it instead of using a stale in-memory ACP worker.
-    if (entry.worker && JSON.stringify(entry.record) !== JSON.stringify(record)) {
+    if (entry.worker && canonical(entry.record) !== canonical(record)) {
       await entry.worker.stop();
       entry.worker = undefined;
       entry.settingsSignature = undefined;
@@ -208,7 +243,7 @@ export class SessionPool {
       entry.historyTransferred = false;
     }
     if (!entry.worker) {
-      const sessionId = record?.sessionId;
+      const sessionId = aligned && record?.model === request.settings.model && record.effort === request.settings.effort ? record.sessionId : undefined;
       entry.worker = await createAcpWorker(workerOptions(request.settings, sessionId), request.signal);
       entry.settingsSignature = signature;
       const workerSession = entry.worker.sessionId;
@@ -219,35 +254,96 @@ export class SessionPool {
     const history = !entry.worker.resumed && !entry.historyTransferred && request.priorMessages?.length
       ? buildBoundedHistory(request.priorMessages)
       : "";
-    const prompt: ContentBlock[] = history
+    let prompt: ContentBlock[] = history
       ? [{ type: "text", text: `${history}\n\n<current-user-message>` }, ...request.prompt, { type: "text", text: "</current-user-message>" }]
-      : request.prompt;
+      : [...request.prompt];
+    if (request.messages) {
+      const unseen = request.messages.slice(aligned ? accepted!.boundary.length : 0);
+      let currentUserIndex = -1;
+      for (let index = 0; index < unseen.length; index++) if (unseen[index].role === "user") currentUserIndex = index;
+      const groups: Array<{ blocks: ContentBlock[]; operative: boolean }> = [];
+      for (const [index, message] of unseen.entries()) {
+        let blocks: ContentBlock[];
+        if (message.role === "system") blocks = [{ type: "text", text: `<instruction-update>\n${extractTextContent(message.content)}\n</instruction-update>` }];
+        else if (message.role === "user" && Array.isArray(message.content) && message.content.some((p: any) => p?.type === "tool_result")) blocks = await hostResultMessageToAcp(message, [request.settings.cwd]);
+        else if (message.role === "user" && (!Array.isArray(message.content) || message.content.every((p: any) => !["tool_result", "tool_use"].includes(p?.type)))) blocks = [{ type: "text", text: "[user]" }, ...await messageContentToAcp(message.content, [request.settings.cwd])];
+        else blocks = [{ type: "text", text: buildBoundedHistory([message], Number.MAX_SAFE_INTEGER) }];
+        groups.push({ blocks, operative: message.role === "system" || index === currentUserIndex || (aligned && message.role === "user") });
+      }
+      const fixed = [...(request.instructions ? [{ type: "text", text: request.instructions }] : []), ...groups.filter(group => group.operative).flatMap(group => group.blocks)];
+      const marker: ContentBlock = { type: "text", text: HISTORY_OMISSION };
+      let historyBytes = modelTranscriptBudget(request.settings.model, DEFAULT_HISTORY_MAX_CHARS, fixed.map(block => JSON.stringify(block)).join("\n"), request.settings.outputBudget) - blockBytes(marker);
+      let omitted = false;
+      prompt = groups.flatMap(group => {
+        if (group.operative) return group.blocks;
+        const bounded = boundHistoricalBlocks(group.blocks, historyBytes);
+        historyBytes = bounded.remaining; omitted ||= bounded.omitted;
+        return bounded.blocks;
+      });
+      if (omitted) prompt.unshift(marker);
+    }
     if (request.instructions) prompt.unshift({ type: "text", text: request.instructions });
     // This write must succeed before sending a prompt that can change files.
-    await sessionStore.saveReceipt(request.key, identity, { state: "started" });
-    if (history) entry.historyTransferred = true;
+    await sessionStore.saveReceipt(request.key, identity, { state: "prepared" });
+    if (entry.conversation) entry.conversation.resumable = false;
+    await this.persistWorker(entry, request.key, request.settings);
+    entry.historyTransferred = true;
     const events: AcpEvent[] = [];
     let bytes = 0;
     let cacheable = true;
+    let terminal = false;
+    let settledReceipt = false;
+    let activity = false;
     try {
+      await sessionStore.saveReceipt(request.key, identity, { state: "submitted" });
       for await (const event of entry.worker.runTurn(prompt, request.signal)) {
+        if (!activity && event.event === "update") {
+          activity = true;
+          await sessionStore.saveReceipt(request.key, identity, { state: "running" });
+        }
+        if (request.hostSessionID && event.event === "update" && event.update.sessionUpdate === "usage_update") {
+          await observeContext(request.hostSessionID, hostEpoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel);
+        }
         bytes += Buffer.byteLength(JSON.stringify(event));
         if (bytes <= 2_000_000) events.push(event);
         else { cacheable = false; events.length = 0; }
+        if (request.responseCursor) request.responseCursor.events = events.length;
         if (event.event === "result" && event.result.stopReason !== "cancelled") {
+          const collected = cacheable ? await collectTurn((async function* () {
+            for (const item of events.slice(request.responseCursor?.start ?? 0)) {
+              if (request.suppressToolTelemetry && item.event === "update" && (item.update.sessionUpdate === "tool_call" || item.update.sessionUpdate === "tool_call_update")) continue;
+              yield item;
+            }
+          })()) : undefined;
+          const assistant = collected ? hostVisibleContent(collected.segments) : undefined;
+          if (request.messages && entry.conversation) {
+            entry.conversation.boundary = fingerprints([...request.messages, ...(assistant?.length ? [{ role: "assistant", content: assistant }] : [])]);
+            entry.conversation.resumable = cacheable;
+            await this.persistWorker(entry, request.key, request.settings);
+          }
           // Persist before exposing success, including when the consumer stops
           // reading immediately after the terminal event.
           await sessionStore.saveReceipt(request.key, identity, {
             state: "completed", ...(cacheable ? { events } : {}),
           });
+          terminal = true;
+          settledReceipt = true;
+        }
+        if (event.event === "result" && event.result.stopReason === "cancelled") {
+          await sessionStore.saveReceipt(request.key, identity, { state: "interrupted" });
+          settledReceipt = true;
         }
         yield event;
       }
     } catch (error) {
+      if (!terminal) await sessionStore.saveReceipt(request.key, identity, { state: error instanceof AgyError && error.details?.execution === "rejected-before-execution" && !activity && !entry.worker?.hasExecutionActivity && !request.settings.waitingForTools?.() && !request.settings.hasToolActivity?.() ? "rejected-before-execution" : error instanceof AgyAbortError ? "interrupted" : "uncertain" });
+      settledReceipt = true;
       // Do not retry a process failure: the prompt may have been accepted by
       // the remote agent. The next user turn can resume the saved id.
       if (error instanceof AgyError) throw error;
       throw new AgyProcessError("The Antigravity ACP turn failed", error);
+    } finally {
+      if (!settledReceipt) await sessionStore.saveReceipt(request.key, identity, { state: "uncertain" });
     }
 
     entry.turnCount += 1;
@@ -272,6 +368,9 @@ export class SessionPool {
     const now = Date.now();
     const previous = entry.record;
     const record: SessionRecord = {
+      version: 1,
+      conversation: entry.conversation,
+      executionProfile: createHash("sha256").update(settingsSignature(settings)).digest("hex"),
       sessionId,
       revision: randomUUID(),
       model: settings.model,
@@ -333,6 +432,28 @@ export class SessionPool {
     await entry.worker?.stop();
   }
 
+  async quiesceHostSession(hostSessionID: string): Promise<void> {
+    for (const [key, entry] of this.entries) {
+      if (entry.conversation?.hostSessionID !== hostSessionID) continue;
+      await entry.worker?.stop(true);
+      if (entry.pending) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([entry.tail, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AgyBusyError("The old ACP turn did not quiesce within the compaction deadline")), 5000); })]);
+        } finally { if (timer) clearTimeout(timer); }
+      }
+      if (!entry.pending) this.entries.delete(key);
+    }
+  }
+
+  async retireCatalogScope(scope: string): Promise<void> {
+    for (const [key, entry] of this.entries) {
+      if (!key.startsWith(`${scope}:`) && !key.startsWith(`host-v1:${scope}:`)) continue;
+      await entry.worker?.stop(true);
+      if (!entry.pending) this.entries.delete(key);
+    }
+  }
+
   async status(key: string): Promise<Record<string, unknown>> {
     const entry = this.entries.get(key);
     const record = entry?.record ?? await sessionStore.get(key);
@@ -345,4 +466,5 @@ export class SessionPool {
   }
 }
 
-export const sessionPool = new SessionPool();
+const runtimeOwner = globalThis as typeof globalThis & { __agySessionPoolV1?: SessionPool };
+export const sessionPool = runtimeOwner.__agySessionPoolV1 ??= new SessionPool();
