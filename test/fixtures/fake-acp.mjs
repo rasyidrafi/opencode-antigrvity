@@ -51,6 +51,12 @@ async function handlePrompt(message) {
   const text = textFromPrompt(message.params?.prompt);
   if (process.env.FAKE_ACP_PROMPT_LOG) fs.appendFileSync(process.env.FAKE_ACP_PROMPT_LOG, JSON.stringify({ text, prompt: message.params?.prompt }) + "\n");
   activePrompt = { id, cancelled: false };
+  if (text.includes("FAKE_INTERNAL_COMPACTION")) {
+    update({ sessionUpdate: "usage_update", used: 950, size: 1000 });
+    update({ sessionUpdate: "compaction_update", compactionId: "fake-internal", status: "in_progress" });
+    update({ sessionUpdate: "compaction_update", compactionId: "fake-internal", status: "completed" });
+    update({ sessionUpdate: "usage_update", used: 100, size: 1000 });
+  }
   if (text.includes("FAKE_QUOTA_MESSAGE_ONLY")) { fail(id, -32000, "quota exceeded"); activePrompt = undefined; return; }
   if (text.includes("FAKE_CANCELLED")) { respond(id, { stopReason: "cancelled" }); activePrompt = undefined; return; }
   if (text.includes("FAKE_QUOTA_REJECTED") || text.includes("FAKE_QUOTA_UNCERTAIN")) {
