@@ -7,7 +7,7 @@ const points = ["before-call-persistence", "after-call-persistence", "before-exp
 test("SIGKILL matrix exercises integrated tool persistence, exposure, delivery and compaction", async () => {
   const evidence: any[] = [];
   for (const point of points) {
-    const root = await mkdtemp("/tmp/opencode/tool-crash-");
+    const root = await mkdtemp(join(process.env.TMPDIR || "/tmp/opencode", "tool-crash-"));
     await mkdir(join(root, "home"), { mode: 0o700 });
     const launch = (recovery: boolean) => {
       const child = spawn(process.execPath, ["test", join(import.meta.dir, "fixtures/crash-runtime.ts")], {
@@ -82,6 +82,6 @@ test("SIGKILL matrix exercises integrated tool persistence, exposure, delivery a
       expect(await readFile(join(root, "external-counter"), "utf8")).toBe("effect\n");
     }
     evidence.push({ point, root, signal: "SIGKILL", barrier: stopped, counter, recovered, records });
-    await writeFile("/tmp/opencode/tool-crash-evidence.json", JSON.stringify(evidence, null, 2));
+    await writeFile(join(process.env.TMPDIR || "/tmp/opencode", "tool-crash-evidence.json"), JSON.stringify(evidence, null, 2));
   }
 }, 180_000);

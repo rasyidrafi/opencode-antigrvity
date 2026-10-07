@@ -9,7 +9,8 @@ export const DEFAULT_IDLE_WORKER_TIMEOUT_MS = 15 * 60_000;
 export const DEFAULT_MAX_QUEUE_PER_SESSION = 1;
 export const DEFAULT_MAX_SESSIONS = 128;
 export const DEFAULT_MAX_STDERR_BYTES = 256 * 1024;
-export const DEFAULT_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+// 32 MiB decoded images expand to ~43 MiB base64; leave bounded JSON/text room.
+export const DEFAULT_MAX_REQUEST_BYTES = 48 * 1024 * 1024;
 export const DEFAULT_REQUEST_READ_TIMEOUT_MS = 30_000;
 export const DEFAULT_HISTORY_MAX_CHARS = 100_000;
 export const DEFAULT_UTILITY_MAX_CHARS = 24_000;

@@ -17,12 +17,13 @@ import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { AcpEvent } from "./acp-process.js";
 import { buildBoundedHistory, extractTextContent, messageContentToAcp, hostResultMessageToAcp, type HostMessage } from "./prompt.js";
 import { canonical, extendsBoundary, fingerprints, type ConversationState } from "./coordinator.js";
-import { sessionStore, type SessionRecord } from "./session-store.js";
+import { ownershipKey, sessionStore, type SessionRecord } from "./session-store.js";
 import { debug, info, warn } from "./log.js";
 import { collectTurn, hostVisibleContent } from "./translate.js";
-import { blockBytes, boundHistoricalBlocks, HISTORY_OMISSION, modelTranscriptBudget } from "./budget.js";
-import { DEFAULT_HISTORY_MAX_CHARS } from "./constants.js";
-import { observeContext } from "./telemetry.js";
+import { blockBudget, historyCharacterLimit } from "./budget.js";
+import { materializeMedia, validateMediaBlocks, type MediaMaterializationBudget } from "./attachments.js";
+import { reconstruct, type ReconstructionGroup } from "./reconstruction.js";
+import { observeContext, publishContextSnapshot } from "./telemetry.js";
 
 export type SessionSettings = {
   cwd: string;
@@ -64,6 +65,7 @@ type SessionEntry = {
   turnCount: number;
   historyTransferred: boolean;
   conversation?: ConversationState;
+  executionGeneration?: string;
 };
 
 function settingsSignature(settings: SessionSettings): string {
@@ -122,6 +124,13 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
   };
 }
 
+async function reconstructionBlocks(message: HostMessage, cwd: string, budget: MediaMaterializationBudget): Promise<ContentBlock[]> {
+  if (message.role === "system") return [{ type: "text", text: `<instruction-update>\n${extractTextContent(message.content)}\n</instruction-update>` }];
+  if (message.role === "user" && Array.isArray(message.content) && message.content.some((p: any) => p?.type === "tool_result")) return hostResultMessageToAcp(message, [cwd], budget);
+  if (message.role === "user" && (!Array.isArray(message.content) || message.content.every((p: any) => !["tool_result", "tool_use"].includes(p?.type)))) return [{ type: "text", text: "[user]" }, ...await messageContentToAcp(message.content, [cwd], budget)];
+  return [{ type: "text", text: buildBoundedHistory([message], Number.MAX_SAFE_INTEGER) }];
+}
+
 export class SessionPool {
   private entries = new Map<string, SessionEntry>();
   private readonly maxQueue: number;
@@ -177,7 +186,7 @@ export class SessionPool {
       await waitForPrevious(previous, signal);
       if (this.disposed) throw new AgyProcessError("The Antigravity session pool has been shut down");
       if (signal.aborted) throw new AgyAbortError();
-      const unlock = await sessionStore.lockTurn(request.hostSessionID ? `host:${request.hostSessionID}` : request.key);
+      const unlock = await sessionStore.lockTurn(ownershipKey(request.key, request.hostSessionID));
       try {
         if (signal.aborted) throw new AgyAbortError();
         const identity = request.requestId || createHash("sha256").update(canonical({
@@ -215,6 +224,12 @@ export class SessionPool {
     const accepted = record?.conversation ?? entry.conversation;
     const hostEpoch = request.hostSessionID ? (await sessionStore.lifecycle(request.hostSessionID)).epoch : 0;
     const aligned = request.messages ? Boolean(incoming && accepted?.resumable && record?.executionProfile === profile && accepted.hostEpoch === hostEpoch && extendsBoundary(accepted.boundary, incoming)) : Boolean(entry.worker && entry.settingsSignature === signature);
+    if (!aligned && request.hostSessionID && await sessionStore.executionBinding(request.hostSessionID)) {
+      // Retire provenance before startup, including failed replacements.
+      entry.executionGeneration = randomUUID();
+      await sessionStore.saveExecutionBinding(request.hostSessionID, { generation: entry.executionGeneration, sourceSessionID: "" });
+      await publishContextSnapshot(request.hostSessionID);
+    }
     if (entry.worker && !aligned) {
       await entry.worker.stop();
       entry.worker = undefined;
@@ -246,43 +261,59 @@ export class SessionPool {
       const sessionId = aligned && record?.model === request.settings.model && record.effort === request.settings.effort ? record.sessionId : undefined;
       entry.worker = await createAcpWorker(workerOptions(request.settings, sessionId), request.signal);
       entry.settingsSignature = signature;
+      if (!entry.worker.resumed) {
+        entry.conversation = { version: 1, epoch: Math.max((accepted?.epoch ?? -1) + 1, hostEpoch), hostEpoch, boundary: [], instructions: request.instructions ?? "", hostSessionID: request.hostSessionID, resumable: false };
+        entry.executionGeneration = randomUUID();
+      } else entry.executionGeneration = record?.executionGeneration ?? randomUUID();
       const workerSession = entry.worker.sessionId;
+      if (request.hostSessionID && workerSession) {
+        await sessionStore.saveExecutionBinding(request.hostSessionID, { generation: entry.executionGeneration, sourceSessionID: workerSession });
+        if (await sessionStore.contextSnapshot(request.hostSessionID)) await publishContextSnapshot(request.hostSessionID);
+      }
       if (workerSession) await this.persistWorkerSafe(entry, request.key, request.settings);
-      info("created Antigravity ACP session worker", { resumed: Boolean(sessionId), poolSize: this.entries.size });
+      info("created Antigravity ACP session worker", { resumed: entry.worker.resumed, rebuilt: !entry.worker.resumed, poolSize: this.entries.size });
     }
+    const remoteAligned = aligned && Boolean(entry.worker.resumed || entry.historyTransferred);
+    const historyLimit = historyCharacterLimit();
 
-    const history = !entry.worker.resumed && !entry.historyTransferred && request.priorMessages?.length
-      ? buildBoundedHistory(request.priorMessages)
-      : "";
-    let prompt: ContentBlock[] = history
-      ? [{ type: "text", text: `${history}\n\n<current-user-message>` }, ...request.prompt, { type: "text", text: "</current-user-message>" }]
-      : [...request.prompt];
+    let prompt: ContentBlock[] = [...request.prompt];
+    if (!request.messages) {
+      validateMediaBlocks(request.prompt);
+      const mediaBudget = { remaining: Number.POSITIVE_INFINITY, signal: request.signal, inspect: true };
+      const groups: ReconstructionGroup[] = [];
+      if (!entry.worker.resumed && !entry.historyTransferred) {
+        const prior = request.priorMessages ?? [];
+        let queuedStart = 0;
+        prior.forEach((message, index) => { if (message.role === "assistant") queuedStart = index + 1; });
+        const checkpointIndex = hostEpoch > 0 ? prior.findIndex(message => message.role === "assistant") : -1;
+        for (const [index, message] of prior.entries()) groups.push({ message, blocks: await reconstructionBlocks(message, request.settings.cwd, mediaBudget), operative: message.role === "system" || (message.role === "user" && index >= queuedStart) || (checkpointIndex >= 0 && index <= checkpointIndex) });
+      }
+      groups.push({ message: { role: "user" }, blocks: request.prompt, operative: true });
+      prompt = reconstruct(groups, request.instructions ?? "", request.settings.model, historyLimit, request.settings.outputBudget);
+    }
     if (request.messages) {
-      const unseen = request.messages.slice(aligned ? accepted!.boundary.length : 0);
+      const unseen = request.messages.slice(remoteAligned ? accepted!.boundary.length : 0);
       let currentUserIndex = -1;
       for (let index = 0; index < unseen.length; index++) if (unseen[index].role === "user") currentUserIndex = index;
-      const groups: Array<{ blocks: ContentBlock[]; operative: boolean }> = [];
+      let queuedStart = aligned && accepted ? accepted.boundary.length - (remoteAligned ? accepted.boundary.length : 0) : 0;
+      if (!aligned) for (let index = 0; index < unseen.length; index++) if (unseen[index].role === "assistant") queuedStart = index + 1;
+      const groups: ReconstructionGroup[] = [];
+      const mediaBudget = { remaining: Number.POSITIVE_INFINITY, signal: request.signal, inspect: true };
+      // The wire carries no checkpoint ID. Conservatively protect the opening
+      // host-selected prefix through its first assistant after a committed epoch.
+      // This does not choose or reconstruct a hidden compaction tail.
+      const checkpointIndex = !remoteAligned && hostEpoch > 0 ? unseen.findIndex(message => message.role === "assistant") : -1;
       for (const [index, message] of unseen.entries()) {
-        let blocks: ContentBlock[];
-        if (message.role === "system") blocks = [{ type: "text", text: `<instruction-update>\n${extractTextContent(message.content)}\n</instruction-update>` }];
-        else if (message.role === "user" && Array.isArray(message.content) && message.content.some((p: any) => p?.type === "tool_result")) blocks = await hostResultMessageToAcp(message, [request.settings.cwd]);
-        else if (message.role === "user" && (!Array.isArray(message.content) || message.content.every((p: any) => !["tool_result", "tool_use"].includes(p?.type)))) blocks = [{ type: "text", text: "[user]" }, ...await messageContentToAcp(message.content, [request.settings.cwd])];
-        else blocks = [{ type: "text", text: buildBoundedHistory([message], Number.MAX_SAFE_INTEGER) }];
-        groups.push({ blocks, operative: message.role === "system" || index === currentUserIndex || (aligned && message.role === "user") });
+        const blocks = await reconstructionBlocks(message, request.settings.cwd, mediaBudget);
+        groups.push({ blocks, message, operative: message.role === "system" || (checkpointIndex >= 0 && index <= checkpointIndex) || index === currentUserIndex || (message.role === "user" && index >= queuedStart) });
       }
-      const fixed = [...(request.instructions ? [{ type: "text", text: request.instructions }] : []), ...groups.filter(group => group.operative).flatMap(group => group.blocks)];
-      const marker: ContentBlock = { type: "text", text: HISTORY_OMISSION };
-      let historyBytes = modelTranscriptBudget(request.settings.model, DEFAULT_HISTORY_MAX_CHARS, fixed.map(block => JSON.stringify(block)).join("\n"), request.settings.outputBudget) - blockBytes(marker);
-      let omitted = false;
-      prompt = groups.flatMap(group => {
-        if (group.operative) return group.blocks;
-        const bounded = boundHistoricalBlocks(group.blocks, historyBytes);
-        historyBytes = bounded.remaining; omitted ||= bounded.omitted;
-        return bounded.blocks;
-      });
-      if (omitted) prompt.unshift(marker);
+      prompt = reconstruct(groups, request.instructions ?? "", request.settings.model, historyLimit, request.settings.outputBudget);
     }
+    prompt = await materializeMedia(prompt, request.signal);
     if (request.instructions) prompt.unshift({ type: "text", text: request.instructions });
+    // The alternate path must enforce the same independent transport/context cap.
+    validateMediaBlocks(prompt);
+    blockBudget(request.settings.model, prompt, request.settings.outputBudget);
     // This write must succeed before sending a prompt that can change files.
     await sessionStore.saveReceipt(request.key, identity, { state: "prepared" });
     if (entry.conversation) entry.conversation.resumable = false;
@@ -302,7 +333,7 @@ export class SessionPool {
           await sessionStore.saveReceipt(request.key, identity, { state: "running" });
         }
         if (request.hostSessionID && event.event === "update" && event.update.sessionUpdate === "usage_update") {
-          await observeContext(request.hostSessionID, hostEpoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel);
+          await observeContext(request.hostSessionID, hostEpoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel, entry.executionGeneration);
         }
         bytes += Buffer.byteLength(JSON.stringify(event));
         if (bytes <= 2_000_000) events.push(event);
@@ -369,6 +400,7 @@ export class SessionPool {
     const previous = entry.record;
     const record: SessionRecord = {
       version: 1,
+      executionGeneration: entry.executionGeneration,
       conversation: entry.conversation,
       executionProfile: createHash("sha256").update(settingsSignature(settings)).digest("hex"),
       sessionId,
@@ -416,12 +448,9 @@ export class SessionPool {
   async forget(key: string): Promise<void> {
     const entry = this.entries.get(key);
     if (entry?.pending) throw new AgyBusyError("Cannot forget an active Antigravity session");
-    const unlock = await sessionStore.lockTurn(key);
-    try {
-      await entry?.worker?.stop();
-      this.entries.delete(key);
-      await sessionStore.delete(key);
-    } finally { await unlock(); }
+    await sessionStore.delete(key);
+    await entry?.worker?.stop();
+    this.entries.delete(key);
   }
 
   /** Release an idle process while retaining the persisted ACP resume point. */

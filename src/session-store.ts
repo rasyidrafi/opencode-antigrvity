@@ -7,11 +7,13 @@ import { acquireFileLock } from "./file-lock.js";
 import { AgyBusyError, AgyError } from "./errors.js";
 import type { AcpEvent } from "./protocol.js";
 import type { ContextSnapshot } from "./telemetry.js";
-import type { AutoAdmission } from "./auto-compaction.js";
 import { canonical, type ConversationState, type HostLifecycle } from "./coordinator.js";
 import { PAYLOAD_RETENTION_MS, pruneUtilityArtifacts } from "./retention.js";
+import { ownershipKey } from "./ownership-key.js";
+export { ownershipKey } from "./ownership-key.js";
 
 export type SessionRecord = {
+  executionGeneration?: string;
   version?: 1;
   conversation?: ConversationState;
   executionProfile?: string;
@@ -94,6 +96,7 @@ function validRecord(value: unknown): value is SessionRecord {
 
 function sanitizeRecord(value: SessionRecord): SessionRecord {
   return {
+    ...(typeof value.executionGeneration === "string" ? { executionGeneration: value.executionGeneration } : {}),
     ...(value.version === 1 && value.conversation?.version === 1 && Number.isSafeInteger(value.conversation.epoch) && value.conversation.epoch >= 0 && Array.isArray(value.conversation.boundary) && value.conversation.boundary.every(item => typeof item === "string") && typeof value.conversation.resumable === "boolean" ? { version: 1, conversation: value.conversation } : {}),
     sessionId: value.sessionId.slice(0, 200),
     ...(typeof value.executionProfile === "string" ? { executionProfile: value.executionProfile } : {}),
@@ -169,7 +172,7 @@ export class SessionStore {
         await rm(join(dataDirectory(), "requests", digest(key)), { recursive: true, force: true });
       }
       await this.mutate(records => { for (const key of keys) delete records[key]; });
-      for (const name of ["context", "auto-compaction", "lifecycle", "host-keys"]) await rm(join(dataDirectory(), name, `${digest(hostSessionID)}.json`), { force: true });
+      for (const name of ["context", "execution", "lifecycle", "host-keys"]) await rm(join(dataDirectory(), name, `${digest(hostSessionID)}.json`), { force: true });
       await atomicWrite(join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`), { version: 1, hostSessionID, cleaned: true });
     } finally { await unlockRecords?.(); await unlock?.(); await unlockLifecycle(); }
   }
@@ -249,16 +252,6 @@ export class SessionStore {
       for (const record of Object.values(records)) if (record.conversation?.hostSessionID === hostSessionID) record.conversation.resumable = false;
     });
   }
-  async autoAdmission(hostSessionID: string): Promise<AutoAdmission | undefined> {
-    try {
-      const value = JSON.parse(await readFile(join(dataDirectory(), "auto-compaction", `${digest(hostSessionID)}.json`), "utf8"));
-      if (value.version !== 1 || !Number.isSafeInteger(value.epoch) || value.epoch < 0 || typeof value.baseline !== "string" || typeof value.id !== "string" || !["pending", "admitted", "failed"].includes(value.phase)) throw new Error("Invalid auto compaction admission");
-      return value;
-    } catch (error: any) { if (error.code === "ENOENT") return undefined; await quarantineJson(join(dataDirectory(), "auto-compaction", `${digest(hostSessionID)}.json`), "invalid_auto_admission"); throw error; }
-  }
-  async saveAutoAdmission(hostSessionID: string, admission: AutoAdmission): Promise<void> {
-    await atomicWrite(join(dataDirectory(), "auto-compaction", `${digest(hostSessionID)}.json`), admission);
-  }
   async contextSnapshot(hostSessionID: string): Promise<ContextSnapshot | undefined> {
     try {
       const value = JSON.parse(await readFile(join(dataDirectory(), "context", `${digest(hostSessionID)}.json`), "utf8"));
@@ -268,6 +261,27 @@ export class SessionStore {
   }
   async saveContextSnapshot(hostSessionID: string, snapshot: ContextSnapshot): Promise<void> {
     await atomicWrite(join(dataDirectory(), "context", `${digest(hostSessionID)}.json`), snapshot);
+  }
+  async executionBinding(hostSessionID: string): Promise<{ generation: string; sourceSessionID: string } | undefined> {
+    try {
+      const value = JSON.parse(await readFile(join(dataDirectory(), "execution", `${digest(hostSessionID)}.json`), "utf8"));
+      if (!value || typeof value.generation !== "string" || !value.generation || typeof value.sourceSessionID !== "string") throw new Error("Invalid execution binding");
+      return value;
+    }
+    catch (error: any) { if (error.code === "ENOENT") return undefined; throw error; }
+  }
+  async saveExecutionBinding(hostSessionID: string, binding: { generation: string; sourceSessionID: string }): Promise<void> {
+    await atomicWrite(join(dataDirectory(), "execution", `${digest(hostSessionID)}.json`), binding);
+    const previous = await this.contextSnapshot(hostSessionID);
+    if (previous && (previous.executionGeneration !== binding.generation || previous.sourceSessionID !== binding.sourceSessionID)) {
+      // Invalidations are durable observations too: monotonically advance the
+      // v1 sequence so consumers cannot mistake unknown for a duplicate sample.
+      await this.saveContextSnapshot(hostSessionID, {
+        version: 1, hostSessionID, epoch: (await this.lifecycle(hostSessionID)).epoch,
+        sequence: previous.sequence + 1, state: "unknown",
+        executionGeneration: binding.generation, sourceSessionID: binding.sourceSessionID,
+      });
+    }
   }
   private async read(): Promise<DiskStore> {
     try {
@@ -314,7 +328,12 @@ export class SessionStore {
   }
 
   async delete(key: string): Promise<void> {
-    await this.mutate(records => { delete records[key]; });
+    await this.mutate(async records => {
+      const unlock = await this.lockTurn(ownershipKey(key, records[key]?.conversation?.hostSessionID));
+      try {
+        delete records[key];
+      } finally { await unlock(); }
+    });
   }
 
   async entries(): Promise<Array<[string, SessionRecord]>> {
@@ -456,9 +475,11 @@ export class SessionStore {
     await this.mutate(async records => {
       for (const [key, record] of Object.entries(records)) {
         if (protectedKeys.has(key) || record.lastUsedAt >= Date.now() - maxIdleMs) continue;
+        // Unattributed legacy host keys cannot establish the host lock.
+        if (key.startsWith("host-v1:") && !record.conversation?.hostSessionID) continue;
         let unlock: (() => Promise<void>) | undefined;
         try {
-          unlock = await this.lockTurn(key);
+          unlock = await this.lockTurn(ownershipKey(key, record.conversation?.hostSessionID));
           delete records[key];
         } catch (error) {
           if (!(error instanceof AgyBusyError)) throw error;
@@ -491,7 +512,7 @@ export class SessionStore {
         let unlockTurn: (() => Promise<void>) | undefined;
         let unlockResult: (() => Promise<void>) | undefined;
         try {
-          unlockTurn = await this.lockTurn(value.hostSessionID ? `host:${value.hostSessionID}` : key);
+          unlockTurn = await this.lockTurn(ownershipKey(key, value.hostSessionID ?? undefined));
           unlockResult = await this.lockTurn(`tool-result:${key}:${id}`);
           const current = await this.toolCall(key, id);
           if (!current?.result || typeof current.updatedAt !== "number" || current.updatedAt >= now - PAYLOAD_RETENTION_MS || (await this.receipt(key, value.requestId))?.state !== "completed") continue;
@@ -519,7 +540,15 @@ export class SessionStore {
         // work remain recovery evidence. Legacy records migrate conservatively.
         if (value.state !== "completed") continue;
         if (!Number.isFinite(value.updatedAt)) { value.updatedAt = now; await atomicWrite(path, value); }
-        else if (value.events && value.updatedAt < now - PAYLOAD_RETENTION_MS) { delete value.events; await atomicWrite(path, value); }
+        else if (value.events && value.updatedAt < now - PAYLOAD_RETENTION_MS && typeof value.conversationKey === "string" && digest(value.conversationKey) === directory) {
+          let unlock: (() => Promise<void>) | undefined;
+          try {
+            unlock = await this.lockTurn(ownershipKey(value.conversationKey, typeof value.hostSessionID === "string" ? value.hostSessionID : undefined));
+            const current = JSON.parse(await readFile(path, "utf8"));
+            if (current.state === "completed" && current.updatedAt < now - PAYLOAD_RETENTION_MS) { delete current.events; await atomicWrite(path, current); }
+          } catch (error) { if (!(error instanceof AgyBusyError)) throw error; }
+          finally { await unlock?.(); }
+        }
       }
     }
   }
@@ -554,7 +583,8 @@ export class SessionStore {
   }
 
   async saveReceipt(key: string, request: string, receipt: RequestReceipt): Promise<void> {
-    await atomicWrite(receiptPath(key, request), { version: 1, ...receipt, updatedAt: Date.now() });
+    const hostSessionID = (await this.get(key))?.conversation?.hostSessionID;
+    await atomicWrite(receiptPath(key, request), { version: 1, ...receipt, conversationKey: key, ...(hostSessionID ? { hostSessionID } : {}), updatedAt: Date.now() });
   }
 
 }

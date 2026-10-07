@@ -244,13 +244,11 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const sendTools = () => fetch(toolEvent.baseURL + "/messages", { method: "POST", headers: { ...toolEvent.headers, "content-type": "application/json" }, body: JSON.stringify({ model: "gemini-3.8-flash", messages: toolMessages, tools }) });
   const parked = await (await sendTools()).json();
   expect(parked.stop_reason).toBe("tool_use");
-  await sessionStore.saveAutoAdmission("deduplication-host", { version: 1, epoch: 1, baseline: "new-work", id: "msg_new_work", phase: "admitted" });
   const call = parked.content.find((part: any) => part.type === "tool_use");
   subscriptions[0].push(committed);
   subscriptions[0].push(failed);
   subscriptions[0].push({ id: "evt_deduplication_barrier", type: "session.compaction.ended", data: { sessionID: "deduplication-barrier" } });
   await waitEpoch("deduplication-barrier", 1);
-  expect((await sessionStore.autoAdmission("deduplication-host"))?.phase).toBe("admitted");
   toolMessages.push({ role: "assistant", content: parked.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: "NEW_WORK_RESULT_PRESERVED" }] });
   const continued = await (await sendTools()).json();
   expect(continued.stop_reason).toBe("end_turn");

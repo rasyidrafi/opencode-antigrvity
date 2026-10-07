@@ -14,7 +14,7 @@ import { getEventListeners } from "node:events";
 async function isolatedData(): Promise<() => Promise<void>> {
   const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
   const gemini = process.env.GEMINI_HOME;
-  const path = await mkdtemp("/tmp/opencode/agy-phase67-");
+  const path = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-phase67-`);
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = path;
   process.env.GEMINI_HOME = join(path, "gemini");
   return async () => {
@@ -66,7 +66,7 @@ test("capacity evicts completed idle workers and never evicts active work", asyn
 });
 
 test("utility retention removes dead abandoned private directories but protects live owners and unrelated paths", async () => {
-  const directory = await mkdtemp("/tmp/opencode/agy-utility-gc-");
+  const directory = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-utility-gc-`);
   try {
     const root = join(directory, "utilities");
     const dead = join(root, "utility-dead");
@@ -88,7 +88,7 @@ test("unknown ACP overrides fail closed regardless of version text", async () =>
 });
 
 test("lock release cannot delete a replacement owner; dead reaper and primary recover", async () => {
-  const directory = await mkdtemp("/tmp/opencode/agy-lock-");
+  const directory = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-lock-`);
   try {
     const path = join(directory, "turn.lock");
     const release = await acquireFileLock(path);
@@ -114,7 +114,7 @@ test("lock release cannot delete a replacement owner; dead reaper and primary re
 });
 
 test("effective auth scopes overrides, project/location, endpoint and credential revision without exposing secrets", async () => {
-  const home = await mkdtemp("/tmp/opencode/agy-auth-");
+  const home = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-auth-`);
   try {
     await mkdir(join(home, "antigravity-acp"));
     await writeFile(join(home, "antigravity-acp", "settings.json"), JSON.stringify({ auth: { type: "oauth-business" }, gcp: { project: "a", location: "us" } }));
@@ -180,21 +180,20 @@ test("ancillary corruption is privately quarantined without authorizing absent-r
   try {
     const store = new SessionStore();
     const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
-    for (const name of ["context", "lifecycle", "auto-compaction"]) {
+    for (const name of ["context", "lifecycle"]) {
       await mkdir(join(root, name));
       const { createHash } = await import("node:crypto");
       await writeFile(join(root, name, `${createHash("sha256").update("corrupt").digest("hex")}.json`), "invalid JSON");
     }
     await expect(store.contextSnapshot("corrupt")).rejects.toThrow();
     await expect(store.lifecycle("corrupt")).rejects.toThrow();
-    await expect(store.autoAdmission("corrupt")).rejects.toThrow();
     await expect(store.lifecycle("corrupt")).rejects.toThrow();
-    expect(await readdir(join(root, "quarantine"))).toHaveLength(3);
+    expect(await readdir(join(root, "quarantine"))).toHaveLength(2);
     await store.saveToolCall("corrupt-tools", "call", { call: { id: "call", name: "shell", input: {} } });
     const { createHash } = await import("node:crypto");
     await writeFile(join(root, "tools", createHash("sha256").update("corrupt-tools").digest("hex"), `${createHash("sha256").update("call").digest("hex")}.json`), "broken tool JSON");
     await expect(store.toolCall("corrupt-tools", "call")).rejects.toThrow();
-    expect(await readdir(join(root, "quarantine"))).toHaveLength(4);
+    expect(await readdir(join(root, "quarantine"))).toHaveLength(3);
   } finally { await restore(); }
 });
 
@@ -274,7 +273,7 @@ for (const winner of ["hook", "event"] as const) test(`checkpoint hook/${winner}
 
 test("seven-day completed payload retention keeps replay tombstones and protects parked records", async () => {
   const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
-  const directory = await mkdtemp("/tmp/opencode/agy-retention-");
+  const directory = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-retention-`);
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
   try {
     const store = new SessionStore();

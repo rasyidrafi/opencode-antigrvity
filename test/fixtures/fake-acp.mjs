@@ -2,6 +2,7 @@
 
 import readline from "node:readline";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 
 if (process.env.FAKE_ACP_PID_LOG) fs.appendFileSync(process.env.FAKE_ACP_PID_LOG, `${process.pid}\n`);
 
@@ -157,7 +158,7 @@ async function handlePrompt(message) {
   if (text.includes("FAKE_FALLBACK_AVAILABLE")) update({ sessionUpdate: "config_option_update", configOptions: [{ id: "model", category: "model", type: "select", name: "Model", currentValue: "gemini-3.8-flash-low", options: [
     { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }, { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" }, { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
   ] }] });
-  update({ sessionUpdate: "usage_update", used: 12, size: 1000 });
+  if (!process.env.FAKE_ACP_NO_USAGE) update({ sessionUpdate: "usage_update", used: 12, size: 1000 });
   if (text.includes("FAKE_CATALOG_UPDATE")) {
     update({ sessionUpdate: "config_option_update", configOptions: [{
       id: "model", category: "model", type: "select", name: "Model", currentValue: "new-server-model",
@@ -180,7 +181,7 @@ input.on("line", (line) => {
   if (message?.method === "initialize") {
     respond(message.id, {
       protocolVersion: 1,
-      agentCapabilities: { loadSession: true, promptCapabilities: { image: true, audio: true, embeddedContext: true }, sessionCapabilities: { list: {}, resume: {} }, auth: { logout: {} } },
+      agentCapabilities: { loadSession: process.env.FAKE_ACP_LOAD_MODE !== "unsupported", promptCapabilities: { image: true, audio: true, embeddedContext: true }, sessionCapabilities: { list: {}, resume: {} }, auth: { logout: {} } },
       authMethods: [{ id: "oauth-personal", name: "Fake Google" }],
       agentInfo: { name: "fake-antigravity-acp", title: "Fake ACP", version: "test" },
     });
@@ -192,7 +193,9 @@ input.on("line", (line) => {
       fail(message.id, -32602, "mcpServers is required");
       return;
     }
-    sessionId = "fake-acp-session-1";
+    // Distinct sessions must not alias one private trajectory across unrelated
+    // host owners. session/load below still preserves its requested identity.
+    sessionId = `fake-acp-session-${randomUUID()}`;
     respond(message.id, {
       sessionId,
       configOptions: [
@@ -207,6 +210,11 @@ input.on("line", (line) => {
       ],
     });
   } else if (message?.method === "session/load") {
+    if (process.env.FAKE_ACP_LOAD_MODE === "missing") { remembered = ""; fail(message.id, -32000, "Session not found"); return; }
+    if (process.env.FAKE_ACP_LOAD_MODE === "not-resumable") { remembered = ""; fail(message.id, -32000, "Session is not resumable"); return; }
+    if (process.env.FAKE_ACP_LOAD_MODE === "method-unsupported") { fail(message.id, -32601, "Method not found"); return; }
+    if (process.env.FAKE_ACP_LOAD_MODE === "auth") { fail(message.id, -32000, "Cannot load session: authentication required"); return; }
+    if (process.env.FAKE_ACP_LOAD_MODE === "rejected") { fail(message.id, -32000, "Cannot load session: permission denied"); return; }
     mcpServers = message.params.mcpServers;
     sessionId = String(message.params?.sessionId ?? sessionId);
     respond(message.id, { configOptions: [] });

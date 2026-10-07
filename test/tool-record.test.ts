@@ -8,7 +8,7 @@ import { canonical } from "../src/coordinator.js";
 const hash = (v: string) => createHash("sha256").update(v).digest("hex");
 test("tool V2 validates versions, ownership, profile and digests on every read; corruption stays nonretryable", async () => {
   const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
-  const root = await mkdtemp("/tmp/opencode/tool-record-");
+  const root = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/tool-record-`);
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = root;
   try {
     const store = new SessionStore();

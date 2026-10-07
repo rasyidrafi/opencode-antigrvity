@@ -8,9 +8,41 @@ import { runSummary } from "../src/utility.js";
 const live = process.env.OPENCODE_ANTIGRAVITY_ACP_LIVE === "1";
 
 describe("opt-in official Antigravity ACP live checks", () => {
+  test.skipIf(!live)("reports streamed context occupancy separately from terminal accounting", async () => {
+    const data = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-live-usage-`);
+    const detection = await detectAcpServer();
+    let worker: Awaited<ReturnType<typeof createAcpWorker>> | undefined;
+    const samples: Array<{ used: number; size: number }> = [];
+    const terminalUsage: Array<unknown> = [];
+    try {
+      worker = await createAcpWorker({ cwd: data, executable: detection.executable, executableArgs: detection.args, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
+      for (const prompt of ["Remember USAGE_CHECK_MAPLE_827. Reply OK only.", "Return the marker from my previous message only."]) {
+        for await (const event of worker.runTurn(prompt, AbortSignal.timeout(120_000))) {
+          if (event.event === "update" && event.update.sessionUpdate === "usage_update") {
+            samples.push({ used: event.update.used, size: event.update.size });
+          } else if (event.event === "result") {
+            expect(event.result.stopReason).toBe("end_turn");
+            terminalUsage.push(event.result.usage);
+          }
+        }
+      }
+      expect(samples.length).toBeGreaterThanOrEqual(2);
+      for (const sample of samples) {
+        expect(Number.isFinite(sample.used)).toBe(true);
+        expect(sample.used).toBeGreaterThan(0);
+        expect(sample.size).toBe(1_048_576);
+      }
+      // Do not require missing accounting forever: future server releases may
+      // legitimately add it. Occupancy must remain distinct either way.
+      console.info("ACP occupancy/accounting probe", JSON.stringify({ samples, terminalUsageAvailable: terminalUsage.map(value => value != null) }));
+    } finally {
+      await worker?.stop(true);
+      await rm(data, { recursive: true, force: true });
+    }
+  }, 300_000);
   test.skipIf(!live)("reviewed host-tool isolation profile initializes and runs a tool-free utility summary", async () => {
     const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
-    const data = await mkdtemp("/tmp/opencode/agy-live-isolated-");
+    const data = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-live-isolated-`);
     process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = data;
     try {
       const detection = await detectAcpServer();

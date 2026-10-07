@@ -390,7 +390,7 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
   const metaKind = detectMetaRequestKind(Array.isArray(requestMessages) ? requestMessages : [], readHeader(request, REQUEST_KIND_HEADER));
   if (metaKind) {
     try {
-      const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true });
+      const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true, signal: request.signal });
       const generated = metaKind === "generate" ? buildGenerateUtilityPrompt(normalized.messages) : undefined;
       const utilityPrompt = generated?.context ?? buildUtilityPrompt(metaKind, normalized.messages);
       const hostSession = readHeader(request, SESSION_HEADER);
@@ -424,7 +424,7 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
     events = hostBridge(`host-v1:${key}`, sessionID, cwd).request({ messages: body.messages, system: body.system, tools: body.tools, settings,
       baseURL: getProxyBaseUrl().replace(/\/v1$/, ""), requestId: readHeader(request, MESSAGE_HEADER), signal: request.signal });
   } else {
-    const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true });
+    const normalized = await normalizePrompt(requestMessages, { allowedRoots: [cwd], hostTools: true, signal: request.signal });
     events = sessionPool.turn({ key, requestId: readHeader(request, MESSAGE_HEADER), prompt: normalized.blocks,
       messages: normalized.messages, hostSessionID: sessionID,
       priorMessages: normalized.priorMessages.filter((m) => m.role !== "system"), instructions: hostInstructions(body.system, cwd), settings, signal: request.signal });

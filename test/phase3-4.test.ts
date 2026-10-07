@@ -42,7 +42,7 @@ test("refusal remains a refusal", () => {
 });
 test("occupancy replaces samples and rejects old epochs", async () => {
   const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
-  process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp("/tmp/opencode/telemetry-test-");
+  process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/telemetry-test-`);
   try {
     for (const used of [30_000, 31_000, 8_000]) await observeContext("host", 0, "remote", "model", { used, size: 100_000 });
     expect((await readContextSnapshot("host")).used).toBe(8_000);

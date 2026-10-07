@@ -22,7 +22,6 @@ import { sessionStore } from "./session-store.js";
 import { sessionPool } from "./session-pool.js";
 import { ContextTelemetry } from "./telemetry-rpc.js";
 import { onContextSnapshot, readContextSnapshot, publishContextSnapshot, markContextStale } from "./telemetry.js";
-import { failAutoCompaction } from "./auto-compaction.js";
 import { AgyError, retryAfterSeconds } from "./errors.js";
 import { warn, info as lifecycleInfo } from "./log.js";
 
@@ -284,7 +283,6 @@ export const AntigravityCliPlugin = Plugin.define({
             if (e.type === "session.compaction.started" && e.data?.sessionID) await sessionStore.compaction(e.data.sessionID, e.id ?? e.data.messageID ?? "pending", "generating");
             if ((e.type === "session.compaction.ended" || e.type === "session.compaction.failed") && e.data?.sessionID) {
               const sessionID = e.data.sessionID;
-              const admission = e.type === "session.compaction.failed" ? await sessionStore.autoAdmission(sessionID) : undefined;
               let checkpoints: string[] | undefined;
               if (e.type === "session.compaction.ended") try { checkpoints = await hostCheckpoints(sessionID); }
               catch { warn("Checkpoint read failed; retaining durable lifecycle event authority", { sessionID, reason: "context_event_read_failed" }); }
@@ -302,7 +300,6 @@ export const AntigravityCliPlugin = Plugin.define({
                 await closeHostBridges(sessionID);
                 await sessionPool.quiesceHostSession(sessionID);
               });
-              if (applied && admission) await failAutoCompaction(sessionID, admission.id);
               if (applied) await publishContextSnapshot(sessionID);
             }
             if ((e.type === "session.execution.interrupted" || e.type === "session.execution.failed") && e.data?.sessionID) await closeHostBridges(e.data.sessionID);

@@ -18,6 +18,7 @@ export async function hostEnvironment(environment: NodeJS.ProcessEnv, scope = "l
   const directory = join(home, "antigravity-acp");
   const cwd = join(home, "workspace");
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  await mkdir(join(directory, "conversations"), { recursive: true, mode: 0o700 });
   await mkdir(cwd, { recursive: true, mode: 0o700 });
   for (const name of ["acp_token.json", "acp_business_token.json", "settings.json"]) {
     let text: string;

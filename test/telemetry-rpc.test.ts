@@ -21,9 +21,9 @@ const clientPath = Bun.resolveSync("@opencode/client", dirname(fileURLToPath(imp
 const { OpenCode } = await import(clientPath);
 
 test("installed V2 client reads telemetry, consumes change events, resyncs, and enforces RPC/location/auth schemas", async () => {
-  const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "OPENCODE_ANTIGRAVITY_ACP_PATH", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV"];
+  const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "OPENCODE_ANTIGRAVITY_ACP_PATH", "GEMINI_HOME", "OPENCODE_ANTIGRAVITY_MODELS_DEV", "FAKE_ACP_NO_USAGE"];
   const old = keys.map(key => process.env[key]);
-  const root = await mkdtemp("/tmp/opencode/rpc-wire-");
+  const root = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/rpc-wire-`);
   const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
   process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
@@ -93,6 +93,27 @@ test("installed V2 client reads telemetry, consumes change events, resyncs, and 
     expect(await (await fetch(getProxyBaseUrl() + "/usage", { headers })).json()).toEqual(changed.value.data);
     expect((await fetch(getProxyBaseUrl() + "/usage", { headers: { [SESSION_HEADER]: "host" } })).status).toBe(401);
     expect((await fetch(getProxyBaseUrl() + "/usage", { headers: { "x-api-key": LOCAL_API_KEY } })).status).toBe(400);
+    // The replacement supplies no usage. Both the actual strict RPC schema
+    // and authenticated /v1/usage must resync to unknown, not old occupancy.
+    process.env.FAKE_ACP_NO_USAGE = "1";
+    const replacementEvent = changes.next();
+    expect((await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "EDITED_RPC_BASELINE" }] }) })).status).toBe(200);
+    const invalidated = (await replacementEvent).value.data;
+    expect(invalidated).toMatchObject({ epoch: 0, state: "unknown" });
+    expect(invalidated.sequence).toBeGreaterThan(changed.value.data.sequence);
+    expect((await changes.next()).value.data).toMatchObject({ epoch: 0, state: "unknown" });
+    const replaced = await rpc.read({ sessionID: "host" });
+    expect(replaced.state).toBe("unknown");
+    expect(replaced.used).toBeUndefined();
+    expect(await (await fetch(getProxyBaseUrl() + "/usage", { headers })).json()).toEqual(replaced);
+    delete process.env.FAKE_ACP_NO_USAGE;
+    const freshEvent = changes.next();
+    expect((await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FRESH_RPC_BASELINE" }] }) })).status).toBe(200);
+    let fresh = await freshEvent;
+    for (let i = 0; i < 3 && fresh.value.data.state === "unknown"; i++) fresh = await changes.next();
+    expect(fresh.value.data).toMatchObject({ state: "measured", used: 12 });
+    expect(await rpc.read({ sessionID: "host" })).toEqual(fresh.value.data);
+    expect(await (await fetch(getProxyBaseUrl() + "/usage", { headers })).json()).toEqual(fresh.value.data);
     const persisted = (await sessionStore.contextSnapshot("host"))!;
     await sessionStore.saveContextSnapshot("host", { ...persisted, observedAt: Date.now() - 300_001 });
     expect(await rpc.read({ sessionID: "host" })).toMatchObject({ state: "stale" });

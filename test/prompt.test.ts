@@ -33,8 +33,8 @@ describe("prompt normalization", () => {
       expect(body.length).toBeLessThanOrEqual(limit);
       expect(history).not.toContain("X".repeat(100));
     }
-    const history = buildBoundedHistory([{ role: "user", content: "X".repeat(10_000) }, { role: "assistant", content: "recent" }], 40);
-    expect(history.split("\n").slice(2, -1).join("\n").length).toBeLessThanOrEqual(40);
+    const history = buildBoundedHistory([{ role: "user", content: "X".repeat(10_000) }, { role: "assistant", content: "recent" }], 240);
+    expect(history.length).toBeLessThanOrEqual(240);
     expect(history).toContain("recent");
   });
 

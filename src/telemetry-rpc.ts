@@ -7,6 +7,7 @@ export const snapshotSchema = {
     epoch: { type: "integer", minimum: 0 }, sequence: { type: "integer", minimum: 0 },
     state: { type: "string", enum: ["measured", "unknown", "stale"] },
     sourceSessionID: { type: "string" }, model: { type: "string" }, requestedModel: { type: "string" }, baseline: { type: "string" },
+    executionGeneration: { type: "string" },
     observedAt: { type: "number", minimum: 0 }, used: { type: "number", minimum: 0 }, size: { type: "number", exclusiveMinimum: 0 },
   },
   required: ["version", "hostSessionID", "epoch", "sequence", "state"], additionalProperties: false,

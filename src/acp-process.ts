@@ -2,6 +2,7 @@ import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "n
 import { access, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
+import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import {
   client,
@@ -30,6 +31,7 @@ export type { AcpEvent } from "./protocol.js";
 export type AcpWorkerState = "created" | "starting" | "ready" | "turn_active" | "closing" | "closed" | "failed";
 
 export type AcpWorkerOptions = {
+  utility?: boolean;
   cwd: string;
   executable?: string;
   executableArgs?: string[];
@@ -211,7 +213,10 @@ function safeOptionKind(kind: PermissionOptionKind): boolean {
 
 function isMissingSessionError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /not found|unknown session|invalid session|no such session|cannot load/i.test(message);
+  // Loading is pre-inference, but an authorization rejection is never proof
+  // of an unavailable cache. Deny precedence also covers mixed messages.
+  if (/auth|permission|forbidden|access denied|unauthorized|credentials|login/i.test(message)) return false;
+  return /session.{0,200}not found|unknown session|invalid session|no such session|cannot load (?:stored )?session|method not found|session (?:cannot be resumed|is not resumable|has expired)|resume (?:is )?not supported/i.test(message);
 }
 
 function isAuthenticationRequired(error: unknown): boolean {
@@ -793,7 +798,8 @@ export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortS
   if (options.hostTools) await assertHostToolCompatibility(detection.executable);
   if (options.hostTools) {
     const isolated = await hostEnvironment({ ...process.env, ...options.environment,
-      ...(options.authMethod ? { OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: options.authMethod } : {}) }, options.catalogScope);
+      ...(options.authMethod ? { OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: options.authMethod } : {}) },
+      options.utility === true ? `${options.catalogScope ?? "local"}:utility:${randomUUID()}` : options.catalogScope);
     options = { ...options, ...isolated };
   }
   await bridgeCliAuthentication({

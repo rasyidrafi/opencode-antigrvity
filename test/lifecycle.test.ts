@@ -13,7 +13,7 @@ const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const settings = { cwd: process.cwd(), model: "fake-model-low", executable: fixture };
 async function setup() {
   await chmod(fixture, 0o755);
-  const directory = await mkdtemp("/tmp/opencode/lifecycle-");
+  const directory = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/lifecycle-`);
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
   process.env.FAKE_ACP_PROMPT_LOG = join(directory, "prompts.jsonl");
   delete process.env.FAKE_ACP_STATE_FILE;
@@ -130,12 +130,13 @@ describe("authoritative host lifecycle", () => {
       }
       const prompts = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
       expect(prompts).toHaveLength(2);
-      for (const sent of prompts) {
+      for (const [index, sent] of prompts.entries()) {
         expect(sent.prompt.reduce((sum: number, block: any) => sum + blockBytes(block), 0)).toBeLessThan(50000);
-        expect(sent.text).toContain(HISTORY_OMISSION);
+        if (index === 0) expect(sent.text).toContain(HISTORY_OMISSION);
+        else expect(sent.text).not.toContain(HISTORY_OMISSION);
         expect(sent.text).toContain("CURRENT_HEAD");
         expect(sent.text).toContain("CURRENT_TAIL");
-        expect(sent.prompt.filter((block: any) => block.type === "image")).toEqual([{ type: "image", data: "AA==", mimeType: "image/png" }]);
+        expect(sent.prompt.filter((block: any) => block.type === "image")).toEqual([...(index === 1 ? [{ type: "image", data: "A".repeat(120000), mimeType: "image/png" }] : []), { type: "image", data: "AA==", mimeType: "image/png" }]);
       }
       await expect(execute(pool, [{ role: "user", content: [{ type: "text", text: "C".repeat(60000) }, { type: "text", text: "OPERATIVE_TAIL" }] }], "oversized-operative")).rejects.toThrow("exhaust");
       expect((await readFile(log, "utf8")).trim().split("\n")).toHaveLength(2);

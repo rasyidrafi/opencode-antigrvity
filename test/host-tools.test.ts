@@ -36,6 +36,9 @@ const send = (session: string, messages: any[], extra: Record<string, unknown> =
 const result = (id: string, text: string, is_error = false) => ({ type: "tool_result", tool_use_id: id, content: text, is_error });
 
 test("installed host encoder preserves inline/promoted result images and image steering through proxy/MCP", async () => {
+  // Sanitized synthetic payloads, >90 KiB decoded each; no private screenshots.
+  const resultImage = Buffer.alloc(96 * 1024, 17).toString("base64");
+  const steeringImage = Buffer.alloc(100 * 1024, 23).toString("base64");
   const initial = [{ role: "user", content: "FAKE_MCP ENCODER_MEDIA" }];
   const first = await (await send("encoder-media", initial)).json();
   const call = first.content.find((part: any) => part.type === "tool_use");
@@ -44,8 +47,8 @@ test("installed host encoder preserves inline/promoted result images and image s
     messages: [
       { role: "user", content: [{ type: "text", text: initial[0].content }] },
       { role: "assistant", content: [{ type: "tool-call", id: call.id, name: call.name, input: call.input }] },
-      { role: "tool", content: [{ type: "tool-result", id: call.id, name: call.name, result: { type: "content", value: [{ type: "text", text: "ENCODER_RESULT" }, { type: "file", uri: "data:image/png;base64,AA==", mime: "image/png" }] } }] },
-      { role: "user", content: [{ type: "text", text: "IMAGE_STEERING" }, { type: "media", media: { mediaType: "image/png", source: { type: "base64" }, inline: () => ({ mime: "image/png", base64: "AQ==" }) } }] },
+      { role: "tool", content: [{ type: "tool-result", id: call.id, name: call.name, result: { type: "content", value: [{ type: "text", text: "ENCODER_RESULT" }, { type: "file", uri: `data:image/png;base64,${resultImage}`, mime: "image/png" }] } }] },
+      { role: "user", content: [{ type: "text", text: "IMAGE_STEERING" }, { type: "media", media: { mediaType: "image/png", source: { type: "base64" }, inline: () => ({ mime: "image/png", base64: steeringImage }) } }] },
     ],
   } as any));
   const encodedResult = body.messages.find((m: any) => m.content.some((p: any) => p.type === "tool_result"));
@@ -59,8 +62,8 @@ test("installed host encoder preserves inline/promoted result images and image s
   const content = JSON.stringify(final.content);
   expect(content).toContain("ENCODER_RESULT");
   expect(content).toContain("IMAGE_STEERING");
-  expect(content).toContain("AA==");
-  expect(content).toContain("AQ==");
+  expect(content).toContain(resultImage);
+  expect(content).toContain(steeringImage);
 
   const recoveredInitial = [{ role: "user", content: "FAKE_MCP IMAGE_RECOVERY" }];
   const lost = await (await send("encoder-image-recovery", recoveredInitial)).json();
@@ -75,7 +78,7 @@ test("installed host encoder preserves inline/promoted result images and image s
   expect(recoveredBody.error).toBeUndefined();
   expect(recoveredResponse.status).toBe(200);
   const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
-  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual(["AA==", "AQ=="]);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([resultImage, steeringImage]);
 });
 
 test("MCP cancellation request IDs interrupt their bridge without a successful empty result", async () => {

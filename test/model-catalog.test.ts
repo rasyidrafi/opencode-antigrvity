@@ -7,7 +7,7 @@ import { acpModelCatalog } from "../src/models.js";
 import { emitAcpCatalog } from "../src/catalog-events.js";
 
 test("malformed inventory caches are quarantined and never create available models", async () => {
-  const directory = await mkdtemp("/tmp/opencode/agy-corrupt-catalog-");
+  const directory = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-corrupt-catalog-`);
   await writeFile(join(directory, "account.json"), "broken cache");
   const manager = new ModelCatalog(directory, { context: async () => ({ scope: "account", executable: "fake", args: [], cacheDirectory: directory }), probe: async () => { throw new Error("offline"); } });
   try {

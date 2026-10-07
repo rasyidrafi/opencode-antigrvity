@@ -7,6 +7,9 @@ import { extractTextContent, messageContentToAcp, normalizePrompt, type HostMess
 import { envNumber } from "./constants.js";
 import { sessionStore } from "./session-store.js";
 import { canonical } from "./coordinator.js";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
+import { MAX_MEDIA_BYTES, validateMediaBlocks } from "./attachments.js";
+import { blockBudget } from "./budget.js";
 
 export type HostTool = { name: string; description?: string; input_schema: Record<string, unknown> };
 export type HostCall = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
@@ -32,11 +35,13 @@ export function parseHostTools(value: unknown): HostTool[] {
 function resultContent(value: unknown): Record<string, unknown>[] {
   if (typeof value === "string") return [{ type: "text", text: value }];
   if (!Array.isArray(value)) return [{ type: "text", text: "" }];
-  return value.map((part) => {
+  const content = value.map((part) => {
     if (part?.type === "text" && typeof part.text === "string") return { type: "text", text: part.text };
     if (part?.type === "image" && part.source?.type === "base64" && typeof part.source.data === "string" && typeof part.source.media_type === "string" && part.source.media_type.startsWith("image/")) return { type: "image", data: part.source.data, mimeType: part.source.media_type };
     throw new AgyError("unsupported", "Unsupported OpenCode tool-result content");
   });
+  validateMediaBlocks(content as ContentBlock[], Number.POSITIVE_INFINITY);
+  return content;
 }
 
 function promotedImages(content: unknown): Map<any, string> {
@@ -69,6 +74,8 @@ export function hostResults(messages: unknown): Map<string, ToolResult> {
     }
     for (const [image, id] of promotedImages(message.content)) result.get(id)?.content.push(...resultContent([image]));
   }
+  // Aggregate admission belongs to the actual delivery, including pending
+  // results and steering, not historical result inspection/recovery.
   return result;
 }
 
@@ -201,6 +208,11 @@ export class HostBridge {
       }
       const tools = parseHostTools(input.tools);
       const signature = profile(tools, input.settings);
+      if (this.active) {
+        // Only this batch is operative. Admit its accumulated partial results
+        // before persistence, not unrelated historical/settled result groups.
+        validateMediaBlocks([...this.reported].flatMap(id => (results.get(id) ?? this.pending.get(id)?.result)?.content ?? []) as ContentBlock[]);
+      }
       if (this.active && signature !== this.signature) {
         // Accept under the originating profile before retiring its waiter. The
         // replacement prompt imports host calls/results; it never reissues them.
@@ -228,11 +240,19 @@ export class HostBridge {
             if (input.messages[i]?.role === "assistant") break;
             trailing.unshift(input.messages[i]);
           }
-          const steering = (await Promise.all(trailing.filter(m => m.role === "user").map(m => {
+          // Include results accepted on earlier partial continuations as well
+          // as this request; parallel deliveries share one aggregate allowance.
+          const deliveryContent = [...this.reported].flatMap(id => this.pending.get(id)!.result!.content) as ContentBlock[];
+          const steeringBudget = { remaining: MAX_MEDIA_BYTES - validateMediaBlocks(deliveryContent), signal: input.signal };
+          const steering: ContentBlock[] = [];
+          for (const m of trailing.filter(m => m.role === "user")) {
             const promoted = promotedImages(m.content);
-            return messageContentToAcp(Array.isArray(m.content) ? m.content.filter((p: any) => p?.type !== "tool_result" && !promoted.has(p)) : m.content, [this.cwd]);
-          }))).flat();
+            steering.push(...await messageContentToAcp(Array.isArray(m.content) ? m.content.filter((p: any) => p?.type !== "tool_result" && !promoted.has(p)) : m.content, [this.cwd], steeringBudget));
+          }
           const append = nextInstructions !== this.instructions ? nextInstructions : "";
+          const delivery = [...deliveryContent, ...steering, ...(append ? [{ type: "text" as const, text: append }] : [])];
+          validateMediaBlocks(delivery);
+          blockBudget(input.settings.model, delivery, input.settings.outputBudget);
           const last = [...this.reported].at(-1);
           const requestID = this.turn?.identity?.value ?? this.turn?.requestId;
           if (requestID) await sessionStore.saveReceipt(this.key, requestID, { state: "running" });
@@ -297,7 +317,7 @@ export class HostBridge {
           if (missing.length) throw new AgyError("invalid_request", "Previously exposed tool calls have no recorded result. Their execution is uncertain; reconcile the original host results before continuing. They cannot be executed again automatically.", { code: "agy_tool_execution_uncertain", retryable: false });
           if (restored.length) messages.push({ role: "user", content: restored });
         }
-        const normalized = await normalizePrompt(messages, { allowedRoots: [this.cwd], hostTools: true });
+        const normalized = await normalizePrompt(messages, { allowedRoots: [this.cwd], hostTools: true, signal: input.signal });
         this.tools = tools; this.signature = signature;
         this.queue = new AsyncEventQueue<Wake>(); this.controller = new AbortController();
         this.settled.clear(); this.reported.clear(); this.active = true;
