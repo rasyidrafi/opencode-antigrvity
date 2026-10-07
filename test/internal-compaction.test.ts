@@ -43,8 +43,6 @@ test("synthetic ACP compaction notifications preserve worker, session ID, and ep
     const after = await store.get("internal");
     expect(after!.sessionId).toBe(before!.sessionId);
     expect(after!.conversation!.epoch).toBe(before!.conversation!.epoch);
-    expect(after!.conversation!.hostEpoch).toBe(before!.conversation!.hostEpoch);
-    expect((await store.lifecycle("host-internal")).epoch).toBe(0);
     expect((await readFile(join(directory, "pids"), "utf8")).trim().split("\n")).toHaveLength(1);
     const prompts = (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line).text);
     expect(prompts).toHaveLength(3);

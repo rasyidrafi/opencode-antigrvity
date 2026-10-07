@@ -94,7 +94,7 @@ const RESEARCHED: Record<string, ResearchedModelMetadata> = {
 };
 
 function canonicalId(model: AcpModel): string {
-  let id = model.id.toLowerCase().replace(/^antigravity-cli\//, "");
+  let id = model.id.toLowerCase().replace(/^antigravity\//, "");
   if (model.family) id = model.family.toLowerCase();
   else id = id.replace(/-(?:low|medium|high)$/i, "");
   if (id === "gemini-3.1-pro") return "gemini-3.1-pro-preview";

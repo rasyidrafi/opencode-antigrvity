@@ -7,29 +7,26 @@ import { effectiveAuth } from "./effective-auth.js";
 
 /** ACP supplies inference, OpenCode supplies tools. Do not import global MCP,
  * hooks, skills, or workspace hooks into this second harness. */
-export async function hostEnvironment(environment: NodeJS.ProcessEnv, scope = "local") {
+export async function hostEnvironment(environment: NodeJS.ProcessEnv, scope = "local", utilityDirectory?: string) {
   await bridgeCliAuthentication(environment);
   const effective = await effectiveAuth(environment);
   const source = effective.home;
   const data = environment.OPENCODE_ANTIGRAVITY_DATA_DIR?.trim() ||
     join(environment.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode-antigravity");
   const key = createHash("sha256").update(`${effective.scope}:${scope}`).digest("hex");
-  const home = join(data, "host-acp", key);
+  const home = utilityDirectory ?? join(data, "host-acp", key);
   const directory = join(home, "antigravity-acp");
   const cwd = join(home, "workspace");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await mkdir(join(directory, "conversations"), { recursive: true, mode: 0o700 });
   await mkdir(cwd, { recursive: true, mode: 0o700 });
-  for (const name of ["acp_token.json", "acp_business_token.json", "settings.json"]) {
+  for (const name of ["acp_token.json", "acp_business_token.json"]) {
     let text: string;
     try { text = await readFile(join(source, "antigravity-acp", name), "utf8"); }
     catch (error: any) {
       if (error.code !== "ENOENT") throw error;
       await rm(join(directory, name), { force: true });
       continue;
-    }
-    if (name === "settings.json") {
-      text = JSON.stringify(effective.settings);
     }
     const target = join(directory, name);
     const temporary = `${target}.${randomUUID()}.tmp`;

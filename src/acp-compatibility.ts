@@ -20,5 +20,5 @@ export async function assertHostToolCompatibility(executable: string): Promise<v
   try {
     if (profile && await sha256(executable) === profile[0] && await sha256(join(dirname(executable), "localharness_external")) === profile[1]) return;
   } catch { /* Missing companion or unknown executable fails closed. */ }
-  throw new AgyError("unsupported", "This ACP executable has no tested host-tool isolation profile. Use the official Antigravity ACP 1.3.0 Linux x64 distribution (including its companion), or request a reviewed compatibility profile for your platform/build. Version text and executable overrides cannot establish tool-filter safety.", { code: "agy_acp_compatibility" });
+  throw new AgyError("unsupported", "This ACP executable has no tested host-tool isolation profile. Use the official Antigravity 1.3.0 Linux x64 ACP distribution (including its companion), or request a reviewed compatibility profile for your platform/build. Version text and executable overrides cannot establish tool-filter safety.", { code: "agy_acp_compatibility" });
 }

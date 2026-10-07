@@ -99,7 +99,7 @@ export function catalogFromSession(response: unknown, executable: string, versio
 export type AcpModelSelection = { requestedModel: string; acpModel: string; effort?: AcpEffort };
 
 export function resolveAcpModelSelection(requestedModel: string | undefined, requestedEffort: string | undefined, catalog: AcpModelCatalog): AcpModelSelection {
-  const raw = (requestedModel ?? catalog.models[0]?.id ?? "").replace(/^antigravity-cli\//, "").trim();
+  const raw = (requestedModel ?? catalog.models[0]?.id ?? "").replace(/^antigravity\//, "").trim();
   if (!raw) throw new AgyError("unknown_model", "Antigravity model discovery has not returned any available models", { code: "agy_no_model" });
   const model = catalog.models.find((entry) => entry.id === raw) ?? catalog.exactModels.find((entry) => entry.id === raw);
   if (!model) throw new AgyError("unknown_model", `Unknown Antigravity model "${raw}"`, { code: "agy_unknown_model", details: { available: catalog.exactModels.map((entry) => entry.id) } });

@@ -155,34 +155,6 @@ test("both assemblers continue when accumulated media exceeds the selected promp
   });
 });
 
-test("committed epoch preserves a summary encoded by the installed host codec", async () => {
-  // Codec evidence, not proof of native checkpoint-to-message preprocessing.
-  const Effect = await import(Bun.resolveSync("effect/Effect", dirname(import.meta.resolve("@opencode/ai"))));
-  const summary = `ACCEPTED_SUMMARY ${"sanitized checkpoint fact ".repeat(35)}`.trim();
-  const body: any = await Effect.runPromise(anthropicProtocol.body.from({
-    model: { id: "gemini-3.8-flash", provider: "antigravity-cli", route: {} }, system: [], tools: [],
-    messages: [
-      { role: "assistant", content: [{ type: "text", text: summary }] },
-      { role: "user", content: [{ type: "text", text: "OPTIONAL_OLD".repeat(10000) }] },
-      { role: "assistant", content: [{ type: "text", text: "RECENT_TAIL_DECISION" }] },
-      { role: "user", content: [{ type: "text", text: "CURRENT_CONTINUATION" }] },
-    ],
-  } as any));
-  expect(body.messages[0].role).toBe("assistant");
-  expect(text(await messageContentToAcp(body.messages[0].content))).toBe(summary);
-  await withFixturePool(async (pool, root, executable) => {
-    const store = new SessionStore();
-    await store.compaction("checkpoint-host", "accepted-fixture", "committed");
-    expect((await store.lifecycle("checkpoint-host")).epoch).toBe(1);
-    for await (const _ of pool.turn({ key: "checkpoint-fixture", hostSessionID: "checkpoint-host", messages: body.messages, prompt: [{ type: "text", text: "CURRENT_CONTINUATION" }], settings: { cwd: root, model: "fake-model-low", executable } })) { /* drain */ }
-    const sent = JSON.parse((await readFile(join(root, "prompts.jsonl"), "utf8")).trim()).text;
-    expect(sent).toContain(summary);
-    expect(sent).toContain("RECENT_TAIL_DECISION");
-    expect(sent).toContain("CURRENT_CONTINUATION");
-    expect(sent).not.toContain("OPTIONAL_OLD");
-  });
-});
-
 test("oversized sparse local image fails before materialization; unsupported media remains early", async () => {
   const root = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/phase2-media-`);
   const path = join(root, "large.png");

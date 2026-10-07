@@ -3,18 +3,12 @@ import { detectMetaRequestKind } from "../src/request-kind.js";
 import { buildGenerateUtilityPrompt, buildUtilityPrompt } from "../src/utility.js";
 
 describe("isolated utility request detection", () => {
-  test("recognizes title and summary prompts", () => {
-    expect(detectMetaRequestKind([{ role: "system", content: "You are a title generator. Output only a thread title." }, { role: "user", content: "Fix login" }])).toBe("title");
-    expect(detectMetaRequestKind([{ role: "system", content: "You are tasked with summarizing conversations." }])).toBe("summary");
-  });
-
-  test("uses explicit host routing and does not classify quoted user phrases", () => {
-    const quoted = [{ role: "user", content: "Fix parsing of <previous-summary> in this code." }];
-    expect(detectMetaRequestKind(quoted)).toBeNull();
-    expect(detectMetaRequestKind(quoted, "title")).toBe("title");
-    expect(detectMetaRequestKind(quoted, "compaction")).toBe("summary");
-    expect(detectMetaRequestKind(quoted, "generate")).toBe("generate");
-    expect(detectMetaRequestKind([{ role: "system", content: "title generator" }], "chat")).toBeNull();
+  test("uses only explicit host routing", () => {
+    expect(detectMetaRequestKind()).toBeNull();
+    expect(detectMetaRequestKind("chat")).toBeNull();
+    expect(detectMetaRequestKind("title")).toBe("title");
+    expect(detectMetaRequestKind("compaction")).toBe("compaction");
+    expect(detectMetaRequestKind("generate")).toBe("generate");
   });
 
   test("quotes utility input instead of treating it as instructions", () => {

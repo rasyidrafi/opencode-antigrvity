@@ -7,7 +7,7 @@ import { chmod, mkdtemp } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { AntigravityCliPlugin } from "../src/index.js";
+import { AntigravityPlugin } from "../src/index.js";
 import { ContextTelemetry } from "@rasyid_rafi/opencode-antigravity/rpc";
 import { sessionStore } from "../src/session-store.js";
 import { AsyncEventQueue } from "../src/acp-process.js";
@@ -71,7 +71,7 @@ test("installed V2 client reads telemetry, consumes change events, resyncs, and 
       integration: { connection: { active: async () => ({}), resolve: async () => ({ type: "key", key: LOCAL_API_KEY }) }, transform: async (fn: any) => { fn({ update() {}, method: { update() {} } }); } },
       provider: { reload: async () => {}, transform: async (fn: any) => { fn({ add() {} }); } },
     };
-    cleanup = await (AntigravityCliPlugin as any).setup(ctx);
+    cleanup = await (AntigravityPlugin as any).setup(ctx);
     const client = OpenCode.make({ baseUrl: server.url.toString() });
     const rpc = client.rpc(ContextTelemetry);
     const initial = await rpc.read({ sessionID: "host" });
@@ -117,12 +117,12 @@ test("installed V2 client reads telemetry, consumes change events, resyncs, and 
     const persisted = (await sessionStore.contextSnapshot("host"))!;
     await sessionStore.saveContextSnapshot("host", { ...persisted, observedAt: Date.now() - 300_001 });
     expect(await rpc.read({ sessionID: "host" })).toMatchObject({ state: "stale" });
-    const unknownEvent = changes.next();
     hostEvents.push({ id: "evt_rpc_commit", type: "session.compaction.ended", data: { sessionID: "host" } });
-    expect((await unknownEvent).value.data).toMatchObject({ epoch: 1, state: "unknown" });
+    await Bun.sleep(20);
+    expect(await sessionStore.contextSnapshot("host")).toEqual({ ...persisted, observedAt: expect.any(Number) });
     await changes.return();
     // Read is the authoritative resync after a missed live event.
-    expect(await rpc.read({ sessionID: "host" })).toMatchObject({ epoch: 1, state: "unknown" });
+    expect(await rpc.read({ sessionID: "host" })).toMatchObject({ epoch: persisted.epoch, state: "stale" });
     await cleanup(); cleaned = true;
     await expect(rpc.read({ sessionID: "host" })).rejects.toMatchObject({ type: "rpc.unavailable" });
   } finally {

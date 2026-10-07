@@ -10,7 +10,14 @@ export function canonical(value: unknown): string {
 
 export function fingerprints(messages: HostMessage[]): string[] {
   return messages.map(m => {
-    const content = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content.map(part => part?.type === "thinking" ? { type: "thinking", thinking: part.thinking } : part) : m.content;
+    const content = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content.map(part => {
+      if (!part || typeof part !== "object") return part;
+      if (part.type === "thinking") return { type: "thinking", thinking: part.thinking };
+      // OpenCode moves the Anthropic cache marker to the newest message on
+      // every request. It is transport metadata, not a history edit.
+      const { cache_control: _cache, ...semantic } = part;
+      return semantic;
+    }) : m.content;
     return createHash("sha256").update(canonical({ role: m.role, content, tool_calls: m.tool_calls, tool_call_id: m.tool_call_id })).digest("hex");
   });
 }
@@ -26,7 +33,4 @@ export type ConversationState = {
   instructions: string;
   hostSessionID?: string;
   resumable: boolean;
-  hostEpoch?: number;
 };
-
-export type HostLifecycle = { version: 1; epoch: number; checkpoints?: string[]; reconciledCheckpoint?: string; transaction?: { id: string; phase: "generating" | "committed" | "failed"; sourceEpoch: number; boundaries: Record<string, { epoch: number; boundary: string[] }> }; commits: string[]; failures: string[] };

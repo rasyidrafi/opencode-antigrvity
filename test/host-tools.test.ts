@@ -43,7 +43,7 @@ test("installed host encoder preserves inline/promoted result images and image s
   const first = await (await send("encoder-media", initial)).json();
   const call = first.content.find((part: any) => part.type === "tool_use");
   const body: any = await Effect.runPromise(anthropicProtocol.body.from({
-    model: { id: "gemini-3.8-flash", provider: "antigravity-cli", route: {} }, system: [], tools: [],
+    model: { id: "gemini-3.8-flash", provider: "antigravity", route: {} }, system: [], tools: [],
     messages: [
       { role: "user", content: [{ type: "text", text: initial[0].content }] },
       { role: "assistant", content: [{ type: "tool-call", id: call.id, name: call.name, input: call.input }] },
@@ -168,7 +168,7 @@ test("cross-session results cannot resolve tools; stopped calls rebuild with acc
   expect(recovered.content.some((part: any) => part.type === "tool_use")).toBe(false);
 });
 
-test("compaction retires parked calls and imports their completed results into the committed epoch", async () => {
+test("host compaction leaves parked calls and their completed results intact", async () => {
   const { sessionStore } = await import("../src/session-store.js");
   const host = "parked-compaction";
   const original = [{ role: "user", content: "FAKE_MCP_PARALLEL" }];
@@ -182,22 +182,18 @@ test("compaction retires parked calls and imports their completed results into t
   const oldBinding = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
   expect((await sessionStore.toolCall(oldBinding[0], calls[0].id))!.delivery).toBe("result-persisted");
   const summary = await send(host, [...partialMessages, { role: "user", content: "Summarize the selected prefix." }], { system: "Keep exact identifiers", tools: undefined }, { "x-opencode-antigravity-request-kind": "compaction" });
-  expect(summary.status).toBe(200);
-  await sessionStore.compaction(host, "parked-compaction-commit", "committed");
-  const continued = await (await send(host, [{ role: "user", content: "COMMITTED_CHECKPOINT" }, { role: "assistant", content: first.content }, { role: "user", content: [result(calls[0].id, "COMPLETED_ONCE"), result(calls[1].id, "COMPLETED_SECOND_ONCE")] }])).json();
+  expect(summary.status).toBe(400);
+  expect((await summary.json()).error.code).toBe("agy_internal_compaction");
+  expect(await sessionStore.get(oldBinding[0])).toEqual(oldBinding[1]);
+  const continued = await (await send(host, [...original, { role: "assistant", content: first.content }, { role: "user", content: [result(calls[0].id, "COMPLETED_ONCE"), result(calls[1].id, "COMPLETED_SECOND_ONCE")] }])).json();
   expect(continued.stop_reason).toBe("end_turn");
   expect(continued.content.some((part: any) => part.type === "tool_use")).toBe(false);
   const binding = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
-  expect(binding[1].conversation!.hostEpoch).toBe(1);
-  for (const call of calls) expect((await sessionStore.toolCall(binding[0], call.id))!.delivery).toBe("result-persisted");
-  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!).text;
-  for (const call of calls) {
-    expect(rebuilt).toContain(`[tool shell ${call.id}]`);
-    expect(rebuilt).toContain(`[tool result ${call.id}]`);
-    expect(rebuilt.indexOf(`[tool shell ${call.id}]`)).toBeLessThan(rebuilt.indexOf(`[tool result ${call.id}]`));
-  }
-  expect(rebuilt).toContain("COMPLETED_ONCE");
-  expect(rebuilt).toContain("COMPLETED_SECOND_ONCE");
+  expect(binding[1].sessionId).toBe(oldBinding[1].sessionId);
+  expect(binding[1].conversation!.epoch).toBe(oldBinding[1].conversation!.epoch);
+  for (const call of calls) expect((await sessionStore.toolCall(binding[0], call.id))!.delivery).toBe("locally-handed-off");
+  expect(JSON.stringify(continued)).toContain("COMPLETED_ONCE");
+  expect(JSON.stringify(continued)).toContain("COMPLETED_SECOND_ONCE");
 });
 
 test("tool schema and media conversion retain the native host contract", () => {
@@ -288,20 +284,6 @@ test("conflicting persisted results are terminal and private to their conversati
   await expect(store.saveToolResult("another-session", "call", completed)).rejects.toThrow("originating");
 });
 
-test("terminal acceptance is durable, call-scoped and independent of fabricated results", async () => {
-  const { SessionStore } = await import("../src/session-store.js");
-  const store = new SessionStore();
-  await store.saveToolCall("terminal-durable", "terminal-call", { call: { id: "terminal-call", name: "StructuredOutput", input: { answer: 42 } }, hostSessionID: "terminal-host", profile: '{"model":"model","tools":[{"input_schema":{},"name":"StructuredOutput"}]}' });
-  expect(await store.acceptTerminalCall("terminal-durable", "wrong-host", "terminal-call", "wrong-event")).toBe(false);
-  expect(await store.acceptTerminalCall("terminal-durable", "terminal-host", "wrong-call", "wrong-event")).toBe(false);
-  expect(await store.acceptTerminalCall("terminal-durable", "terminal-host", "terminal-call", "accepted-event")).toBe(true);
-  const restarted = new SessionStore();
-  expect((await restarted.toolCall("terminal-durable", "terminal-call"))?.terminalAcceptance).toMatchObject({ hostSessionID: "terminal-host", eventID: "accepted-event" });
-  expect(await restarted.acceptTerminalCall("terminal-durable", "terminal-host", "terminal-call", "duplicate-event")).toBe(true);
-  expect((await restarted.toolCall("terminal-durable", "terminal-call"))?.terminalAcceptance).toMatchObject({ eventID: "accepted-event" });
-  expect((await restarted.toolCall("terminal-durable", "terminal-call"))?.result).toBeUndefined();
-});
-
 test("failed durable file sync cannot acknowledge a tool result", async () => {
   const { SessionStore } = await import("../src/session-store.js");
   const store = new SessionStore();
@@ -369,14 +351,12 @@ test("generic host idle expiry retires a pending tool without fabricating succes
     await new Promise(resolve => setTimeout(resolve, 1300));
     const saved = await sessionStore.toolCall(key, first.content[0].id);
     expect(saved?.result).toBeUndefined();
-    expect(saved?.terminalAcceptance).toBeUndefined();
     const { sessionPool } = await import("../src/session-pool.js");
     expect((await sessionPool.status(key)).active).toBe(false);
   } finally { delete process.env.OPENCODE_ANTIGRAVITY_HOST_IDLE_MS; }
 });
 
-test("StructuredOutput success events cannot abort ordinary result delivery or a newer call", async () => {
-  const { recordHostToolSuccess } = await import("../src/host-tools.js");
+test("StructuredOutput uses ordinary result delivery across turns", async () => {
   const { sessionStore } = await import("../src/session-store.js");
   const session = "ordinary-structured-output";
   const tools = [{ name: "StructuredOutput", input_schema: { type: "object" } }];
@@ -384,8 +364,6 @@ test("StructuredOutput success events cannot abort ordinary result delivery or a
   const first = await (await send(session, messages, { tools })).json();
   const call = first.content.find((part: any) => part.type === "tool_use");
   const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === session)!;
-  await recordHostToolSuccess(session, call.id, "original-success");
-  await recordHostToolSuccess(session, call.id, "duplicate-success");
   expect((await sessionStore.toolCall(key, call.id))?.result).toBeUndefined();
   messages.push({ role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "ORIGINAL_STRUCTURED_RESULT")] });
   const completed = await (await send(session, messages, { tools })).json();
@@ -396,9 +374,6 @@ test("StructuredOutput success events cannot abort ordinary result delivery or a
   const second = await (await send(session, messages, { tools })).json();
   const next = second.content.find((part: any) => part.type === "tool_use");
   expect(next.id).not.toBe(call.id);
-  await recordHostToolSuccess(session, call.id, "delayed-old-success");
-  await recordHostToolSuccess(session, next.id, "new-success");
-  await recordHostToolSuccess(session, next.id, "duplicate-new-success");
   messages.push({ role: "assistant", content: second.content }, { role: "user", content: [result(next.id, "SECOND_STRUCTURED_RESULT")] });
   const final = await (await send(session, messages, { tools })).json();
   expect(final.stop_reason).toBe("end_turn");
@@ -413,7 +388,7 @@ test("MCP tools render only as host calls while thinking and compaction notices 
     const firstResponse = await send(session, messages, { stream });
     const firstText = await firstResponse.text();
     expect(firstText).toContain("GENUINE_THOUGHT_BEFORE");
-    expect(firstText).not.toContain("Antigravity ACP tool");
+    expect(firstText).not.toContain("Antigravity tool");
     expect(firstText).not.toContain("duplicate-command");
     let call: any;
     if (stream) {
@@ -431,7 +406,7 @@ test("MCP tools render only as host calls while thinking and compaction notices 
     }
     messages.push({ role: "assistant", content: [call] }, { role: "user", content: [result(call.id, "HOST_TOOL_DENIED", true)] });
     const finalText = await (await send(session, messages, { stream })).text();
-    expect(finalText).not.toContain("Antigravity ACP tool");
+    expect(finalText).not.toContain("Antigravity tool");
     expect(finalText).toContain("GENUINE_THOUGHT_AFTER");
     expect(finalText).toContain("context compacted");
     expect(finalText).toContain("HOST_TOOL_DENIED");

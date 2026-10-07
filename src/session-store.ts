@@ -7,7 +7,7 @@ import { acquireFileLock } from "./file-lock.js";
 import { AgyBusyError, AgyError } from "./errors.js";
 import type { AcpEvent } from "./protocol.js";
 import type { ContextSnapshot } from "./telemetry.js";
-import { canonical, type ConversationState, type HostLifecycle } from "./coordinator.js";
+import { canonical, type ConversationState } from "./coordinator.js";
 import { PAYLOAD_RETENTION_MS, pruneUtilityArtifacts } from "./retention.js";
 import { ownershipKey } from "./ownership-key.js";
 export { ownershipKey } from "./ownership-key.js";
@@ -37,7 +37,6 @@ export type ToolRecord = Record<string, unknown> & {
   updatedAt: number; delivery?: "result-persisted" | "delivery-attempted" | "locally-handed-off";
   result?: { content: Record<string, unknown>[]; isError: boolean }; resultDigest?: string;
   epoch?: number; requestId?: string; payloadExpired?: boolean; emitted?: boolean;
-  terminalAcceptance?: { version: 1; hostSessionID: string; eventID: string; acceptedAt: number };
 };
 function validateTool(value: any, key: string, id: string): asserts value is ToolRecord {
   const object = (v: any) => v && typeof v === "object" && !Array.isArray(v);
@@ -70,8 +69,7 @@ function validateTool(value: any, key: string, id: string): asserts value is Too
       (value.resultDigest !== undefined && !/^[a-f0-9]{64}$/.test(value.resultDigest)) ||
       (value.result !== undefined && value.resultDigest !== digest(canonical(value.result))) ||
       (value.delivery !== undefined && value.resultDigest === undefined) ||
-      (value.resultDigest !== undefined && value.result === undefined && value.payloadExpired !== true) ||
-      (value.terminalAcceptance !== undefined && (value.call.name !== "StructuredOutput" || !object(value.terminalAcceptance) || value.terminalAcceptance.version !== 1 || value.terminalAcceptance.hostSessionID !== value.hostSessionID || typeof value.terminalAcceptance.eventID !== "string" || !value.terminalAcceptance.eventID || !Number.isFinite(value.terminalAcceptance.acceptedAt) || value.terminalAcceptance.acceptedAt < 0))) {
+      (value.resultDigest !== undefined && value.result === undefined && value.payloadExpired !== true)) {
     throw new AgyError("invalid_request", "Corrupt or unsupported durable tool record; execution cannot be retried", { code: "agy_tool_record_corrupt", retryable: false });
   }
 }
@@ -172,79 +170,18 @@ export class SessionStore {
         await rm(join(dataDirectory(), "requests", digest(key)), { recursive: true, force: true });
       }
       await this.mutate(records => { for (const key of keys) delete records[key]; });
-      for (const name of ["context", "execution", "lifecycle", "host-keys"]) await rm(join(dataDirectory(), name, `${digest(hostSessionID)}.json`), { force: true });
+      for (const name of ["context", "execution", "host-keys"]) await rm(join(dataDirectory(), name, `${digest(hostSessionID)}.json`), { force: true });
       await atomicWrite(join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`), { version: 1, hostSessionID, cleaned: true });
     } finally { await unlockRecords?.(); await unlock?.(); await unlockLifecycle(); }
   }
 
-  async reconcileHostCheckpoints(hostSessionID: string, checkpoints: string[], reconcile: boolean): Promise<void> {
+  /** Retire only bindings that still belong to a lost event subscription. */
+  async reconcileLostBinding(hostSessionID: string, expectedBindings: Array<[string, string | undefined]>, retire: () => Promise<void>): Promise<void> {
     const unlock = await this.lockTurn(`lifecycle-event:${hostSessionID}`, 5000);
-    try { await this.writeHostCheckpoints(hostSessionID, checkpoints, reconcile); }
-    finally { await unlock(); }
-  }
-
-  /** Snapshot acquisition may await outside this lock. Never decide novelty
-   * from state read before that await. Retirement owns no host turn lock, so
-   * the pump being joined can persist its outcome and release that lock. */
-  async reconcileHostCheckpointBoundary(hostSessionID: string, checkpoints: string[] | undefined, retire: () => Promise<void>, expectedBindings?: Array<[string, string | undefined]>): Promise<boolean> {
-    const unlock = await this.lockTurn(`lifecycle-event:${hostSessionID}`, 5000);
-    try {
-      if (await this.isHostDeleted(hostSessionID)) return false;
-      const state = await this.lifecycle(hostSessionID);
-      const novel = checkpoints && state.checkpoints !== undefined && checkpoints.some(id => !state.checkpoints!.includes(id));
-      const current = expectedBindings ? (await this.entries()).filter(([, record]) => record.conversation?.hostSessionID === hostSessionID) : [];
-      const unchangedLostBinding = expectedBindings && current.length > 0 && current.every(([key, record]) => expectedBindings.some(([oldKey, revision]) => oldKey === key && revision === record.revision));
-      if (novel || unchangedLostBinding) await retire();
-      if (checkpoints && (novel || state.checkpoints === undefined)) await this.writeHostCheckpoints(hostSessionID, checkpoints, state.checkpoints !== undefined);
-      return Boolean(novel || unchangedLostBinding);
-    } finally { await unlock(); }
-  }
-
-  private async writeHostCheckpoints(hostSessionID: string, checkpoints: string[], reconcile: boolean): Promise<void> {
-    // All callers already own lifecycle-event. Initial observation/aliases
-    // change no execution epoch and must not wait on a parked pump's turn lock.
-    const state = await this.lifecycle(hostSessionID);
-    const novel = state.checkpoints ? checkpoints.filter(id => !state.checkpoints!.includes(id)) : [];
-    const unlock = reconcile && novel.length ? await this.lockTurn(`host:${hostSessionID}`, 5000) : undefined;
     try {
       if (await this.isHostDeleted(hostSessionID)) return;
-      if (reconcile && novel.length) {
-        const sourceEpoch = state.epoch;
-        state.epoch += novel.length;
-        state.reconciledCheckpoint = novel.at(-1);
-        state.transaction = { id: `checkpoint:${novel.at(-1)}`, phase: "committed", sourceEpoch, boundaries: state.transaction?.boundaries ?? {} };
-        state.commits.push(...novel.map(id => `checkpoint:${id}`));
-      }
-      state.checkpoints = [...new Set([...(state.checkpoints ?? []), ...checkpoints])];
-      await atomicWrite(join(dataDirectory(), "lifecycle", `${digest(hostSessionID)}.json`), state);
-    } finally { await unlock?.(); }
-  }
-
-  private async recordAuthoritativeCompactionEvent(hostSessionID: string, eventID: string): Promise<void> {
-    // Alias receipt only, under lifecycle-event: do not join/lock newer work.
-    if (await this.isHostDeleted(hostSessionID)) return;
-    const state = await this.lifecycle(hostSessionID);
-    if (!state.commits.includes(eventID)) state.commits.push(eventID);
-    delete state.reconciledCheckpoint;
-    await atomicWrite(join(dataDirectory(), "lifecycle", `${digest(hostSessionID)}.json`), state);
-  }
-
-  async applyAuthoritativeCompactionEvent(hostSessionID: string, eventID: string, checkpoints: string[], retire: () => Promise<void>): Promise<boolean> {
-    const unlock = await this.lockTurn(`lifecycle-event:${hostSessionID}`, 5000);
-    try {
-      if (await this.isHostDeleted(hostSessionID)) return false;
-      const state = await this.lifecycle(hostSessionID);
-      if (state.commits.includes(eventID)) return false;
-      if (state.checkpoints === undefined) {
-        await retire();
-        await this.writeCompaction(hostSessionID, eventID, "committed");
-        await this.writeHostCheckpoints(hostSessionID, checkpoints, false);
-      } else if (checkpoints.some(id => !state.checkpoints!.includes(id))) {
-        await retire();
-        await this.writeHostCheckpoints(hostSessionID, checkpoints, true);
-      }
-      await this.recordAuthoritativeCompactionEvent(hostSessionID, eventID);
-      return true;
+      const current = (await this.entries()).filter(([, record]) => record.conversation?.hostSessionID === hostSessionID);
+      if (current.length > 0 && current.every(([key, record]) => expectedBindings.some(([oldKey, revision]) => oldKey === key && revision === record.revision))) await retire();
     } finally { await unlock(); }
   }
   async invalidateHostSession(hostSessionID: string): Promise<void> {
@@ -277,7 +214,7 @@ export class SessionStore {
       // Invalidations are durable observations too: monotonically advance the
       // v1 sequence so consumers cannot mistake unknown for a duplicate sample.
       await this.saveContextSnapshot(hostSessionID, {
-        version: 1, hostSessionID, epoch: (await this.lifecycle(hostSessionID)).epoch,
+        version: 1, hostSessionID, epoch: previous.epoch,
         sequence: previous.sequence + 1, state: "unknown",
         executionGeneration: binding.generation, sourceSessionID: binding.sourceSessionID,
       });
@@ -340,76 +277,11 @@ export class SessionStore {
     return Object.entries(await this.read());
   }
 
-  async compaction(hostSessionID: string, id: string, phase: "generating" | "committed" | "failed"): Promise<void> {
-    const unlock = await this.lockTurn(`lifecycle-event:${hostSessionID}`, 5000);
-    try { await this.writeCompaction(hostSessionID, id, phase); }
-    finally { await unlock(); }
-  }
-
-  private async writeCompaction(hostSessionID: string, id: string, phase: "generating" | "committed" | "failed"): Promise<void> {
-    const unlock = await this.lockTurn(`host:${hostSessionID}`);
-    try {
-      if (await this.isHostDeleted(hostSessionID)) return;
-      const state = await this.lifecycle(hostSessionID);
-      if (state.commits.includes(id)) return;
-      if (phase === "generating" && state.transaction?.phase === "generating") return;
-      if (phase === "generating") delete state.reconciledCheckpoint;
-      const boundaries = phase === "generating" || !state.transaction ? Object.fromEntries((await this.entries()).filter(([, r]) => r.conversation?.hostSessionID === hostSessionID).map(([key, r]) => [key, { epoch: r.conversation!.epoch, boundary: r.conversation!.boundary }])) : state.transaction.boundaries;
-      const sourceEpoch = phase === "generating" || !state.transaction ? state.epoch : state.transaction.sourceEpoch;
-      if (phase === "committed") { state.epoch++; state.commits.push(id); }
-      if (phase === "failed" && !state.failures.includes(id)) state.failures.push(id);
-      state.transaction = { id, phase, sourceEpoch, boundaries };
-      await atomicWrite(join(dataDirectory(), "lifecycle", `${digest(hostSessionID)}.json`), state);
-    } finally { await unlock(); }
-  }
-
-  /** Serialize admission separately from the turn lock: cancelling a parked
-   * pump must be able to release that lock before we commit the checkpoint. */
-  async applyCompactionEvent(hostSessionID: string, id: string, phase: "committed" | "failed", retire: () => Promise<void>): Promise<boolean> {
-    const unlock = await this.lockTurn(`lifecycle-event:${hostSessionID}`, 5000);
-    try {
-      const state = await this.lifecycle(hostSessionID);
-      if (state.commits.includes(id) || state.failures.includes(id)) return false;
-      await retire();
-      await this.writeCompaction(hostSessionID, id, phase);
-      return true;
-    } finally { await unlock(); }
-  }
-
-  async lifecycle(hostSessionID: string): Promise<HostLifecycle> {
-    try {
-      const state = JSON.parse(await readFile(join(dataDirectory(), "lifecycle", `${digest(hostSessionID)}.json`), "utf8"));
-      if (state.version !== 1 || !Number.isSafeInteger(state.epoch) || state.epoch < 0 || !Array.isArray(state.commits)) throw new Error("Invalid conversation lifecycle record");
-      if (!state.commits.every((id: unknown) => typeof id === "string") || (state.failures !== undefined && (!Array.isArray(state.failures) || !state.failures.every((id: unknown) => typeof id === "string")))) throw new Error("Invalid conversation lifecycle event identities");
-      if (state.checkpoints !== undefined && (!Array.isArray(state.checkpoints) || !state.checkpoints.every((id: unknown) => typeof id === "string"))) throw new Error("Invalid authoritative checkpoint identities");
-      if (state.transaction !== undefined && (!state.transaction || typeof state.transaction.id !== "string" || !["generating", "committed", "failed"].includes(state.transaction.phase) || !Number.isSafeInteger(state.transaction.sourceEpoch) || !state.transaction.boundaries || typeof state.transaction.boundaries !== "object")) throw new Error("Invalid lifecycle transaction");
-      // Additive V1 migration: preserve the last failure still evidenced by an
-      // older record before a new transaction can overwrite it. Earlier IDs
-      // already lost by old writers cannot be reconstructed safely.
-      state.failures ??= [];
-      if (state.transaction?.phase === "failed" && typeof state.transaction.id === "string" && !state.failures.includes(state.transaction.id)) state.failures.push(state.transaction.id);
-      return state;
-    } catch (error: any) {
-      if (error.code === "ENOENT") return { version: 1, epoch: 0, commits: [], failures: [] };
-      await quarantineJson(join(dataDirectory(), "lifecycle", `${digest(hostSessionID)}.json`), "invalid_lifecycle");
-      throw error;
-    }
-  }
-
   async toolCall(key: string, id: string): Promise<ToolRecord | undefined> {
     const path = join(dataDirectory(), "tools", digest(key), `${digest(id)}.json`);
     const unlock = await this.lockTurn(`tool-record:${key}:${id}`, 5000);
     try {
-      let value = JSON.parse(await readFile(path, "utf8"));
-      if (value?.version === 1) {
-        // V1 accepted means only persisted, never transport acknowledgement.
-        // Missing ownership/profile remains explicitly unknown, not inferred.
-        if (value.conversationKey !== key || value.call?.id !== id || !value.argumentsDigest || !value.profile) throw new Error("Unverifiable legacy tool record");
-        value = { ...value, version: 2, hostSessionID: value.hostSessionID ?? null, profileDigest: digest(value.profile),
-          ...(value.delivery === "accepted" || value.delivery === undefined && value.resultDigest ? { delivery: "result-persisted" } : {}) };
-        validateTool(value, key, id);
-        await atomicWrite(path, value);
-      }
+      const value = JSON.parse(await readFile(path, "utf8"));
       validateTool(value, key, id);
       const binding = await this.get(key);
       if (binding?.conversation?.hostSessionID && value.hostSessionID !== binding.conversation.hostSessionID) throw new Error("Tool ownership conflicts with conversation binding");
@@ -453,19 +325,6 @@ export class SessionStore {
     } finally { await unlock(); }
   }
 
-  /** Legacy call-correlated host success receipt, not an MCP result or turn completion. */
-  async acceptTerminalCall(key: string, hostSessionID: string, id: string, eventID: string): Promise<boolean> {
-    const unlock = await this.lockTurn(`tool-result:${key}:${id}`, 5000);
-    try {
-      const saved = await this.toolCall(key, id);
-      const call = saved?.call as { id?: string; name?: string } | undefined;
-      const originatingHost = saved?.hostSessionID ?? (await this.get(key))?.conversation?.hostSessionID;
-      if (!saved || call?.id !== id || call.name !== "StructuredOutput" || originatingHost !== hostSessionID) return false;
-      if (!saved.terminalAcceptance) await this.saveToolCall(key, id, { ...saved, terminalAcceptance: { version: 1, hostSessionID, eventID, acceptedAt: Date.now() } });
-      return true;
-    } finally { await unlock(); }
-  }
-
   async prune(maxIdleMs = DEFAULT_IDLE_WORKER_TIMEOUT_MS * 4, protectedKeys: ReadonlySet<string> = new Set()): Promise<void> {
     await this.pruneCompletedPayloads();
     await this.pruneCompletedToolPayloads(Date.now(), protectedKeys);
@@ -475,8 +334,6 @@ export class SessionStore {
     await this.mutate(async records => {
       for (const [key, record] of Object.entries(records)) {
         if (protectedKeys.has(key) || record.lastUsedAt >= Date.now() - maxIdleMs) continue;
-        // Unattributed legacy host keys cannot establish the host lock.
-        if (key.startsWith("host-v1:") && !record.conversation?.hostSessionID) continue;
         let unlock: (() => Promise<void>) | undefined;
         try {
           unlock = await this.lockTurn(ownershipKey(key, record.conversation?.hostSessionID));

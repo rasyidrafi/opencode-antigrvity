@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fixtureCompatibility } from "./compatibility.js";
 import { startProxy, stopProxy, getProxyBaseUrl } from "../../src/proxy.js";
 import { sessionStore } from "../../src/session-store.js";
-import { HostBridge, closeHostBridges } from "../../src/host-tools.js";
+import { HostBridge } from "../../src/host-tools.js";
 import { SESSION_HEADER } from "../../src/constants.js";
 
 // This file is run only in a separate test process. No shipped hooks or env bypass.
@@ -59,7 +59,7 @@ if (process.env.AGY_CRASH_CHILD) test("integrated crash child", async () => {
     const response = await send(messages);
     const body = await response.json();
     expect(body.content?.some((p: any) => p.type === "tool_use") ?? false).toBe(false);
-    process.send!({ recovered: true, status: response.status, body, lifecycle: await sessionStore.lifecycle("crash-host"), bindings: await sessionStore.entries() });
+    process.send!({ recovered: true, status: response.status, body, bindings: await sessionStore.entries() });
     await stopProxy();
     return;
   }
@@ -71,11 +71,6 @@ if (process.env.AGY_CRASH_CHILD) test("integrated crash child", async () => {
   const counter = await open(join(root, "external-counter"), "ax", 0o600);
   await counter.writeFile("effect\n"); await counter.sync(); await counter.close();
   const directory = await open(root, "r"); await directory.sync(); await directory.close();
-  if (point === "after-compaction-commit") {
-    await closeHostBridges("crash-host");
-    await sessionStore.compaction("crash-host", "crash-checkpoint", "committed");
-    await barrier("after-compaction-commit");
-  }
   const continued = send([...initial, { role: "assistant", content: first.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: first.content[0].id, content: "DURABLE_RESULT_ONCE" }] }]);
   if (point === "after-mcp-handoff") {
     // The test peer actually parsed the MCP HTTP response, rather than merely
@@ -88,10 +83,5 @@ if (process.env.AGY_CRASH_CHILD) test("integrated crash child", async () => {
     throw new Error("MCP peer did not receive its result");
   }
   await continued;
-  if (point === "after-compaction-commit-known") {
-    await closeHostBridges("crash-host");
-    await sessionStore.compaction("crash-host", "crash-checkpoint", "committed");
-    await barrier("after-compaction-commit-known");
-  }
   throw new Error("Crash barrier was not reached");
 }, 60_000);

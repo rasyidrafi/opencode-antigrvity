@@ -63,6 +63,7 @@ async function writePrivateJson(path: string, value: unknown): Promise<void> {
  */
 export async function bridgeCliAuthentication(environment: NodeJS.ProcessEnv = process.env): Promise<boolean> {
   const home = geminiHome(environment);
+  // Official CLI credential directory, independent of our provider ID.
   const cliPath = join(home, "antigravity-cli", "antigravity-oauth-token");
   const acpDir = join(home, "antigravity-acp");
   const acpPath = join(acpDir, "acp_token.json");

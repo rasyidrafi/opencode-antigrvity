@@ -140,18 +140,21 @@ describe("ACP process manager", () => {
     }
   });
 
-  test("answers ACP permission requests with the configured autonomous policy", async () => {
+  test("rejects native tool permission requests", async () => {
     await chmod(fixture, 0o755);
-    const worker = await createAcpWorker({ cwd: process.cwd(), executable: fixture, model: "fake-model-low", permissionPolicy: "allow-always" });
+    const worker = await createAcpWorker({ cwd: process.cwd(), executable: fixture, model: "fake-model-low" });
     let sawTool = false;
+    let stopReason: string | undefined;
     try {
       for await (const event of worker.runTurn("FAKE_PERMISSION")) {
         if (event.event === "update" && (event.update as { sessionUpdate?: string }).sessionUpdate === "tool_call") sawTool = true;
+        if (event.event === "result") stopReason = event.result.stopReason;
       }
     } finally {
       await worker.stop(true);
     }
-    expect(sawTool).toBe(true);
+    expect(sawTool).toBe(false);
+    expect(stopReason).toBe("cancelled");
   });
 
   test("can authenticate an ACP server without creating a workspace session", async () => {

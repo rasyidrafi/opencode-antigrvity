@@ -40,7 +40,7 @@ test("refusal remains a refusal", () => {
   const mapped = mapAcpEvent({ event: "result", sessionId: "remote", result: { stopReason: "refusal" } });
   expect(mapped.kind === "result" && mapped.finishReason).toBe("refusal");
 });
-test("occupancy replaces samples and rejects old epochs", async () => {
+test("occupancy replaces samples and rejects outdated execution generations", async () => {
   const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/telemetry-test-`);
   try {
@@ -51,8 +51,8 @@ test("occupancy replaces samples and rejects old epochs", async () => {
     expect(await readContextSnapshot("host")).toMatchObject({ used: 120_000, requestedModel: "requested", model: "actual-fallback" });
     await observeContext("host", 0, "remote", "requested", { used: -1, size: 100_000 });
     expect((await readContextSnapshot("host")).used).toBe(120_000);
-    await sessionStore.compaction("host", "commit", "committed");
-    await observeContext("host", 0, "remote", "model", { used: 99_000, size: 100_000 });
+    await sessionStore.saveExecutionBinding("host", { generation: "new", sourceSessionID: "remote" });
+    await observeContext("host", 0, "remote", "model", { used: 99_000, size: 100_000 }, undefined, undefined, "old");
     expect((await readContextSnapshot("host")).state).toBe("unknown");
   } finally {
     if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;

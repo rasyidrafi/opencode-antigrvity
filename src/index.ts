@@ -17,11 +17,11 @@ import { refreshModelMetadata, researchedMetadataFor } from "./model-metadata.js
 import { fallbackAcpModelCatalog, type AcpModel, type AcpModelCatalog } from "./models.js";
 import { getProxyBaseUrl, getProxyRuntime, onModelCatalogChange, startProxy, stopProxy } from "./proxy.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
-import { closeHostBridges, recordHostToolSuccess } from "./host-tools.js";
+import { closeHostBridges } from "./host-tools.js";
 import { sessionStore } from "./session-store.js";
 import { sessionPool } from "./session-pool.js";
 import { ContextTelemetry } from "./telemetry-rpc.js";
-import { onContextSnapshot, readContextSnapshot, publishContextSnapshot, markContextStale } from "./telemetry.js";
+import { onContextSnapshot, readContextSnapshot, markContextStale } from "./telemetry.js";
 import { AgyError, retryAfterSeconds } from "./errors.js";
 import { warn, info as lifecycleInfo } from "./log.js";
 
@@ -110,7 +110,7 @@ async function authorizeAcp(directory: string, answer: Record<string, unknown>) 
     // navigable link, so point the client at the official ACP registry entry.
     url: AUTH_REGISTRY_URL,
     instructions:
-      "The official Antigravity ACP server performs sign-in and stores its credentials locally. OpenCode stores only the fixed loopback proxy marker; never paste a Google credential into OpenCode.",
+      "The official Antigravity server performs sign-in and stores its credentials locally. OpenCode stores only the fixed loopback proxy marker; never paste a Google credential into OpenCode.",
     mode: "auto" as const,
     callback,
   };
@@ -118,7 +118,7 @@ async function authorizeAcp(directory: string, answer: Record<string, unknown>) 
 
 function requestKind(kind: string): string {
   if (kind === "title") return "title";
-  if (kind === "compaction") return "summary";
+  if (kind === "compaction") return "compaction";
   if (kind === "generate") return "generate";
   return "chat";
 }
@@ -136,7 +136,7 @@ function stripAcpOwnedOptions(event: { options: Record<string, unknown> }): void
 }
 
 /** V2 plugin entrypoint. ACP owns Google auth; OpenCode sees only a local marker. */
-export const AntigravityCliPlugin = Plugin.define({
+export const AntigravityPlugin = Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
     const workspaces = new WorkspaceRegistry(retainWorkspace, releaseWorkspace);
@@ -165,11 +165,6 @@ export const AntigravityCliPlugin = Plugin.define({
     };
     const deletionTimer = setInterval(() => { for (const id of pendingDeletions) void cleanupDeleted(id); }, 15_000);
     deletionTimer.unref?.();
-    const hostCheckpoints = async (sessionID: string): Promise<string[] | undefined> => {
-      if (typeof ctx.session.context !== "function") return undefined;
-      const context = await ctx.session.context({ sessionID: sessionID as Parameters<typeof ctx.session.context>[0]["sessionID"] });
-      return context.filter(message => message.type === "compaction" && message.status === "completed").map(message => message.id);
-    };
 
     try {
       for (const sessionID of await sessionStore.deletedHosts()) { pendingDeletions.add(sessionID); void cleanupDeleted(sessionID); }
@@ -213,7 +208,7 @@ export const AntigravityCliPlugin = Plugin.define({
           method: {
             id: AUTH_METHOD_ID,
             type: "oauth",
-            label: "Sign in with the official Antigravity ACP server",
+            label: "Sign in with Antigravity",
             form: [{
               key: "method",
               type: "string",
@@ -228,7 +223,7 @@ export const AntigravityCliPlugin = Plugin.define({
         });
         // This is a local adapter, not a Google API-key provider. Keep the
         // integration ID equal to the provider ID for clients such as OpenChamber.
-        editor.method.update({ integrationID: INTEGRATION_ID, method: { type: "key", label: "Local Antigravity CLI" } });
+        editor.method.update({ integrationID: INTEGRATION_ID, method: { type: "key", label: "Local Antigravity" } });
       });
 
       // Match V1: install the non-secret loopback marker automatically. Google
@@ -257,16 +252,11 @@ export const AntigravityCliPlugin = Plugin.define({
             // from the next authoritative request, retaining durable results.
             for (const [sessionID, expectedBindings] of lostBindings) {
               if (await sessionStore.isHostDeleted(sessionID)) { await sessionStore.removeHostSession(sessionID); continue; }
-              let checkpoints: string[] | undefined;
-              try {
-                checkpoints = await hostCheckpoints(sessionID);
-              } catch { warn("Authoritative checkpoint reconciliation unavailable", { sessionID, reason: "context_read_failed" }); }
-              const changed = await sessionStore.reconcileHostCheckpointBoundary(sessionID, checkpoints, async () => {
+              await sessionStore.reconcileLostBinding(sessionID, expectedBindings, async () => {
                 await closeHostBridges(sessionID);
                 await sessionPool.quiesceHostSession(sessionID);
                 await sessionStore.invalidateHostSession(sessionID);
-              }, expectedBindings);
-              if (changed) await publishContextSnapshot(sessionID);
+              });
             }
             lostBindings.clear();
             lifecycleInfo("Host lifecycle subscription reconnecting", { reason: "event_reconcile", attempt: attempts });
@@ -280,32 +270,7 @@ export const AntigravityCliPlugin = Plugin.define({
               continue;
             }
             if (e.data?.sessionID && await sessionStore.isHostDeleted(e.data.sessionID)) continue;
-            if (e.type === "session.compaction.started" && e.data?.sessionID) await sessionStore.compaction(e.data.sessionID, e.id ?? e.data.messageID ?? "pending", "generating");
-            if ((e.type === "session.compaction.ended" || e.type === "session.compaction.failed") && e.data?.sessionID) {
-              const sessionID = e.data.sessionID;
-              let checkpoints: string[] | undefined;
-              if (e.type === "session.compaction.ended") try { checkpoints = await hostCheckpoints(sessionID); }
-              catch { warn("Checkpoint read failed; retaining durable lifecycle event authority", { sessionID, reason: "context_event_read_failed" }); }
-              if (checkpoints) {
-                const eventID = e.id ?? e.data.messageID ?? "pending";
-                const applied = await sessionStore.applyAuthoritativeCompactionEvent(sessionID, eventID, checkpoints, async () => {
-                  await closeHostBridges(sessionID);
-                  await sessionPool.quiesceHostSession(sessionID);
-                  await sessionStore.invalidateHostSession(sessionID);
-                });
-                if (applied) await publishContextSnapshot(sessionID);
-                continue;
-              }
-              const applied = await sessionStore.applyCompactionEvent(sessionID, e.id ?? e.data.messageID ?? "pending", e.type === "session.compaction.ended" ? "committed" : "failed", async () => {
-                await closeHostBridges(sessionID);
-                await sessionPool.quiesceHostSession(sessionID);
-              });
-              if (applied) await publishContextSnapshot(sessionID);
-            }
             if ((e.type === "session.execution.interrupted" || e.type === "session.execution.failed") && e.data?.sessionID) await closeHostBridges(e.data.sessionID);
-            // Call success is not provider-turn completion, regardless of the
-            // tool's name. Only the original result can release its MCP waiter.
-            if (e.type === "session.tool.success" && e.data?.sessionID && e.data.id && e.id) await recordHostToolSuccess(e.data.sessionID, e.data.id, e.id);
           }
         } catch { /* Intentional cleanup exits below; unexpected loss retries. */ }
         if (events.signal.aborted) break;
@@ -358,17 +323,6 @@ export const AntigravityCliPlugin = Plugin.define({
           if (await sessionStore.isHostDeleted(event.sessionID)) throw new AgyError("invalid_request", "Host session has been deleted");
           const session = await ctx.session.get({ sessionID: event.sessionID });
           const directory = session.location.directory;
-          try {
-            const checkpoints = await hostCheckpoints(event.sessionID);
-            if (checkpoints) {
-              const changed = await sessionStore.reconcileHostCheckpointBoundary(event.sessionID, checkpoints, async () => {
-                await closeHostBridges(event.sessionID);
-                await sessionPool.quiesceHostSession(event.sessionID);
-                await sessionStore.invalidateHostSession(event.sessionID);
-              });
-              if (changed) await publishContextSnapshot(event.sessionID);
-            }
-          } catch { warn("Authoritative checkpoint baseline unavailable; request alignment remains required", { sessionID: event.sessionID, reason: "context_baseline_failed" }); }
           await workspaces.add(directory);
           event.baseURL = getProxyBaseUrl();
           event.headers["x-api-key"] = LOCAL_API_KEY;
@@ -420,4 +374,4 @@ export {
 } from "./proxy.js";
 export { sessionPool } from "./session-pool.js";
 
-export default AntigravityCliPlugin;
+export default AntigravityPlugin;

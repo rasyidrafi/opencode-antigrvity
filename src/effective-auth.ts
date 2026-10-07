@@ -15,6 +15,7 @@ export async function effectiveAuth(environment: NodeJS.ProcessEnv = process.env
   const settings = await object(join(home, "antigravity-acp", "settings.json"));
   const method = environment.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim() || settings.auth?.type || "oauth-personal";
   const auth = { ...settings.auth, type: method };
+  // Official CLI credential directory, independent of our provider ID.
   const cli = await object(join(home, "antigravity-cli", "antigravity-oauth-token"));
   const credentials = await object(join(home, "antigravity-acp", method === "oauth-business" ? "acp_business_token.json" : "acp_token.json"));
   const adcPath = environment.GOOGLE_APPLICATION_CREDENTIALS || join(environment.CLOUDSDK_CONFIG || join(environment.XDG_CONFIG_HOME || join(environment.HOME || homedir(), ".config"), "gcloud"), "application_default_credentials.json");

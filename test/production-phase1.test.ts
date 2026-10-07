@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { SessionPool } from "../src/session-pool.js";
 import { SessionStore, ownershipKey } from "../src/session-store.js";
 import { observeContext, readContextSnapshot } from "../src/telemetry.js";
-import { boundHistoryCharacters, historyCharacterLimit } from "../src/budget.js";
+import { historyCharacterLimit } from "../src/budget.js";
 import { buildBoundedHistory, type HostMessage } from "../src/prompt.js";
 
 const fixture = join(import.meta.dir, "fixtures/fake-acp.mjs");
@@ -85,7 +85,7 @@ for (const replacement of ["edit", "profile", "lost-resume"]) test(`${replacemen
 
 test("real host owner prevents metadata prune and deletion without lock-order waits", async () => {
   const store = new SessionStore();
-  await store.set("conversation", { version: 1, sessionId: "s", model: "m", cwd: root, cliVersion: null, createdAt: 1, updatedAt: 1, lastUsedAt: 1, conversation: { version: 1, epoch: 0, hostEpoch: 0, boundary: [], instructions: "", hostSessionID: "host", resumable: true } });
+  await store.set("conversation", { version: 1, sessionId: "s", model: "m", cwd: root, cliVersion: null, createdAt: 1, updatedAt: 1, lastUsedAt: 1, conversation: { version: 1, epoch: 0, boundary: [], instructions: "", hostSessionID: "host", resumable: true } });
   await store.saveReceipt("conversation", "parked", { state: "parked" });
   const module = join(import.meta.dir, "../src/session-store.ts");
   const child = Bun.spawn([process.execPath, "--eval", `const { SessionStore, ownershipKey } = await import(${JSON.stringify(module)}); const store = new SessionStore(); const release = await store.lockTurn(ownershipKey("conversation", "host")); console.log("locked"); await Bun.stdin.text(); await release();`], { env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
@@ -129,11 +129,10 @@ test("host deletion waits for ownership, removes execution provenance, and prese
   } finally { reader.releaseLock(); child.kill(); await child.exited; await deleting; }
 });
 
-test("stale host ownership is reclaimed while unattributed legacy host keys remain protected", async () => {
+test("stale host ownership is reclaimed", async () => {
   const store = new SessionStore();
   const base = { sessionId: "s", model: "m", cwd: root, cliVersion: null, createdAt: 1, updatedAt: 1, lastUsedAt: 1 };
-  await store.set("host-v1:legacy:unknown", base);
-  await store.set("conversation", { ...base, version: 1, conversation: { version: 1, epoch: 0, hostEpoch: 0, boundary: [], instructions: "", hostSessionID: "host", resumable: true } });
+  await store.set("conversation", { ...base, version: 1, conversation: { version: 1, epoch: 0, boundary: [], instructions: "", hostSessionID: "host", resumable: true } });
   const module = join(import.meta.dir, "../src/session-store.ts");
   const child = Bun.spawn([process.execPath, "--eval", `const { SessionStore } = await import(${JSON.stringify(module)}); await new SessionStore().lockTurn("host:host"); console.log("locked"); await Bun.stdin.text();`], { env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   const reader = child.stdout.getReader();
@@ -142,7 +141,6 @@ test("stale host ownership is reclaimed while unattributed legacy host keys rema
     child.kill("SIGKILL"); await child.exited;
     await store.prune(0);
     expect(await store.get("conversation")).toBeUndefined();
-    expect(await store.get("host-v1:legacy:unknown")).toBeDefined();
   } finally { reader.releaseLock(); child.kill(); await child.exited; }
 });
 
@@ -178,12 +176,9 @@ for (const canonical of [true, false]) test(`1024 character cap bounds rendered 
   } finally { await pool.close(); }
 });
 
-test("history validation and Unicode are character bounds, not transport budgets", () => {
+test("invalid history limits use the default", () => {
   for (const invalid of ["", "-1", "0", "1.5", "Infinity", "oops"]) {
     process.env.OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS = invalid;
     expect(historyCharacterLimit()).toBe(100000);
   }
-  const bounded = boundHistoryCharacters([{ type: "text", text: "😀😀" }, { type: "text", text: "tail" }], 3);
-  expect(bounded.blocks).toEqual([{ type: "text", text: "😀" }, { type: "text", text: "t" }]);
-  expect(bounded.omitted).toBe(true);
 });

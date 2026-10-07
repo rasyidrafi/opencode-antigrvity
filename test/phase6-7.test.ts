@@ -180,20 +180,19 @@ test("ancillary corruption is privately quarantined without authorizing absent-r
   try {
     const store = new SessionStore();
     const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
-    for (const name of ["context", "lifecycle"]) {
+    for (const name of ["context"]) {
       await mkdir(join(root, name));
       const { createHash } = await import("node:crypto");
       await writeFile(join(root, name, `${createHash("sha256").update("corrupt").digest("hex")}.json`), "invalid JSON");
     }
     await expect(store.contextSnapshot("corrupt")).rejects.toThrow();
-    await expect(store.lifecycle("corrupt")).rejects.toThrow();
-    await expect(store.lifecycle("corrupt")).rejects.toThrow();
-    expect(await readdir(join(root, "quarantine"))).toHaveLength(2);
+    await expect(store.contextSnapshot("corrupt")).rejects.toThrow();
+    expect(await readdir(join(root, "quarantine"))).toHaveLength(1);
     await store.saveToolCall("corrupt-tools", "call", { call: { id: "call", name: "shell", input: {} } });
     const { createHash } = await import("node:crypto");
     await writeFile(join(root, "tools", createHash("sha256").update("corrupt-tools").digest("hex"), `${createHash("sha256").update("call").digest("hex")}.json`), "broken tool JSON");
     await expect(store.toolCall("corrupt-tools", "call")).rejects.toThrow();
-    expect(await readdir(join(root, "quarantine"))).toHaveLength(3);
+    expect(await readdir(join(root, "quarantine"))).toHaveLength(2);
   } finally { await restore(); }
 });
 
@@ -221,54 +220,20 @@ test("session deletion tombstones late writers and waits for active ownership be
   } finally { await restore(); }
 });
 
-test("authoritative checkpoints deduplicate late/concurrent events without retiring newer work", async () => {
+test("event reconnect retires only the binding captured at disconnect", async () => {
   const restore = await isolatedData();
   try {
     const store = new SessionStore();
-    await store.reconcileHostCheckpoints("checkpoint-host", [], false);
-    await store.reconcileHostCheckpoints("checkpoint-host", ["msg_checkpoint"], true);
+    const record = { sessionId: "remote", model: "fake", cwd: process.cwd(), cliVersion: null, createdAt: 1, updatedAt: 1, lastUsedAt: 1, version: 1 as const, revision: "old", conversation: { version: 1 as const, epoch: 0, boundary: [], instructions: "", resumable: true, hostSessionID: "host" } };
+    await store.set("key", record);
     let retired = 0;
     const retire = async () => { retired++; };
-    await Promise.all([store.applyAuthoritativeCompactionEvent("checkpoint-host", "evt_late_checkpoint", ["msg_checkpoint"], retire), store.applyAuthoritativeCompactionEvent("checkpoint-host", "evt_late_checkpoint", ["msg_checkpoint"], retire)]);
-    expect(retired).toBe(0);
-    expect((await store.lifecycle("checkpoint-host")).epoch).toBe(1);
-    await Promise.all([store.applyAuthoritativeCompactionEvent("checkpoint-host", "evt_new_checkpoint", ["msg_new_checkpoint"], retire), store.applyAuthoritativeCompactionEvent("checkpoint-host", "evt_new_checkpoint", ["msg_new_checkpoint"], retire)]);
+    await store.reconcileLostBinding("host", [["key", "old"]], retire);
     expect(retired).toBe(1);
-    expect((await store.lifecycle("checkpoint-host")).epoch).toBe(2);
+    await store.set("key", { ...record, revision: "new" });
+    await store.reconcileLostBinding("host", [["key", "old"]], retire);
+    expect(retired).toBe(1);
   } finally { await restore(); }
-});
-
-for (const winner of ["hook", "event"] as const) test(`checkpoint hook/${winner} interleaving re-reads state and never joins a newer turn`, async () => {
-  const restore = await isolatedData();
-  let releaseOld: (() => Promise<void>) | undefined;
-  let releaseNew: (() => Promise<void>) | undefined;
-  let resume!: () => void;
-  try {
-    const store = new SessionStore();
-    const host = `interleave-${winner}`;
-    await store.reconcileHostCheckpoints(host, [], false);
-    releaseOld = await store.lockTurn(`host:${host}`);
-    let enter!: () => void;
-    const entered = new Promise<void>(resolve => { enter = resolve; });
-    const resumed = new Promise<void>(resolve => { resume = resolve; });
-    let retired = 0;
-    const retire = async () => { retired++; await releaseOld!(); releaseOld = undefined; };
-    const delayedHook = (async () => { enter(); await resumed; return store.reconcileHostCheckpointBoundary(host, ["msg_checkpoint"], retire); })();
-    await entered;
-    if (winner === "hook") await store.reconcileHostCheckpointBoundary(host, ["msg_checkpoint"], retire);
-    else await store.applyAuthoritativeCompactionEvent(host, "evt_checkpoint", ["msg_checkpoint"], retire);
-    releaseNew = await store.lockTurn(`host:${host}`);
-    resume();
-    // The new parked owner remains held: any accidental join/turn-lock wait
-    // would time out, even though no retirement of that owner is permissible.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try { expect(await Promise.race([delayedHook, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("reconciliation waited on its newer parked owner")), 1000); })])).toBe(false); }
-    finally { clearTimeout(timer); }
-    expect(retired).toBe(1);
-    expect((await store.lifecycle(host)).epoch).toBe(1);
-    if (winner === "event") await store.applyAuthoritativeCompactionEvent(host, "evt_checkpoint_alias", ["msg_checkpoint"], retire);
-    expect(retired).toBe(1);
-  } finally { resume?.(); await releaseNew?.(); await releaseOld?.(); await restore(); }
 });
 
 test("seven-day completed payload retention keeps replay tombstones and protects parked records", async () => {

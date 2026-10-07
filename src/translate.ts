@@ -135,13 +135,13 @@ function toolActivity(update: SessionUpdate, state?: AcpTranslationState): strin
     state?.tools.set(key, { title, failureShown: true });
     const output = Array.isArray(value.content)
       ? compactActivity(value.content.map(toolContentText).filter(Boolean).join("\n"), 2_000) : "";
-    return `[Antigravity ACP tool ${status}: ${title}]${output ? `\n${output}` : ""}`;
+    return `[Antigravity tool ${status}: ${title}]${output ? `\n${output}` : ""}`;
   }
   if (known) return undefined;
   state?.tools.set(key, { title });
   // Some ACP servers report a call only once, already completed.
   const label = status === "completed" || /^running\b/i.test(title) ? title : `Running ${title}`;
-  return `[Antigravity ACP tool: ${label}]`;
+  return `[Antigravity tool: ${label}]`;
 }
 
 function planActivity(update: SessionUpdate): string | undefined {
@@ -149,24 +149,24 @@ function planActivity(update: SessionUpdate): string | undefined {
   const value = update as unknown as Record<string, unknown>;
   const plan = update.sessionUpdate === "plan" ? value : value.plan && typeof value.plan === "object" ? value.plan as Record<string, unknown> : value;
   const entries = Array.isArray(plan.entries) ? plan.entries : undefined;
-  if (!entries?.length) return "[Antigravity ACP plan updated]";
+  if (!entries?.length) return "[Antigravity plan updated]";
   const lines = entries.map((entry) => {
     if (!entry || typeof entry !== "object") return "";
     const item = entry as Record<string, unknown>;
     return typeof item.content === "string" ? `- [${typeof item.status === "string" ? item.status : "pending"}] ${item.content}` : "";
   }).filter(Boolean).slice(0, 30);
-  return `[Antigravity ACP plan]\n${lines.join("\n")}`;
+  return `[Antigravity plan]\n${lines.join("\n")}`;
 }
 
 function statusActivity(update: SessionUpdate): string | undefined {
   const value = update as unknown as Record<string, unknown>;
   switch (update.sessionUpdate) {
-    case "available_commands_update": return "[Antigravity ACP commands updated]";
-    case "current_mode_update": return `[Antigravity ACP mode: ${typeof value.currentModeId === "string" ? value.currentModeId : "updated"}]`;
-    case "config_option_update": return "[Antigravity ACP configuration updated]";
-    case "session_info_update": return typeof value.title === "string" ? `[Antigravity ACP: ${value.title}]` : "[Antigravity ACP session updated]";
-    case "compaction_update": return value.status === "completed" ? "[Antigravity ACP context compacted]" : `[Antigravity ACP compaction: ${typeof value.status === "string" ? value.status : "updated"}]`;
-    case "compaction_summary_chunk": return "[Antigravity ACP compaction summary]";
+    case "available_commands_update": return "[Antigravity commands updated]";
+    case "current_mode_update": return `[Antigravity mode: ${typeof value.currentModeId === "string" ? value.currentModeId : "updated"}]`;
+    case "config_option_update": return "[Antigravity configuration updated]";
+    case "session_info_update": return typeof value.title === "string" ? `[Antigravity: ${value.title}]` : "[Antigravity session updated]";
+    case "compaction_update": return value.status === "completed" ? "[Antigravity context compacted]" : `[Antigravity compaction: ${typeof value.status === "string" ? value.status : "updated"}]`;
+    case "compaction_summary_chunk": return "[Antigravity compaction summary]";
     default: return undefined;
   }
 }

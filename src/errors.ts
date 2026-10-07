@@ -84,7 +84,7 @@ export class UnsupportedMediaError extends AgyError {
   constructor(kind: string) {
     super(
       "unsupported",
-       `Unsupported OpenCode content part type "${kind}" for the official Antigravity ACP server.`,
+       `Unsupported OpenCode content part type "${kind}" for the official Antigravity server.`,
       { code: "agy_unsupported_content" },
     );
     this.name = "UnsupportedMediaError";
@@ -109,7 +109,7 @@ export class AgyAbortError extends AgyError {
   }
 }
 
-export function asAgyError(error: unknown, fallback = "Antigravity ACP request failed"): AgyError {
+export function asAgyError(error: unknown, fallback = "Antigravity request failed"): AgyError {
   if (error instanceof AgyError) return error;
   if (error instanceof Error) return new AgyError("internal", error.message || fallback, { cause: error });
   return new AgyError("internal", fallback, { details: { error: String(error) } });

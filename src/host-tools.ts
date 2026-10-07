@@ -414,17 +414,6 @@ export async function closeHostBridgesForScope(scope: string): Promise<void> {
   await Promise.all([...bridges.values()].filter(bridge => bridge.key.startsWith(`host-v1:${scope}:`)).map(bridge => bridge.close()));
 }
 
-export async function recordHostToolSuccess(sessionID: string, callID: string, eventID: string): Promise<void> {
-  const keys = new Set((await sessionStore.entries()).filter(([, r]) => r.conversation?.hostSessionID === sessionID).map(([key]) => key));
-  for (const bridge of bridges.values()) if (bridge.sessionID === sessionID) keys.add(bridge.key);
-  for (const key of keys) {
-    // Retain the existing call-correlated receipt for durable compatibility.
-    // Its legacy terminalAcceptance name conveys no turn-completion authority.
-    // Never abort a pump or release a waiter on a tool-success event.
-    await sessionStore.acceptTerminalCall(key, sessionID, callID, eventID);
-  }
-}
-
 /** Stateless Streamable HTTP MCP. Each unguessable endpoint belongs to one host
  * session; schemas and results never cross session boundaries. */
 export async function handleHostMcp(request: Request): Promise<Response> {

@@ -192,15 +192,9 @@ export class SessionPool {
         const identity = request.requestId || createHash("sha256").update(canonical({
           prior: request.priorMessages, prompt: request.prompt,
           messages: request.messages ? fingerprints(request.messages) : undefined,
-          hostEpoch: request.hostSessionID ? (await sessionStore.lifecycle(request.hostSessionID)).epoch : 0,
           instructions: request.instructions, model: request.settings.model,
         })).digest("hex");
-        const legacyIdentity = request.requestId || createHash("sha256").update(JSON.stringify({ prior: request.priorMessages, prompt: request.prompt, instructions: request.instructions, model: request.settings.model })).digest("hex");
         const receipt = await sessionStore.receipt(request.key, identity);
-        // Legacy hashes carry no epoch/boundary evidence. Preserve them only
-        // as tombstones; never replay an unverified old response into a new
-        // accepted host baseline.
-        if (!receipt && identity !== legacyIdentity && await sessionStore.receipt(request.key, legacyIdentity)) throw new AgyError("invalid_request", "A legacy Antigravity receipt prevents replay without verified host alignment", { code: "agy_legacy_replay_tombstone" });
         if (receipt && receipt.state !== "rejected-before-execution" && receipt.state !== "prepared") {
           if (receipt.state === "completed" && receipt.events) { yield* receipt.events; return; }
           if (receipt.state === "completed") throw new AgyError("invalid_request", "This Antigravity request completed, but its response payload is unavailable. It cannot be executed again.", { code: "agy_completed_response_unavailable" });
@@ -222,8 +216,7 @@ export class SessionPool {
     const record = await sessionStore.get(request.key);
     const incoming = request.messages ? fingerprints(request.messages) : undefined;
     const accepted = record?.conversation ?? entry.conversation;
-    const hostEpoch = request.hostSessionID ? (await sessionStore.lifecycle(request.hostSessionID)).epoch : 0;
-    const aligned = request.messages ? Boolean(incoming && accepted?.resumable && record?.executionProfile === profile && accepted.hostEpoch === hostEpoch && extendsBoundary(accepted.boundary, incoming)) : Boolean(entry.worker && entry.settingsSignature === signature);
+    const aligned = request.messages ? Boolean(incoming && accepted?.resumable && record?.executionProfile === profile && extendsBoundary(accepted.boundary, incoming)) : Boolean(entry.worker && entry.settingsSignature === signature);
     if (!aligned && request.hostSessionID && await sessionStore.executionBinding(request.hostSessionID)) {
       // Retire provenance before startup, including failed replacements.
       entry.executionGeneration = randomUUID();
@@ -235,7 +228,7 @@ export class SessionPool {
       entry.worker = undefined;
       entry.historyTransferred = false;
     }
-    entry.conversation = aligned ? accepted : { version: 1, epoch: Math.max((accepted?.epoch ?? -1) + 1, hostEpoch), hostEpoch, boundary: [], instructions: request.instructions ?? "", hostSessionID: request.hostSessionID, resumable: false };
+    entry.conversation = aligned ? accepted : { version: 1, epoch: (accepted?.epoch ?? -1) + 1, boundary: [], instructions: request.instructions ?? "", hostSessionID: request.hostSessionID, resumable: false };
     // Another process may have advanced or replaced this session since our
     // last turn. Reload it instead of using a stale in-memory ACP worker.
     if (entry.worker && canonical(entry.record) !== canonical(record)) {
@@ -262,7 +255,7 @@ export class SessionPool {
       entry.worker = await createAcpWorker(workerOptions(request.settings, sessionId), request.signal);
       entry.settingsSignature = signature;
       if (!entry.worker.resumed) {
-        entry.conversation = { version: 1, epoch: Math.max((accepted?.epoch ?? -1) + 1, hostEpoch), hostEpoch, boundary: [], instructions: request.instructions ?? "", hostSessionID: request.hostSessionID, resumable: false };
+        entry.conversation = { version: 1, epoch: (accepted?.epoch ?? -1) + 1, boundary: [], instructions: request.instructions ?? "", hostSessionID: request.hostSessionID, resumable: false };
         entry.executionGeneration = randomUUID();
       } else entry.executionGeneration = record?.executionGeneration ?? randomUUID();
       const workerSession = entry.worker.sessionId;
@@ -271,7 +264,7 @@ export class SessionPool {
         if (await sessionStore.contextSnapshot(request.hostSessionID)) await publishContextSnapshot(request.hostSessionID);
       }
       if (workerSession) await this.persistWorkerSafe(entry, request.key, request.settings);
-      info("created Antigravity ACP session worker", { resumed: entry.worker.resumed, rebuilt: !entry.worker.resumed, poolSize: this.entries.size });
+      info("created Antigravity session worker", { resumed: entry.worker.resumed, rebuilt: !entry.worker.resumed, poolSize: this.entries.size });
     }
     const remoteAligned = aligned && Boolean(entry.worker.resumed || entry.historyTransferred);
     const historyLimit = historyCharacterLimit();
@@ -285,8 +278,7 @@ export class SessionPool {
         const prior = request.priorMessages ?? [];
         let queuedStart = 0;
         prior.forEach((message, index) => { if (message.role === "assistant") queuedStart = index + 1; });
-        const checkpointIndex = hostEpoch > 0 ? prior.findIndex(message => message.role === "assistant") : -1;
-        for (const [index, message] of prior.entries()) groups.push({ message, blocks: await reconstructionBlocks(message, request.settings.cwd, mediaBudget), operative: message.role === "system" || (message.role === "user" && index >= queuedStart) || (checkpointIndex >= 0 && index <= checkpointIndex) });
+        for (const [index, message] of prior.entries()) groups.push({ message, blocks: await reconstructionBlocks(message, request.settings.cwd, mediaBudget), operative: message.role === "system" || (message.role === "user" && index >= queuedStart) });
       }
       groups.push({ message: { role: "user" }, blocks: request.prompt, operative: true });
       prompt = reconstruct(groups, request.instructions ?? "", request.settings.model, historyLimit, request.settings.outputBudget);
@@ -299,13 +291,9 @@ export class SessionPool {
       if (!aligned) for (let index = 0; index < unseen.length; index++) if (unseen[index].role === "assistant") queuedStart = index + 1;
       const groups: ReconstructionGroup[] = [];
       const mediaBudget = { remaining: Number.POSITIVE_INFINITY, signal: request.signal, inspect: true };
-      // The wire carries no checkpoint ID. Conservatively protect the opening
-      // host-selected prefix through its first assistant after a committed epoch.
-      // This does not choose or reconstruct a hidden compaction tail.
-      const checkpointIndex = !remoteAligned && hostEpoch > 0 ? unseen.findIndex(message => message.role === "assistant") : -1;
       for (const [index, message] of unseen.entries()) {
         const blocks = await reconstructionBlocks(message, request.settings.cwd, mediaBudget);
-        groups.push({ blocks, message, operative: message.role === "system" || (checkpointIndex >= 0 && index <= checkpointIndex) || index === currentUserIndex || (message.role === "user" && index >= queuedStart) });
+        groups.push({ blocks, message, operative: message.role === "system" || index === currentUserIndex || (message.role === "user" && index >= queuedStart) });
       }
       prompt = reconstruct(groups, request.instructions ?? "", request.settings.model, historyLimit, request.settings.outputBudget);
     }
@@ -333,7 +321,7 @@ export class SessionPool {
           await sessionStore.saveReceipt(request.key, identity, { state: "running" });
         }
         if (request.hostSessionID && event.event === "update" && event.update.sessionUpdate === "usage_update") {
-          await observeContext(request.hostSessionID, hostEpoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel, entry.executionGeneration);
+          await observeContext(request.hostSessionID, entry.conversation!.epoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel, entry.executionGeneration);
         }
         bytes += Buffer.byteLength(JSON.stringify(event));
         if (bytes <= 2_000_000) events.push(event);
@@ -372,7 +360,7 @@ export class SessionPool {
       // Do not retry a process failure: the prompt may have been accepted by
       // the remote agent. The next user turn can resume the saved id.
       if (error instanceof AgyError) throw error;
-      throw new AgyProcessError("The Antigravity ACP turn failed", error);
+      throw new AgyProcessError("The Antigravity turn failed", error);
     } finally {
       if (!settledReceipt) await sessionStore.saveReceipt(request.key, identity, { state: "uncertain" });
     }
@@ -388,7 +376,7 @@ export class SessionPool {
       // A metadata filesystem failure must not turn a completed remote turn
       // into a fake assistant failure. Resume may be unavailable next time;
       // the current response remains authoritative.
-      warn("could not persist Antigravity ACP session metadata", { code: error && typeof error === "object" ? (error as { code?: unknown }).code : undefined });
+      warn("could not persist Antigravity session metadata", { code: error && typeof error === "object" ? (error as { code?: unknown }).code : undefined });
     }
   }
 
@@ -424,13 +412,13 @@ export class SessionPool {
       if (entry.pending === 0 && entry.lastUsedAt < threshold) {
         this.entries.delete(key);
         await entry.worker?.stop();
-        debug("cleaned up idle Antigravity ACP worker", { poolSize: this.entries.size });
+        debug("cleaned up idle Antigravity worker", { poolSize: this.entries.size });
       }
     }
     try {
       await sessionStore.prune(undefined, new Set([...this.entries].filter(([, entry]) => entry.pending > 0).map(([key]) => key)));
     } catch (error) {
-      warn("could not prune Antigravity ACP session metadata", { code: error && typeof error === "object" ? (error as { code?: unknown }).code : undefined });
+      warn("could not prune Antigravity session metadata", { code: error && typeof error === "object" ? (error as { code?: unknown }).code : undefined });
     }
   }
 
@@ -468,7 +456,7 @@ export class SessionPool {
       if (entry.pending) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
-          await Promise.race([entry.tail, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AgyBusyError("The old ACP turn did not quiesce within the compaction deadline")), 5000); })]);
+          await Promise.race([entry.tail, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new AgyBusyError("The old ACP turn did not quiesce within the shutdown deadline")), 5000); })]);
         } finally { if (timer) clearTimeout(timer); }
       }
       if (!entry.pending) this.entries.delete(key);

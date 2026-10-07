@@ -14,7 +14,7 @@ describe("ACP to Anthropic translation", () => {
   test("shows a tool once as running and omits successful completion", () => {
     const state = createAcpTranslationState();
     const started = mapAcpEvent({ event: "update", sessionId: "s", update: { sessionUpdate: "tool_call", toolCallId: "tool-1", title: "run_command", kind: "execute", status: "in_progress" } }, state);
-    expect(started).toEqual({ kind: "activity", text: "[Antigravity ACP tool: Running run_command]" });
+    expect(started).toEqual({ kind: "activity", text: "[Antigravity tool: Running run_command]" });
     const repeated = mapAcpEvent({ event: "update", sessionId: "s", update: { sessionUpdate: "tool_call_update", toolCallId: "tool-1", title: "run_command", kind: "execute", status: "in_progress" } }, state);
     expect(repeated).toEqual({ kind: "ignore" });
     const completed = mapAcpEvent({ event: "update", sessionId: "s", update: { sessionUpdate: "tool_call_update", toolCallId: "tool-1", status: "completed" } }, state);
@@ -30,7 +30,7 @@ describe("ACP to Anthropic translation", () => {
         entries: [{ content: "Inspect the repository", priority: "high", status: "in_progress" }],
       } as any,
     });
-    expect(plan).toEqual({ kind: "activity", text: "[Antigravity ACP plan]\n- [in_progress] Inspect the repository" });
+    expect(plan).toEqual({ kind: "activity", text: "[Antigravity plan]\n- [in_progress] Inspect the repository" });
 
     const tool = mapAcpEvent({
       event: "update",
@@ -62,12 +62,12 @@ describe("ACP to Anthropic translation", () => {
     const update = (value: any) => mapAcpEvent({ event: "update", sessionId: "s", update: value }, state);
     const started = update({ sessionUpdate: "tool_call", toolCallId: "shell", title: "run_command", kind: "execute", status: "in_progress",
       rawInput: { command: "rg -n TODO src", token: "SECRET", content: "FILE_BODY" } });
-    expect(started).toEqual({ kind: "activity", text: "[Antigravity ACP tool: Running run_command: rg -n TODO src]" });
+    expect(started).toEqual({ kind: "activity", text: "[Antigravity tool: Running run_command: rg -n TODO src]" });
     const failed = { sessionUpdate: "tool_call_update", toolCallId: "shell", status: "failed" };
-    expect(update(failed)).toEqual({ kind: "activity", text: "[Antigravity ACP tool failed: run_command: rg -n TODO src]" });
+    expect(update(failed)).toEqual({ kind: "activity", text: "[Antigravity tool failed: run_command: rg -n TODO src]" });
     expect(update(failed).kind).toBe("ignore");
     expect(update({ sessionUpdate: "tool_call", toolCallId: "read", kind: "read", status: "completed", locations: [{ path: "src/index.ts", line: 10 }] }))
-      .toEqual({ kind: "activity", text: "[Antigravity ACP tool: Read: src/index.ts, line 10]" });
+      .toEqual({ kind: "activity", text: "[Antigravity tool: Read: src/index.ts, line 10]" });
     const long = update({ sessionUpdate: "tool_call", toolCallId: "long", title: "x\u001b\n" + "y".repeat(1000) });
     expect((long as any).text.length).toBeLessThan(280);
     expect((long as any).text).not.toContain("\u001b");

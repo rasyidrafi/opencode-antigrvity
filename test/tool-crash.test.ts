@@ -3,8 +3,8 @@ import { spawn } from "node:child_process";
 import { mkdtemp, readFile, readdir, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-const points = ["before-call-persistence", "after-call-persistence", "before-exposure", "after-exposure", "before-result-persistence", "after-result-persistence", "before-waiter-release", "after-delivery-intent", "after-mcp-handoff", "after-compaction-commit", "after-compaction-commit-known"];
-test("SIGKILL matrix exercises integrated tool persistence, exposure, delivery and compaction", async () => {
+const points = ["before-call-persistence", "after-call-persistence", "before-exposure", "after-exposure", "before-result-persistence", "after-result-persistence", "before-waiter-release", "after-delivery-intent", "after-mcp-handoff"];
+test("SIGKILL matrix exercises integrated tool persistence, exposure and delivery", async () => {
   const evidence: any[] = [];
   for (const point of points) {
     const root = await mkdtemp(join(process.env.TMPDIR || "/tmp/opencode", "tool-crash-"));
@@ -42,26 +42,21 @@ test("SIGKILL matrix exercises integrated tool persistence, exposure, delivery a
     const recovered = await second.message;
     expect((await second.exit).code).toBe(0);
     const counter = await readFile(join(root, "external-counter"), "utf8").catch(() => "");
-    expect(counter.split("effect").length - 1).toBe(["before-result-persistence", "after-result-persistence", "before-waiter-release", "after-delivery-intent", "after-mcp-handoff", "after-compaction-commit", "after-compaction-commit-known"].includes(point) ? 1 : 0);
-    if (["after-result-persistence", "before-waiter-release", "after-delivery-intent", "after-mcp-handoff", "after-compaction-commit-known"].includes(point)) {
+    expect(counter.split("effect").length - 1).toBe(["before-result-persistence", "after-result-persistence", "before-waiter-release", "after-delivery-intent", "after-mcp-handoff"].includes(point) ? 1 : 0);
+    if (["after-result-persistence", "before-waiter-release", "after-delivery-intent", "after-mcp-handoff"].includes(point)) {
       expect(recovered.status).toBe(200);
       expect(await readFile(join(root, "prompts.jsonl"), "utf8")).toContain("DURABLE_RESULT_ONCE");
     } else {
       expect(recovered.status).toBe(400);
-      if (["after-exposure", "before-result-persistence", "after-compaction-commit"].includes(point)) {
+      if (["after-exposure", "before-result-persistence"].includes(point)) {
         expect(recovered.body.error.message).toContain("uncertain");
         expect(recovered.body.error.code).toBe("agy_tool_execution_uncertain");
       }
     }
-    if (point === "after-compaction-commit") expect(recovered.lifecycle.epoch).toBe(1);
-    if (point === "after-compaction-commit-known") {
-      expect(recovered.lifecycle.epoch).toBe(1);
-      expect(recovered.bindings.find(([, record]: any) => record.conversation?.hostSessionID === "crash-host")[1].conversation.hostEpoch).toBe(1);
-    }
     const tools = join(root, "tools");
     const records = [];
     for (const directory of await readdir(tools).catch(() => [])) for (const file of await readdir(join(tools, directory))) if (file.endsWith(".json")) records.push(JSON.parse(await readFile(join(tools, directory, file), "utf8")));
-    const expectedDelivery = point === "after-delivery-intent" ? "delivery-attempted" : ["after-mcp-handoff", "after-compaction-commit-known"].includes(point) ? "locally-handed-off" : ["after-result-persistence", "before-waiter-release"].includes(point) ? "result-persisted" : undefined;
+    const expectedDelivery = point === "after-delivery-intent" ? "delivery-attempted" : point === "after-mcp-handoff" ? "locally-handed-off" : ["after-result-persistence", "before-waiter-release"].includes(point) ? "result-persisted" : undefined;
     if (records.length) expect(records[0].delivery).toBe(expectedDelivery);
     if (point === "before-result-persistence") {
       const directory = (await readdir(tools))[0];

@@ -6,7 +6,7 @@ afterAll(() => { compatibility.mockRestore(); });
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AntigravityCliPlugin, AUTH_METHOD_ID, INTEGRATION_ID, PLUGIN_ID } from "../src/index.js";
+import { AntigravityPlugin, AUTH_METHOD_ID, INTEGRATION_ID, PLUGIN_ID } from "../src/index.js";
 import {
   DIRECTORY_HEADER,
   EFFORT_HEADER,
@@ -67,8 +67,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const sessionDirectories = new Map<string, string>();
   const hooks = new Map<string, { callback: (event: any) => Promise<void>; options?: unknown }>();
   const subscriptions: AsyncEventQueue<any>[] = [];
-  const checkpoints = new Map<string, string[]>();
-  const contextReadGates = new Map<string, () => Promise<void>>();
+  const processedEvents = new Set<string>();
   const hostModels = new Map<string, any>();
   const hostModelUpdates: any[] = [];
   const context = {
@@ -78,11 +77,8 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
       return { async *[Symbol.asyncIterator]() {
         while (true) {
           const next = await queue.next(); if (next.done) return;
-          if (next.value.type === "session.compaction.ended") {
-            const host = next.value.data.sessionID;
-            checkpoints.set(host, [...new Set([...(checkpoints.get(host) ?? []), next.value.id.replace(/^evt_/, "msg_")])]);
-          }
           yield next.value;
+          processedEvents.add(next.value.id);
         }
       } };
     } },
@@ -112,12 +108,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
     },
     session: {
       switchModel: async (input: any) => { hostModelUpdates.push(input); hostModels.set(input.sessionID, input.model); },
-      context: async ({ sessionID }: { sessionID: string }) => {
-        const snapshot = [...(checkpoints.get(sessionID) ?? [])];
-        const gate = contextReadGates.get(sessionID); contextReadGates.delete(sessionID);
-        if (gate) await gate();
-        return snapshot.map(id => ({ type: "compaction", status: "completed", id, time: { created: Date.now() }, reason: "manual", summary: "Authoritative checkpoint", recent: "" }));
-      },
+      context: async () => { throw new Error("ACP must not read host compaction checkpoints"); },
       hook: async (name: string, callback: (event: any) => Promise<void>, options?: unknown) => {
         hooks.set(name, { callback, options });
         return { dispose: async () => hooks.delete(name) };
@@ -129,7 +120,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
     },
   };
 
-  const cleanup = await (AntigravityCliPlugin as any).setup(context);
+  const cleanup = await (AntigravityPlugin as any).setup(context);
   cleanupTasks.push(cleanup);
   expect(PLUGIN_ID).toBe("opencode-antigravity");
   expect(INTEGRATION_ID).toBe(PROVIDER_ID);
@@ -139,7 +130,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const provider = providers[0];
   expect(provider.info).toMatchObject({
     id: PROVIDER_ID,
-    name: "Antigravity ACP",
+    name: "Antigravity",
     activation: "enabled",
     integrationID: INTEGRATION_ID,
     package: "@opencode/ai/providers/anthropic",
@@ -208,7 +199,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   expect(titleEvent.headers[REQUEST_KIND_HEADER]).toBe("title");
   const compactionEvent = { ...event, kind: "compaction", headers: {} };
   await modelRequest.callback(compactionEvent);
-  expect(compactionEvent.headers[REQUEST_KIND_HEADER]).toBe("summary");
+  expect(compactionEvent.headers[REQUEST_KIND_HEADER]).toBe("compaction");
   const generateEvent = { ...event, kind: "generate", headers: {} };
   await modelRequest.callback(generateEvent);
   expect(generateEvent.headers[REQUEST_KIND_HEADER]).toBe("generate");
@@ -222,21 +213,18 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
     modelRequest.callback({ ...event, sessionID, headers: {} }),
   ));
 
-  // Exercise the real lifecycle subscriber, not only the store's epoch ledger.
-  const waitEpoch = async (host: string, epoch: number) => {
+  const waitEvent = async (id: string) => {
     for (let attempt = 0; attempt < 200; attempt++) {
-      if ((await sessionStore.lifecycle(host)).epoch === epoch) return;
+      if (processedEvents.has(id)) return;
       await Bun.sleep(10);
     }
-    throw new Error(`Lifecycle subscriber did not reach epoch ${epoch} for ${host}`);
+    throw new Error(`Lifecycle subscriber did not process ${id}`);
   };
   const committed = { id: "evt_deduplication_commit", type: "session.compaction.ended", data: { sessionID: "deduplication-host" } };
   const failed = { id: "evt_deduplication_old_failure", type: "session.compaction.failed", data: { sessionID: "deduplication-host" } };
   subscriptions[0].push(failed);
   subscriptions[0].push(committed);
-  await waitEpoch("deduplication-host", 1);
-  expect((await sessionStore.lifecycle("deduplication-host")).failures).toContain(failed.id);
-  expect((await sessionStore.lifecycle("deduplication-host")).transaction!.id).toBe(committed.id);
+  await waitEvent(committed.id);
   const toolEvent = { ...event, sessionID: "deduplication-host", headers: {} };
   await modelRequest.callback(toolEvent);
   const toolMessages: any[] = [{ role: "user", content: "FAKE_MCP DUPLICATE_EVENT_NEW_WORK" }];
@@ -245,16 +233,18 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   const parked = await (await sendTools()).json();
   expect(parked.stop_reason).toBe("tool_use");
   const call = parked.content.find((part: any) => part.type === "tool_use");
+  const parkedBinding = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === "deduplication-host")!;
+  subscriptions[0].push({ id: "evt_compaction_started", type: "session.compaction.started", data: { sessionID: "deduplication-host" } });
   subscriptions[0].push(committed);
   subscriptions[0].push(failed);
   subscriptions[0].push({ id: "evt_deduplication_barrier", type: "session.compaction.ended", data: { sessionID: "deduplication-barrier" } });
-  await waitEpoch("deduplication-barrier", 1);
+  await waitEvent("evt_deduplication_barrier");
+  expect(await sessionStore.get(parkedBinding[0])).toEqual(parkedBinding[1]);
   toolMessages.push({ role: "assistant", content: parked.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: "NEW_WORK_RESULT_PRESERVED" }] });
   const continued = await (await sendTools()).json();
   expect(continued.stop_reason).toBe("end_turn");
   expect(JSON.stringify(continued)).toContain("NEW_WORK_RESULT_PRESERVED");
-  expect((await sessionStore.lifecycle("deduplication-host")).epoch).toBe(1);
-  expect((await sessionStore.lifecycle("deduplication-host")).transaction!.id).toBe(committed.id);
+  expect((await sessionStore.get(parkedBinding[0]))!.sessionId).toBe(parkedBinding[1].sessionId);
   const submitted = (await readFile(process.env.FAKE_ACP_PROMPT_LOG!, "utf8")).trim().split("\n").map(line => JSON.parse(line)).filter(entry => entry.text.includes("DUPLICATE_EVENT_NEW_WORK"));
   expect(submitted).toHaveLength(1);
 
@@ -265,51 +255,6 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   expect(await sessionStore.contextSnapshot("fallback-selection")).toMatchObject({ requestedModel: "gemini-3.8-flash-high", model: "gemini-3.8-flash-low" });
   expect(hostModelUpdates).toHaveLength(0);
   expect(hostModels.get("fallback-selection").variant).toBe("medium");
-
-  // Exact reviewer interleaving: hook A waits on context, B (hook or event)
-  // retires the old parked pump/advances the epoch, then a NEW bridge parks.
-  // A's stale observation must not retire that newer bridge or advance again.
-  for (const winner of ["hook", "event"] as const) {
-    const host = `checkpoint-race-${winner}`;
-    const older = { ...event, sessionID: host, headers: {} };
-    await modelRequest.callback(older);
-    const send = (request: any, messages: any[]) => fetch(request.baseURL + "/messages", { method: "POST", headers: { ...request.headers, "content-type": "application/json" }, body: JSON.stringify({ model: "gemini-3.8-flash", messages, tools }) });
-    expect((await (await send(older, [{ role: "user", content: `FAKE_MCP OLD_${winner}` }])).json()).stop_reason).toBe("tool_use");
-    const checkpoint = `msg_checkpoint_race_${winner}`;
-    checkpoints.set(host, [checkpoint]);
-    let enter!: () => void; let resume!: () => void;
-    const entered = new Promise<void>(resolve => { enter = resolve; });
-    const resumeRead = new Promise<void>(resolve => { resume = resolve; });
-    contextReadGates.set(host, async () => { enter(); await resumeRead; });
-    const delayed = modelRequest.callback({ ...event, sessionID: host, headers: {} });
-    await entered;
-    try {
-      const newer = { ...event, sessionID: host, headers: {} };
-      if (winner === "hook") await modelRequest.callback(newer);
-      else {
-        subscriptions[0].push({ id: checkpoint.replace(/^msg_/, "evt_"), type: "session.compaction.ended", data: { sessionID: host } });
-        subscriptions[0].push({ id: "evt_race_event_barrier", type: "session.compaction.ended", data: { sessionID: "race-event-barrier" } });
-        await waitEpoch("race-event-barrier", 1);
-        await modelRequest.callback(newer);
-      }
-      expect((await sessionStore.lifecycle(host)).epoch).toBe(1);
-      const messages: any[] = [{ role: "user", content: `FAKE_MCP NEW_${winner}` }];
-      const parked = await (await send(newer, messages)).json();
-      expect(parked.stop_reason).toBe("tool_use");
-      const [key, record] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
-      const { sessionPool } = await import("../src/session-pool.js");
-      expect((await sessionPool.status(key)).active).toBe(true);
-      resume(); await delayed;
-      expect((await sessionStore.lifecycle(host)).epoch).toBe(1);
-      expect((await sessionStore.get(key))?.revision).toBe(record.revision);
-      expect((await sessionPool.status(key)).active).toBe(true);
-      const call = parked.content.find((part: any) => part.type === "tool_use");
-      messages.push({ role: "assistant", content: parked.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: call.id, content: `NEW_BRIDGE_SURVIVED_${winner}` }] });
-      const continued = await (await send(newer, messages)).json();
-      expect(continued.stop_reason).toBe("end_turn");
-      expect(JSON.stringify(continued)).toContain(`NEW_BRIDGE_SURVIVED_${winner}`);
-    } finally { resume(); await delayed; }
-  }
 
   const terminalEvent = { ...event, sessionID: "terminal-accepted", headers: {} };
   await modelRequest.callback(terminalEvent);
@@ -323,10 +268,9 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   expect((await sessionPool.status(terminalKey)).active).toBe(true);
   subscriptions[0].push({ id: "evt_terminal_accepted", type: "session.tool.success", data: { sessionID: "terminal-accepted", id: terminal.content[0].id, assistantMessageID: "msg_terminal_a", content: [{ type: "text", text: "host validated" }], executed: true } });
   subscriptions[0].push({ id: "evt_terminal_barrier", type: "session.compaction.ended", data: { sessionID: "terminal-barrier" } });
-  await waitEpoch("terminal-barrier", 1);
+  await waitEvent("evt_terminal_barrier");
   expect((await sessionPool.status(terminalKey)).active).toBe(true);
   expect((await sessionStore.toolCall(terminalKey, terminal.content[0].id))?.result).toBeUndefined();
-  expect((await sessionStore.toolCall(terminalKey, terminal.content[0].id))?.terminalAcceptance).toBeDefined();
   const afterTerminal = await (await fetch(terminalEvent.baseURL + "/messages", {
     method: "POST", headers: { ...terminalEvent.headers, "content-type": "application/json" },
     body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FAKE_MCP" }, { role: "assistant", content: terminal.content }, { role: "user", content: [{ type: "tool_result", tool_use_id: terminal.content[0].id, content: "ORIGINAL_HOST_STRUCTURED_RESULT" }, { type: "text", text: "continue after accepted output" }] }], tools: [{ name: "StructuredOutput", input_schema: { type: "object" } }] }),
@@ -344,24 +288,21 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   subscriptions[0].push({ id: "evt_delayed_execution_a", type: "session.execution.succeeded", data: { sessionID: "terminal-accepted" } });
   subscriptions[0].push({ id: "evt_duplicate_tool_a", type: "session.tool.success", data: { sessionID: "terminal-accepted", id: terminal.content[0].id } });
   subscriptions[0].push({ id: "evt_delayed_barrier", type: "session.compaction.ended", data: { sessionID: "delayed-barrier" } });
-  await waitEpoch("delayed-barrier", 1);
+  await waitEvent("evt_delayed_barrier");
   expect((await sessionPool.status(terminalKey)).active).toBe(true);
-  expect((await sessionStore.toolCall(terminalKey, terminalB.content[0].id))?.terminalAcceptance).toBeUndefined();
+  expect((await sessionStore.toolCall(terminalKey, terminalB.content[0].id))?.result).toBeUndefined();
 
-  checkpoints.set("deduplication-host", [...checkpoints.get("deduplication-host")!, "msg_missed_host_checkpoint"]);
   subscriptions[0].close(new Error("synthetic unexpected lifecycle disconnect"));
   for (let i = 0; i < 200 && subscriptions.length < 2; i++) await Bun.sleep(10);
   expect(subscriptions.length).toBe(2);
   expect((await sessionPool.status(terminalKey)).active).toBe(false);
   expect((await sessionStore.get(terminalKey))?.conversation?.resumable).toBe(false);
-  expect((await sessionStore.lifecycle("deduplication-host")).epoch).toBe(2);
   subscriptions[1].push({ id: "evt_missed_host_checkpoint", type: "session.compaction.ended", data: { sessionID: "deduplication-host" } });
   subscriptions[1].push({ id: "evt_reconnected_barrier", type: "session.compaction.ended", data: { sessionID: "reconnected-barrier" } });
-  await waitEpoch("reconnected-barrier", 1);
-  expect((await sessionStore.lifecycle("deduplication-host")).epoch).toBe(2);
+  await waitEvent("evt_reconnected_barrier");
   subscriptions[1].push({ id: "evt_deleted_terminal", type: "session.deleted", data: { sessionID: "terminal-accepted" } });
   subscriptions[1].push({ id: "evt_deleted_barrier", type: "session.compaction.ended", data: { sessionID: "deleted-barrier" } });
-  await waitEpoch("deleted-barrier", 1);
+  await waitEvent("evt_deleted_barrier");
   expect(await sessionStore.get(terminalKey)).toBeUndefined();
   expect(await sessionStore.toolCall(terminalKey, terminalB.content[0].id)).toBeUndefined();
   expect(await sessionStore.isHostDeleted("terminal-accepted")).toBe(true);
@@ -375,7 +316,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
 
   // Two plugin instances acquire the same root. Each acquisition must release
   // at the proxy's single ownership layer, including identical workspace roots.
-  const peerCleanup = await (AntigravityCliPlugin as any).setup(context);
+  const peerCleanup = await (AntigravityPlugin as any).setup(context);
   await Promise.all([cleanup(), cleanup()]);
   expect(getProxyPort()).not.toBeNull();
   await peerCleanup();
@@ -383,7 +324,7 @@ test("V2 setup registers provider models, integration auth, request hook, and cl
   expect(getProxyPort()).toBeNull();
 
   // Reloading a location reuses the automatic local marker, not another account.
-  const secondCleanup = await (AntigravityCliPlugin as any).setup(context);
+  const secondCleanup = await (AntigravityPlugin as any).setup(context);
   cleanupTasks.push(secondCleanup);
   expect(savedMarkers).toHaveLength(1);
 });

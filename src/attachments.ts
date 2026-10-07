@@ -53,7 +53,7 @@ export function validateMediaBlocks(blocks: ContentBlock[], limit = MAX_MEDIA_BY
 }
 
 /**
- * Media policy for the official Antigravity ACP server. ACP carries binary
+ * Media policy for the official Antigravity server. ACP carries binary
  * prompts as base64 content blocks; remote URLs are deliberately not fetched
  * by the local adapter.
  */

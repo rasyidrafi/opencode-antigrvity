@@ -10,7 +10,7 @@ export const ACP_VERSION = "1.3.0";
 export function acpDistribution(platform = process.platform, arch = process.arch) {
   const os = platform === "darwin" ? "macos" : platform === "win32" ? "windows" : platform === "linux" ? "linux" : undefined;
   const cpu = arch === "x64" ? "x86_64" : arch === "arm64" ? "arm64" : undefined;
-  if (!os || !cpu) throw new Error(`No official Antigravity ACP distribution for ${platform}-${arch}`);
+  if (!os || !cpu) throw new Error(`No official Antigravity distribution for ${platform}-${arch}`);
   return {
     url: `https://dl.google.com/agy-extensions/releases/${os}/agy-acp-server-${ACP_VERSION}-${platform === "win32" ? "windows" : platform}-${cpu}.zip`,
     executable: platform === "win32" ? "agy_acp_server.exe" : "agy_acp_server.par",

@@ -1,8 +1,5 @@
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { access, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
-import { randomUUID } from "node:crypto";
 import { Readable, Writable } from "node:stream";
 import {
   client,
@@ -11,7 +8,6 @@ import {
   type ClientConnection,
   type ContentBlock,
   type InitializeResponse,
-  type PermissionOptionKind,
   type PromptResponse,
   type SessionNotification,
   type SessionUpdate,
@@ -31,11 +27,10 @@ export type { AcpEvent } from "./protocol.js";
 export type AcpWorkerState = "created" | "starting" | "ready" | "turn_active" | "closing" | "closed" | "failed";
 
 export type AcpWorkerOptions = {
-  utility?: boolean;
+  utilityDirectory?: string;
   cwd: string;
   executable?: string;
   executableArgs?: string[];
-  addDirs?: string[];
   environment?: Record<string, string | undefined>;
   model?: string;
   effort?: AcpEffort;
@@ -45,7 +40,6 @@ export type AcpWorkerOptions = {
   skipSession?: boolean;
   nonInteractive?: boolean;
   catalogScope?: string;
-  permissionPolicy?: "allow-always" | "allow-once" | "deny";
   printTimeoutMs?: number;
   stallTimeoutMs?: number;
   onActivity?: () => void;
@@ -165,15 +159,6 @@ function createTurnActivityWatchdog(timeoutMs: number, onTimeout: () => void, pa
   };
 }
 
-type TerminalRecord = {
-  child: ChildProcess;
-  output: string;
-  truncated: boolean;
-  outputLimit: number;
-  exitStatus?: { exitCode?: number | null; signal?: string | null };
-  closed: Promise<void>;
-};
-
 function asAcpError(error: unknown, fallback: string): AgyError {
   if (error instanceof AgyError) return error;
   const message = error instanceof Error ? error.message : String(error);
@@ -199,16 +184,6 @@ function asAcpError(error: unknown, fallback: string): AgyError {
 
 function timeoutMsOrDefault(value: number | undefined, fallback: number): number {
   return value === undefined || !Number.isFinite(value) || value < 0 ? fallback : value;
-}
-
-function contentText(content: unknown): string {
-  if (!content || typeof content !== "object") return "";
-  const value = content as { type?: unknown; text?: unknown };
-  return value.type === "text" && typeof value.text === "string" ? value.text : "";
-}
-
-function safeOptionKind(kind: PermissionOptionKind): boolean {
-  return kind === "allow_always" || kind === "allow_once";
 }
 
 function isMissingSessionError(error: unknown): boolean {
@@ -249,8 +224,6 @@ export class AcpWorker {
   private closePromise: Promise<void> | null = null;
   private turnEvents: AsyncEventQueue<AcpEvent> | null = null;
   private turnWatchdog: TurnActivityWatchdog | null = null;
-  private terminals = new Map<string, TerminalRecord>();
-  private roots: string[] = [];
   private stderrDiagnostic = "";
   private actualModelValue?: string;
   private executionActivity = false;
@@ -286,7 +259,6 @@ export class AcpWorker {
     if (this.stateValue === "ready") return;
     if (this.stateValue !== "created") throw new AgyProcessError(`Cannot start ACP worker from state ${this.stateValue}`);
     this.stateValue = "starting";
-    this.roots = [this.options.cwd, ...(this.options.addDirs ?? [])].map((path) => resolve(path));
     try {
       const args = this.options.executableArgs ?? (await detectAcpServer(this.executable)).args;
       this.child = spawn(this.executable, args, {
@@ -310,13 +282,6 @@ export class AcpWorker {
       const app = client({ name: "opencode-antigravity" });
       app.onNotification(methods.client.session.update, ({ params }) => this.onSessionUpdate(params));
       app.onRequest(methods.client.session.requestPermission, ({ params }) => this.requestPermission(params));
-      app.onRequest(methods.client.fs.readTextFile, ({ params }) => this.readTextFile(params));
-      app.onRequest(methods.client.fs.writeTextFile, ({ params }) => this.writeTextFile(params));
-      app.onRequest(methods.client.terminal.create, ({ params }) => this.createTerminal(params));
-      app.onRequest(methods.client.terminal.output, ({ params }) => this.terminalOutput(params));
-      app.onRequest(methods.client.terminal.waitForExit, ({ params }) => this.waitForTerminal(params));
-      app.onRequest(methods.client.terminal.kill, ({ params }) => this.killTerminal(params));
-      app.onRequest(methods.client.terminal.release, ({ params }) => this.releaseTerminal(params));
       this.connection = app.connect(stream);
       void this.connection.closed.then(() => {
         if (!this.stopping) this.turnEvents?.close(new AgyProcessError("The ACP agent connection closed unexpectedly", this.stderrDiagnostic));
@@ -324,11 +289,8 @@ export class AcpWorker {
       const agent = this.connection.agent;
       const init = await this.withSignal(agent.request(methods.agent.initialize, {
         protocolVersion: 1,
-        clientCapabilities: this.options.hostTools ? {} : {
-          fs: { readTextFile: true, writeTextFile: true },
-          terminal: true,
-        },
-        clientInfo: { name: "opencode-antigravity", version: "0.4.1" },
+        clientCapabilities: {},
+        clientInfo: { name: "opencode-antigravity", version: "0.6.0" },
       }), signal);
       this.initValue = init;
       const authMethod = this.options.authMethod?.trim() || process.env.OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD?.trim();
@@ -351,11 +313,11 @@ export class AcpWorker {
         }
       }
       this.stateValue = "ready";
-      info("official Antigravity ACP worker ready", { protocol: init.protocolVersion, session: Boolean(this.sessionIdValue) });
+      info("official Antigravity worker ready", { protocol: init.protocolVersion, session: Boolean(this.sessionIdValue) });
     } catch (error) {
       await this.stop(true);
       this.stateValue = "failed";
-      throw asAcpError(error, "The official Antigravity ACP server could not be started");
+      throw asAcpError(error, "The official Antigravity server could not be started");
     }
   }
 
@@ -363,8 +325,7 @@ export class AcpWorker {
     const request = {
       cwd: this.options.cwd,
       mcpServers: this.options.mcpServers ?? [],
-      ...(this.options.hostTools ? { _meta: { agy: { enabledTools: [] } } } : {}),
-      ...(this.options.addDirs?.length ? { additionalDirectories: this.options.addDirs } : {}),
+      _meta: { agy: { enabledTools: [] } },
     };
     if (this.options.sessionId && this.initValue?.agentCapabilities?.loadSession === true) {
       try {
@@ -580,10 +541,6 @@ export class AcpWorker {
     this.stateValue = "closing";
     this.closePromise = (async () => {
       this.turnEvents?.close(new AgyProcessError("The ACP worker stopped"));
-      for (const terminal of this.terminals.values()) {
-        if (terminal.child.exitCode === null) terminateProcess(terminal.child);
-      }
-      this.terminals.clear();
       this.connection?.close();
       const child = this.child;
       if (child && child.exitCode === null && child.signalCode === null) {
@@ -600,163 +557,19 @@ export class AcpWorker {
         });
       }
       this.stateValue = "closed";
-      debug("official Antigravity ACP worker stopped", { force });
+      debug("official Antigravity worker stopped", { force });
     })();
     return this.closePromise;
   }
 
-  async restart(options: AcpWorkerOptions, executable = this.executable): Promise<AcpWorker> {
-    await this.stop();
-    const worker = new AcpWorker(options, executable);
-    await worker.start();
-    return worker;
-  }
-
   private async requestPermission(params: import("@agentclientprotocol/sdk").RequestPermissionRequest): Promise<import("@agentclientprotocol/sdk").RequestPermissionResponse> {
     this.executionActivity = true;
-    if (this.options.hostTools) {
-      const meta = (params.toolCall as { _meta?: { mcp?: { server?: string } } })._meta;
-      // Malformed MCP envelopes have no parsed _meta yet. Let the MCP
-      // dispatcher report argument errors so the model can correct them.
-      // The isolated harness contains only our session-bound MCP endpoint.
-      const dispatcher = params.toolCall.title === "Run call_mcp_tool?";
-      const allowed = (meta?.mcp?.server === "opencode" || dispatcher) && Boolean(this.options.mcpServers?.length);
-      const option = params.options.find((item) => item.kind === (allowed ? "allow_once" : "reject_once"));
-      return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : { outcome: { outcome: "cancelled" } };
-    }
-    const policy = this.options.permissionPolicy ?? (process.env.OPENCODE_ANTIGRAVITY_ACP_PERMISSION ?? "allow-always");
-    if (policy === "deny") {
-      const option = params.options.find((candidate) => candidate.kind === "reject_once" || candidate.kind === "reject_always");
-      return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : { outcome: { outcome: "cancelled" } };
-    }
-    const preferred = policy === "allow-always" ? "allow_always" : "allow_once";
-    const option = params.options.find((candidate) => candidate.kind === preferred) ?? params.options.find((candidate) => safeOptionKind(candidate.kind));
-    if (!option) return { outcome: { outcome: "cancelled" } };
-    info("auto-approved ACP tool permission", { kind: params.toolCall.kind, status: params.toolCall.status });
-    return { outcome: { outcome: "selected", optionId: option.optionId } };
-  }
-
-  private async readTextFile(params: import("@agentclientprotocol/sdk").ReadTextFileRequest): Promise<import("@agentclientprotocol/sdk").ReadTextFileResponse> {
-    this.executionActivity = true;
-    if (this.options.hostTools) throw new AgyError("unsupported", "File access must use OpenCode tools");
-    const path = await this.allowedPath(params.path, false);
-    const content = await readFile(path, "utf8");
-    const lines = content.split(/\r?\n/);
-    const start = Math.max(0, (params.line ?? 1) - 1);
-    const selected = params.limit === undefined || params.limit === null ? lines.slice(start) : lines.slice(start, start + Math.max(0, params.limit));
-    return { content: selected.join("\n") };
-  }
-
-  private async writeTextFile(params: import("@agentclientprotocol/sdk").WriteTextFileRequest): Promise<import("@agentclientprotocol/sdk").WriteTextFileResponse> {
-    this.executionActivity = true;
-    if (this.options.hostTools) throw new AgyError("unsupported", "File access must use OpenCode tools");
-    const path = await this.allowedPath(params.path, true);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, params.content, { encoding: "utf8", mode: 0o600 });
-    return {};
-  }
-
-  private async allowedPath(path: string, write: boolean): Promise<string> {
-    if (!isAbsolute(path)) throw new AgyError("invalid_request", "ACP file paths must be absolute", { code: "agy_acp_path" });
-    const candidate = resolve(path);
-    let check = candidate;
-    if (write) {
-      while (true) {
-        try { check = await realpath(check); break; } catch {
-          const parent = dirname(check);
-          if (parent === check) throw new AgyError("unsupported", "The ACP path has no accessible parent", { code: "agy_acp_path" });
-          check = parent;
-        }
-      }
-    } else {
-      check = await realpath(candidate);
-    }
-    const roots = await Promise.all(this.roots.map((root) => realpath(root).catch(() => resolve(root))));
-    if (!roots.some((root) => check === root || !relative(root, check).startsWith(`..${sep}`) && relative(root, check) !== "..")) {
-      throw new AgyError("unsupported", "The ACP agent requested a path outside the configured workspace", { code: "agy_acp_path_boundary" });
-    }
-    return candidate;
-  }
-
-  private async createTerminal(params: import("@agentclientprotocol/sdk").CreateTerminalRequest): Promise<import("@agentclientprotocol/sdk").CreateTerminalResponse> {
-    this.executionActivity = true;
-    if (this.options.hostTools) throw new AgyError("unsupported", "Terminal access must use OpenCode tools");
-    const cwd = await this.allowedPath(params.cwd ?? this.options.cwd, false);
-    const child = spawn(params.command, params.args ?? [], {
-      cwd,
-      env: this.terminalEnvironment(params.env),
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      windowsHide: true,
-    });
-    const terminalId = `terminal_${Math.random().toString(36).slice(2, 14)}`;
-    const record: TerminalRecord = {
-      child,
-      output: "",
-      truncated: false,
-      outputLimit: Math.max(1_024, params.outputByteLimit ?? 512 * 1024),
-      closed: Promise.resolve(),
-    };
-    const append = (chunk: Buffer | string) => {
-      const value = typeof chunk === "string" ? chunk : chunk.toString("utf8");
-      const next = `${record.output}${value}`;
-      if (Buffer.byteLength(next, "utf8") <= record.outputLimit) record.output = next;
-      else {
-        record.truncated = true;
-        const bytes = Buffer.from(next, "utf8").subarray(-record.outputLimit);
-        record.output = bytes.toString("utf8");
-      }
-    };
-    child.stdout.on("data", append);
-    child.stderr.on("data", append);
-    record.closed = new Promise<void>((resolveClosed) => child.once("close", (code, signal) => {
-      record.exitStatus = { exitCode: code, signal };
-      resolveClosed();
-    }));
-    this.terminals.set(terminalId, record);
-    return { terminalId };
-  }
-
-  private terminalEnvironment(entries: Array<{ name: string; value: string }> | undefined): NodeJS.ProcessEnv {
-    const sensitive = /(?:API_KEY|TOKEN|SECRET|PASSWORD|AUTHORIZATION|COOKIE|PRIVATE_KEY)/i;
-    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !sensitive.test(name)));
-    for (const entry of entries ?? []) {
-      if (!sensitive.test(entry.name)) inherited[entry.name] = entry.value;
-    }
-    return inherited;
-  }
-
-  private terminal(params: { terminalId: string }): TerminalRecord {
-    const terminal = this.terminals.get(params.terminalId);
-    if (!terminal) throw new AgyError("invalid_request", "Unknown ACP terminal", { code: "agy_acp_terminal" });
-    return terminal;
-  }
-
-  private async terminalOutput(params: import("@agentclientprotocol/sdk").TerminalOutputRequest): Promise<import("@agentclientprotocol/sdk").TerminalOutputResponse> {
-    const terminal = this.terminal(params);
-    return { output: terminal.output, truncated: terminal.truncated, ...(terminal.exitStatus ? { exitStatus: terminal.exitStatus } : {}) };
-  }
-
-  private async waitForTerminal(params: import("@agentclientprotocol/sdk").WaitForTerminalExitRequest): Promise<import("@agentclientprotocol/sdk").WaitForTerminalExitResponse> {
-    const terminal = this.terminal(params);
-    await terminal.closed;
-    return {
-      exitCode: terminal.exitStatus?.exitCode ?? null,
-      signal: terminal.exitStatus?.signal ?? null,
-    };
-  }
-
-  private async killTerminal(params: import("@agentclientprotocol/sdk").KillTerminalRequest): Promise<import("@agentclientprotocol/sdk").KillTerminalResponse> {
-    const terminal = this.terminal(params);
-    if (terminal.child.exitCode === null && terminal.child.signalCode === null) terminateProcess(terminal.child);
-    return {};
-  }
-
-  private async releaseTerminal(params: import("@agentclientprotocol/sdk").ReleaseTerminalRequest): Promise<import("@agentclientprotocol/sdk").ReleaseTerminalResponse> {
-    const terminal = this.terminals.get(params.terminalId);
-    if (terminal && terminal.child.exitCode === null && terminal.child.signalCode === null) terminateProcess(terminal.child);
-    this.terminals.delete(params.terminalId);
-    return {};
+    const meta = (params.toolCall as { _meta?: { mcp?: { server?: string } } })._meta;
+    // The isolated harness contains only our session-bound MCP endpoint.
+    const dispatcher = params.toolCall.title === "Run call_mcp_tool?";
+    const allowed = (meta?.mcp?.server === "opencode" || dispatcher) && Boolean(this.options.mcpServers?.length);
+    const option = params.options.find((item) => item.kind === (allowed ? "allow_once" : "reject_once"));
+    return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : { outcome: { outcome: "cancelled" } };
   }
 
   private async withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -799,7 +612,7 @@ export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortS
   if (options.hostTools) {
     const isolated = await hostEnvironment({ ...process.env, ...options.environment,
       ...(options.authMethod ? { OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: options.authMethod } : {}) },
-      options.utility === true ? `${options.catalogScope ?? "local"}:utility:${randomUUID()}` : options.catalogScope);
+      options.catalogScope, options.utilityDirectory);
     options = { ...options, ...isolated };
   }
   await bridgeCliAuthentication({

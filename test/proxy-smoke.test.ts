@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -32,7 +32,7 @@ describe("loopback Anthropic proxy", () => {
     await Promise.all([rm(secondWorkspace, { recursive: true, force: true }), rm(outsideWorkspace, { recursive: true, force: true })]);
   });
 
-  test("routine Gemini/Claude output budgets do not exhaust independent chat/summary byte caps", async () => {
+  test("routine Gemini/Claude output budgets do not exhaust chat byte caps", async () => {
     const oldExtra = process.env.FAKE_ACP_EXTRA_MODEL;
     const oldLimit = process.env.OPENCODE_ANTIGRAVITY_UTILITY_MAX_CHARS;
     process.env.FAKE_ACP_EXTRA_MODEL = "claude-sonnet-4-6";
@@ -48,10 +48,6 @@ describe("loopback Anthropic proxy", () => {
         const result = await first.json();
         messages.push({ role: "assistant", content: result.content }, { role: "user", content: "A second tiny request." });
         expect((await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify({ model, max_tokens, messages }) })).status).toBe(200);
-        messages.push({ role: "user", content: "Summarize this selected conversation." });
-        const summary = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: { ...headers, [REQUEST_KIND_HEADER]: "compaction" }, body: JSON.stringify({ model, max_tokens, system: "Preserve the tiny requests.", messages }) });
-        expect(summary.status).toBe(200);
-        expect((await summary.json()).stop_reason).toBe("end_turn");
       }
     } finally {
       if (oldExtra === undefined) delete process.env.FAKE_ACP_EXTRA_MODEL; else process.env.FAKE_ACP_EXTRA_MODEL = oldExtra;
@@ -138,11 +134,9 @@ describe("loopback Anthropic proxy", () => {
 
   test("utility refusal is a policy failure, never a successful checkpoint", async () => {
     const { sessionStore } = await import("../src/session-store.js");
-    const response = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: { ...authHeaders, [SESSION_HEADER]: "utility-policy", [REQUEST_KIND_HEADER]: "summary" }, body: JSON.stringify(message("FAKE_REFUSAL")) });
+    const response = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: { ...authHeaders, [SESSION_HEADER]: "utility-policy", [REQUEST_KIND_HEADER]: "generate" }, body: JSON.stringify(message("FAKE_REFUSAL")) });
     expect(response.status).toBe(400);
     expect((await response.json()).error.type).toBe("content_policy_violation");
-    expect((await sessionStore.lifecycle("utility-policy")).epoch).toBe(0);
-    expect((await sessionStore.lifecycle("utility-policy")).transaction?.phase).toBe("failed");
   });
 
   test("replayed host-visible activity stays aligned in streaming and collected responses", async () => {
@@ -283,24 +277,47 @@ describe("loopback Anthropic proxy", () => {
     expect((await sessionPool.status(sessionKey(primarySession))).hasSession).toBe(true);
   });
 
-  test("summary failure preserves baseline and generation alone does not commit an epoch", async () => {
+  test("host compaction is declined without prompting or changing the live session", async () => {
     const { sessionStore } = await import("../src/session-store.js");
     const host = "summary-transaction-runtime";
     const headers = { ...authHeaders, [SESSION_HEADER]: host, [REQUEST_KIND_HEADER]: "chat" };
     const initial = await (await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify(message("SUMMARY_BASELINE")) })).json();
     expect(initial.stop_reason).toBe("end_turn");
     const binding = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
-    const before = binding[1].conversation!.boundary;
-    const summarize = (content: string) => fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: { ...headers, [REQUEST_KIND_HEADER]: "compaction" }, body: JSON.stringify(message(content, { system: "ORIGINAL_HOST_SUMMARY_TASK" })) });
-    const failed = await summarize("FAKE_MAX_TOKENS");
-    expect(failed.status).not.toBe(200);
-    expect((await sessionStore.lifecycle(host)).epoch).toBe(0);
-    expect((await sessionStore.get(binding[0]))!.conversation!.boundary).toEqual(before);
-    const summary = await summarize("selected prefix only");
-    expect(summary.status).toBe(200);
-    expect((await summary.json()).stop_reason).toBe("end_turn");
-    expect((await sessionStore.lifecycle(host)).epoch).toBe(0);
-    expect((await sessionStore.lifecycle(host)).transaction!.phase).toBe("generating");
+    const before = await readFile(process.env.FAKE_ACP_PROMPT_LOG!, "utf8");
+    for (const stream of [false, true]) {
+      const summaryHeaders: Record<string, string> = { ...headers };
+      summaryHeaders[REQUEST_KIND_HEADER] = "compaction";
+      const response = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: summaryHeaders, body: JSON.stringify(message("FAKE_MAX_TOKENS", { stream, system: "You are tasked with summarizing conversations." })) });
+      expect(response.status).toBe(400);
+      expect((await response.json()).error.code).toBe("agy_internal_compaction");
+      expect(await sessionStore.get(binding[0])).toEqual(binding[1]);
+    }
+    expect(await readFile(process.env.FAKE_ACP_PROMPT_LOG!, "utf8")).toBe(before);
+    const continued = await (await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify(message("continue", { messages: [{ role: "user", content: "SUMMARY_BASELINE" }, { role: "assistant", content: initial.content }, { role: "user", content: "continue" }] })) })).json();
+    expect(continued.stop_reason).toBe("end_turn");
+    expect((await sessionStore.get(binding[0]))!.sessionId).toBe(binding[1].sessionId);
+  });
+
+  test("utility success and failure clean their real ACP homes", async () => {
+    const data = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
+    const before = await readdir(join(data, "host-acp"));
+    for (const [kind, prompt, status] of [["title", "short title", 200], ["generate", "FAKE_REFUSAL", 400]] as const) {
+      const response = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: { ...authHeaders, [REQUEST_KIND_HEADER]: kind }, body: JSON.stringify(message(prompt)) });
+      expect(response.status).toBe(status);
+      await response.text();
+      expect(await readdir(join(data, "utilities"))).toEqual([]);
+      expect(await readdir(join(data, "host-acp"))).toEqual(before);
+    }
+  });
+
+  test("summary and title phrases without a routing header remain ordinary chat", async () => {
+    const response = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: authHeaders, body: JSON.stringify(message("NORMAL_CHAT", { system: "You are a title generator. You are tasked with summarizing conversations. Write like a pull request description." })) });
+    expect(response.status).toBe(200);
+    expect((await response.json()).stop_reason).toBe("end_turn");
+    const sent = JSON.parse((await readFile(promptLog, "utf8")).trim().split("\n").at(-1)!);
+    expect(sent.text).toContain("NORMAL_CHAT");
+    expect(sent.text).not.toContain("Generate a concise 3-7 word session title");
   });
 
   test("session config updates change picker inventory and request validation together", async () => {

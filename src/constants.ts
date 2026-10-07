@@ -1,5 +1,5 @@
-export const PROVIDER_ID = "antigravity-cli";
-export const PROVIDER_NAME = "Antigravity ACP";
+export const PROVIDER_ID = "antigravity";
+export const PROVIDER_NAME = "Antigravity";
 /** A deliberately non-secret value used by the loopback adapter. */
 export const LOCAL_API_KEY = "opencode-antigravity-local";
 

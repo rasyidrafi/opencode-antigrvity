@@ -57,7 +57,7 @@ export async function resolveAcpExecutable(preferred?: string, options: AcpServe
   if (configured) {
     const path = isAbsolute(configured) ? configured : resolve(configured);
     if (await isExecutable(path)) return path;
-    throw new AgyProcessError(`Configured Antigravity ACP server was not found: ${path}`);
+    throw new AgyProcessError(`Configured Antigravity server was not found: ${path}`);
   }
 
   const names = executableNames();
@@ -85,7 +85,7 @@ export async function resolveAcpExecutable(preferred?: string, options: AcpServe
   }
 
   throw new AgyProcessError(
-    "The official Antigravity ACP server was not found. Install agy_acp_server.par from the ACP registry or set OPENCODE_ANTIGRAVITY_ACP_PATH.",
+    "The official Antigravity server was not found. Install agy_acp_server.par from the ACP registry or set OPENCODE_ANTIGRAVITY_ACP_PATH.",
   );
 }
 
