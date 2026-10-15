@@ -22,13 +22,22 @@ async function reclaimDead(path: string): Promise<void> {
   } catch (error: any) { if (error.code !== "ENOENT") throw error; }
 }
 
+/** Internal: reaper recursion outgrew its guard. It never escapes lock(): each
+ * unwind level reclaims its own lock best-effort and the outermost resumes. */
+class ReaperGuardError extends AgyBusyError {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReaperGuardError";
+  }
+}
+
 /** Publish a fully written owner file atomically, so contenders never read an empty PID. */
 export async function acquireFileLock(path: string, waitMs = 0): Promise<() => Promise<void>> {
   return lock(path, waitMs, 0);
 }
 
 async function lock(path: string, waitMs: number, depth: number): Promise<() => Promise<void>> {
-  if (depth > 8) throw new AgyBusyError("Antigravity stale-lock recovery guard limit reached; unknown ownership is protected");
+  if (depth > 8) throw new ReaperGuardError("Antigravity stale-lock recovery guard limit reached; unknown ownership is protected");
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const owner = `${path}.${process.pid}.${randomUUID()}`;
   const token = `${process.pid}:${randomUUID()}`;
@@ -56,6 +65,16 @@ async function lock(path: string, waitMs: number, depth: number): Promise<() => 
         } catch (failure: any) {
           if (failure.code === "ENOENT") continue;
           if (!(failure instanceof AgyBusyError)) throw failure;
+          // A chain that outgrew the guard can no longer be serialized through
+          // its reaper. Failing closed forever would brick every later write
+          // (observed with a fully dead depth-8 chain), so recover best-effort
+          // while the failure unwinds: reclaimDead removes only owners whose
+          // process is gone and re-checks the token before unlinking, and each
+          // level clears exactly its own lock. The outermost level then retries.
+          if (failure instanceof ReaperGuardError) {
+            await reclaimDead(path);
+            if (depth > 0) throw failure;
+          }
         } finally {
           await releaseReaper?.();
         }
