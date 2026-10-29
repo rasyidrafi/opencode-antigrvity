@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import readline from "node:readline";
 import fs from "node:fs";
