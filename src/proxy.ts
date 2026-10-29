@@ -25,7 +25,7 @@ import { buildGenerateUtilityPrompt, buildUtilityPrompt, runAcpOneShot, type One
 import { sessionStore } from "./session-store.js";
 import { readContextSnapshot } from "./telemetry.js";
 import { sessionPool } from "./session-pool.js";
-import type { AcpEvent } from "./protocol.js";
+import type { AcpEvent, ContextOccupancy } from "./protocol.js";
 import { hostBridge, handleHostMcp, closeHostBridges, closeHostBridgesForScope, hostInstructions, type BridgeEvent } from "./host-tools.js";
 import {
   appendResultWithoutDuplication,
@@ -210,6 +210,13 @@ function anthropicUsage(usage: AnthropicUsage | undefined): Record<string, unkno
   };
 }
 
+function contextOccupancyUsage(context: ContextOccupancy | undefined): AnthropicUsage | undefined {
+  // ACP occupancy is only an approximation of current input context, not
+  // request-token accounting. It must never invent output/reasoning usage.
+  if (!context || !Number.isSafeInteger(context.used) || context.used < 0) return undefined;
+  return { input_tokens: context.used, output_tokens: 0 };
+}
+
 async function probeTurn(events: AsyncIterable<BridgeEvent>): Promise<ProbeResult> {
   const iterator = events[Symbol.asyncIterator]();
   const buffered: BridgeEvent[] = [];
@@ -258,6 +265,7 @@ function streamAnthropic(
       let streamedText = "";
       let finishReason = "end_turn";
       let resultUsage: AnthropicUsage | undefined;
+      let responseContext: ContextOccupancy | undefined;
       let sawResult = false;
       const translation = createAcpTranslationState();
       const closeBlock = () => {
@@ -287,6 +295,7 @@ function streamAnthropic(
           if (signal?.aborted) throw new AgyError("timeout", "The client cancelled the ACP request", { status: 499, code: "agy_client_cancelled" });
           const next = await iterator!.next();
           if (next.done) break;
+          if ("contextOccupancy" in next.value) responseContext = next.value.contextOccupancy;
           if (next.value.event === "host_tools") {
             closeBlock();
             for (const call of next.value.calls) {
@@ -318,7 +327,7 @@ function streamAnthropic(
         }
         if (!sawResult && finishReason !== "tool_use") throw new AgyProtocolError("The ACP agent ended a turn without a result");
         closeBlock();
-        send({ type: "message_delta", delta: { stop_reason: finishReason, stop_sequence: null }, usage: anthropicUsage(resultUsage) });
+        send({ type: "message_delta", delta: { stop_reason: finishReason, stop_sequence: null }, usage: anthropicUsage(resultUsage ?? contextOccupancyUsage(responseContext)) });
         send({ type: "message_stop" });
         if (!closed) controller.close();
       } catch (error) {
@@ -345,9 +354,9 @@ function utilityMessage(result: OneShotResult, model: string): Response {
   return Response.json({ id: completionId(), type: "message", role: "assistant", model, content: [{ type: "text", text: result.response }], stop_reason: "end_turn", stop_sequence: null, usage: anthropicUsage(result.usage) });
 }
 
-function collectedMessage(collected: Awaited<ReturnType<typeof collectTurn>>, model: string): Response {
+function collectedMessage(collected: Awaited<ReturnType<typeof collectTurn>>, model: string, usage: AnthropicUsage | undefined): Response {
   const content = hostVisibleContent(collected.segments).map((part, index) => part.type === "thinking" ? { ...part, signature: `agy-${index}` } : part);
-  return Response.json({ id: completionId(), type: "message", role: "assistant", model, content, stop_reason: collected.finishReason, stop_sequence: null, usage: anthropicUsage(collected.usage) });
+  return Response.json({ id: completionId(), type: "message", role: "assistant", model, content, stop_reason: collected.finishReason, stop_sequence: null, usage: anthropicUsage(usage) });
 }
 
 function utilityStream(result: OneShotResult, model: string): Response {
@@ -430,7 +439,12 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
   if (body.stream !== true) {
     try {
       const acp: AcpEvent[] = []; const calls: unknown[] = [];
-      for await (const event of probed.replay) { if (event.event === "host_tools") calls.push(...event.calls); else acp.push(event); }
+      let responseContext: ContextOccupancy | undefined;
+      for await (const event of probed.replay) {
+        if ("contextOccupancy" in event) responseContext = event.contextOccupancy;
+        if (event.event === "host_tools") calls.push(...event.calls);
+        else acp.push(event);
+      }
       if (calls.length) {
         const state = createAcpTranslationState();
         const content: unknown[] = [];
@@ -441,9 +455,10 @@ async function handleMessages(request: Request, body: AnthropicMessageRequest): 
           if (mapped.kind === "reasoning" || mapped.kind === "activity") content.push({ type: "thinking", thinking: mapped.text, signature: `agy-${content.length}` });
         }
         return Response.json({ id: completionId(), type: "message", role: "assistant", model: responseModel(body.model, selected.requestedModel),
-          content: [...content, ...calls], stop_reason: "tool_use", stop_sequence: null, usage: anthropicUsage(undefined) });
+          content: [...content, ...calls], stop_reason: "tool_use", stop_sequence: null, usage: anthropicUsage(contextOccupancyUsage(responseContext)) });
       }
-      return collectedMessage(await collectTurn((async function* () { yield* acp; })()), responseModel(body.model, selected.requestedModel));
+      const collected = await collectTurn((async function* () { yield* acp; })());
+      return collectedMessage(collected, responseModel(body.model, selected.requestedModel), collected.usage ?? contextOccupancyUsage(responseContext));
     }
     catch (error) { return errorResponse(error); }
   }

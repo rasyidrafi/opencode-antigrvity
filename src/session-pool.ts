@@ -23,7 +23,7 @@ import { collectTurn, hostVisibleContent } from "./translate.js";
 import { blockBudget, historyCharacterLimit } from "./budget.js";
 import { materializeMedia, validateMediaBlocks, type MediaMaterializationBudget } from "./attachments.js";
 import { reconstruct, type ReconstructionGroup } from "./reconstruction.js";
-import { observeContext, publishContextSnapshot } from "./telemetry.js";
+import { freezeContextOccupancy, observeContext, publishContextSnapshot, readBoundContextOccupancy, type ContextOccupancyCandidate } from "./telemetry.js";
 
 export type SessionSettings = {
   cwd: string;
@@ -50,7 +50,7 @@ export type SessionTurnRequest = {
   instructions?: string;
   messages?: HostMessage[];
   hostSessionID?: string;
-  responseCursor?: { start: number; events: number };
+  responseCursor?: { start: number; events: number; contextOccupancy?: ContextOccupancyCandidate };
   identity?: { value?: string };
   suppressToolTelemetry?: boolean;
 };
@@ -139,8 +139,10 @@ export class SessionPool {
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
   private lifecycleController = new AbortController();
+  private readonly now: () => number;
 
-  constructor(options: { maxQueue?: number; idleMs?: number } = {}) {
+  constructor(options: { maxQueue?: number; idleMs?: number; now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
     this.maxQueue = Math.max(0, Math.floor(options.maxQueue ?? envNumber("OPENCODE_ANTIGRAVITY_MAX_QUEUE", DEFAULT_MAX_QUEUE_PER_SESSION, 0)));
     this.maxSessions = Math.max(1, Math.floor(envNumber("OPENCODE_ANTIGRAVITY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS, 1)));
     this.idleMs = options.idleMs ?? envNumber("OPENCODE_ANTIGRAVITY_IDLE_WORKER_MS", DEFAULT_IDLE_WORKER_TIMEOUT_MS, 1_000);
@@ -269,6 +271,10 @@ export class SessionPool {
       if (workerSession) await this.persistWorkerSafe(entry, request.key, request.settings);
       info("created Antigravity session worker", { resumed: entry.worker.resumed, rebuilt: !entry.worker.resumed, poolSize: this.entries.size });
     }
+    let contextOccupancy = request.hostSessionID && entry.worker.sessionId
+      ? await readBoundContextOccupancy(request.hostSessionID, entry.worker.sessionId, entry.executionGeneration, undefined, this.now())
+      : undefined;
+    if (request.responseCursor) request.responseCursor.contextOccupancy = contextOccupancy;
     const remoteAligned = aligned && Boolean(entry.worker.resumed || entry.historyTransferred);
     const historyLimit = historyCharacterLimit();
 
@@ -318,13 +324,24 @@ export class SessionPool {
     let activity = false;
     try {
       await sessionStore.saveReceipt(request.key, identity, { state: "submitted" });
-      for await (const event of entry.worker.runTurn(prompt, request.signal)) {
+      for await (const incoming of entry.worker.runTurn(prompt, request.signal)) {
+        let event = incoming;
         if (!activity && event.event === "update") {
           activity = true;
           await sessionStore.saveReceipt(request.key, identity, { state: "running" });
         }
         if (request.hostSessionID && event.event === "update" && event.update.sessionUpdate === "usage_update") {
-          await observeContext(request.hostSessionID, entry.conversation!.epoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel, entry.executionGeneration);
+          const observed = await observeContext(request.hostSessionID, entry.conversation!.epoch, event.sessionId, request.settings.model, event.update, identity, entry.worker.actualModel, entry.executionGeneration, this.now());
+          if (observed) {
+            contextOccupancy = observed;
+            if (request.responseCursor) request.responseCursor.contextOccupancy = observed;
+          }
+        }
+        if (event.event === "result" && event.result.stopReason !== "cancelled" && contextOccupancy) {
+          // Carry the measurement with this response through the receipt cache;
+          // do not recover it later from mutable session-global telemetry.
+          const responseContext = freezeContextOccupancy(contextOccupancy, this.now());
+          if (responseContext) event = { ...event, contextOccupancy: responseContext };
         }
         bytes += Buffer.byteLength(JSON.stringify(event));
         if (bytes <= 2_000_000) events.push(event);

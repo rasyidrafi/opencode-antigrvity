@@ -44,6 +44,19 @@ Do not trust dependencies broadly: Koffi's optional platform package supplies
 its prebuilt native binary, so its Node-based install script is intentionally
 left untrusted. A clean Bun install and Koffi import were verified on Linux.
 
+## Anthropic usage fallback
+
+ACP prompt-response usage is authoritative when present, including explicit
+zero values. If it is absent, the proxy may report a fresh measured context
+occupancy as `input_tokens` with zero output tokens. This is an approximation
+of the current context, not per-request token accounting or billing usage.
+Fallback measurements stay bound to the response receipt and execution
+generation. A turn without a new sample may reuse the latest measurement from
+that same generation for up to five minutes, rechecked when each new terminal
+or tool response is emitted. Completed receipt replays retain their original
+response payload. A replacement execution cannot inherit the previous
+generation's occupancy.
+
 ## Optional live tests
 
 The default suite uses fixtures and skips opt-in live and platform-specific

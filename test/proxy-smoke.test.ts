@@ -73,6 +73,79 @@ describe("loopback Anthropic proxy", () => {
     expect(text).toContain("message_stop");
   });
 
+  test("falls back to response-bound context occupancy when ACP omits result usage", async () => {
+    for (const stream of [false, true]) {
+      const response = await fetch(getProxyBaseUrl() + "/messages", {
+        method: "POST",
+        headers: { ...authHeaders, [SESSION_HEADER]: `usage-fallback-${stream}` },
+        body: JSON.stringify(message("FAKE_CONTEXT_A FAKE_NO_RESULT_USAGE", { stream })),
+      });
+      expect(response.status).toBe(200);
+      if (!stream) expect((await response.json()).usage).toMatchObject({ input_tokens: 101, output_tokens: 0 });
+      else {
+        const events = (await response.text()).split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+        expect(events.find(event => event.type === "message_delta").usage).toMatchObject({ input_tokens: 101, output_tokens: 0 });
+      }
+    }
+  });
+
+  test("prefers explicit ACP usage, including zero, over context occupancy", async () => {
+    for (const stream of [false, true]) {
+      const response = await fetch(getProxyBaseUrl() + "/messages", {
+        method: "POST",
+        headers: { ...authHeaders, [SESSION_HEADER]: `usage-explicit-zero-${stream}` },
+        body: JSON.stringify(message("FAKE_CONTEXT_A FAKE_ZERO_RESULT_USAGE", { stream })),
+      });
+      expect(response.status).toBe(200);
+      if (!stream) expect((await response.json()).usage).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+      else {
+        const events = (await response.text()).split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+        expect(events.find(event => event.type === "message_delta").usage).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+      }
+    }
+  });
+
+  test("reuses a fresh measurement only within the same execution generation", async () => {
+    const headers = { ...authHeaders, [SESSION_HEADER]: "usage-same-generation" };
+    const firstMessages = [{ role: "user", content: "FAKE_CONTEXT_A" }];
+    const first = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify(message("", { messages: firstMessages })) });
+    expect(first.status).toBe(200);
+    const firstPayload = await first.json();
+    const nextMessages = [
+      ...firstMessages,
+      { role: "assistant", content: firstPayload.content },
+      { role: "user", content: "FAKE_NO_USAGE_UPDATE FAKE_NO_RESULT_USAGE" },
+    ];
+    const next = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify(message("", { messages: nextMessages })) });
+    expect(next.status).toBe(200);
+    expect((await next.json()).usage).toMatchObject({ input_tokens: 101, output_tokens: 0 });
+  });
+
+  test("reports bound occupancy on paused host-tool responses", async () => {
+    const toolBody = (stream: boolean) => message("FAKE_MCP_USAGE_BEFORE", {
+      stream,
+      tools: [{ name: "StructuredOutput", input_schema: { type: "object" } }],
+    });
+    for (const stream of [false, true]) {
+      const response = await fetch(getProxyBaseUrl() + "/messages", {
+        method: "POST",
+        headers: { ...authHeaders, [SESSION_HEADER]: `usage-tool-${stream}` },
+        body: JSON.stringify(toolBody(stream)),
+      });
+      expect(response.status).toBe(200);
+      if (!stream) {
+        const payload = await response.json();
+        expect(payload.stop_reason).toBe("tool_use");
+        expect(payload.usage).toMatchObject({ input_tokens: 21, output_tokens: 0 });
+      } else {
+        const events = (await response.text()).split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+        const delta = events.find(event => event.type === "message_delta");
+        expect(delta.delta.stop_reason).toBe("tool_use");
+        expect(delta.usage).toMatchObject({ input_tokens: 21, output_tokens: 0 });
+      }
+    }
+  });
+
   test("keeps thinking, plans, tools, and text in separate ordered blocks", async () => {
     const response = await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers: authHeaders, body: JSON.stringify(message("FAKE_PROGRESS", { stream: true })) });
     const text = await response.text();

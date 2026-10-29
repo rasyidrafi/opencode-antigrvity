@@ -43,6 +43,13 @@ function textFromPrompt(prompt) {
   }).join("\n");
 }
 
+function contextUsed(text) {
+  if (text.includes("FAKE_CONTEXT_A")) return 101;
+  if (text.includes("FAKE_CONTEXT_B")) return 202;
+  if (text.includes("FAKE_MCP_USAGE_BEFORE")) return 21;
+  return 12;
+}
+
 function update(update) {
   send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
 }
@@ -91,6 +98,7 @@ async function handlePrompt(message) {
     }
     const list = await rpc("tools/list");
     const name = list.result.tools[0].name;
+    if (text.includes("FAKE_MCP_USAGE_BEFORE")) update({ sessionUpdate: "usage_update", used: contextUsed(text), size: 1000 });
     if (text.includes("FAKE_MCP_ACTIVITY")) {
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "GENUINE_THOUGHT_BEFORE" } });
       update({ sessionUpdate: "tool_call", toolCallId: "activity-tool", title: "opencode_shell: duplicate-command", kind: "execute", status: "pending" });
@@ -181,14 +189,18 @@ async function handlePrompt(message) {
   if (text.includes("FAKE_FALLBACK_AVAILABLE")) update({ sessionUpdate: "config_option_update", configOptions: [{ id: "model", category: "model", type: "select", name: "Model", currentValue: "gemini-3.8-flash-low", options: [
     { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }, { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" }, { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
   ] }] });
-  if (!process.env.FAKE_ACP_NO_USAGE) update({ sessionUpdate: "usage_update", used: 12, size: 1000 });
+  if (!process.env.FAKE_ACP_NO_USAGE && !text.includes("FAKE_NO_USAGE_UPDATE")) update({ sessionUpdate: "usage_update", used: contextUsed(text), size: 1000 });
   if (text.includes("FAKE_CATALOG_UPDATE")) {
     update({ sessionUpdate: "config_option_update", configOptions: [{
       id: "model", category: "model", type: "select", name: "Model", currentValue: "new-server-model",
       options: [{ value: "new-server-model", name: "Server-added model" }],
     }] });
   }
-  respond(id, { stopReason: text.includes("FAKE_REFUSAL") ? "refusal" : text.includes("FAKE_MAX_TOKENS") ? "max_tokens" : text.includes("FAKE_MAX_TURNS") ? "max_turn_requests" : "end_turn", usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, thoughtTokens: 0 } });
+  const omitResultUsage = process.env.FAKE_ACP_RESULT_USAGE === "off" || text.includes("FAKE_NO_RESULT_USAGE");
+  const usage = text.includes("FAKE_ZERO_RESULT_USAGE")
+    ? { inputTokens: 0, outputTokens: 0, totalTokens: 0, thoughtTokens: 0 }
+    : { inputTokens: 10, outputTokens: 2, totalTokens: 12, thoughtTokens: 0 };
+  respond(id, { stopReason: text.includes("FAKE_REFUSAL") ? "refusal" : text.includes("FAKE_MAX_TOKENS") ? "max_tokens" : text.includes("FAKE_MAX_TURNS") ? "max_turn_requests" : "end_turn", ...(!omitResultUsage ? { usage } : {}) });
   activePrompt = undefined;
 }
 

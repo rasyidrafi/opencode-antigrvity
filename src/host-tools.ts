@@ -1,12 +1,13 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { AsyncEventQueue } from "./acp-process.js";
 import { AgyAbortError, AgyBusyError, AgyError } from "./errors.js";
-import { sessionPool, type SessionSettings, type SessionTurnRequest } from "./session-pool.js";
-import type { AcpEvent } from "./protocol.js";
+import { sessionPool, type SessionPool, type SessionSettings, type SessionTurnRequest } from "./session-pool.js";
+import type { AcpEvent, ContextOccupancy } from "./protocol.js";
 import { extractTextContent, messageContentToAcp, normalizePrompt, type HostMessage } from "./prompt.js";
 import { envNumber, HOST_MCP_SERVER_NAME } from "./constants.js";
 import { sessionStore } from "./session-store.js";
 import { canonical } from "./coordinator.js";
+import { freezeContextOccupancy } from "./telemetry.js";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { MAX_MEDIA_BYTES, validateMediaBlocks } from "./attachments.js";
 import { blockBudget } from "./budget.js";
@@ -15,7 +16,7 @@ export type HostTool = { name: string; description?: string; input_schema: Recor
 export type HostCall = { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
 type ToolResult = { content: Record<string, unknown>[]; isError: boolean };
 type Pending = { call: HostCall; resolve: (result: ToolResult) => void; reject: (error: Error) => void; result?: ToolResult };
-export type BridgeEvent = AcpEvent | { event: "host_tools"; calls: HostCall[] };
+export type BridgeEvent = AcpEvent | { event: "host_tools"; calls: HostCall[]; contextOccupancy?: ContextOccupancy };
 type Wake = AcpEvent | { event: "park" };
 
 export function parseHostTools(value: unknown): HostTool[] {
@@ -158,8 +159,19 @@ export class HostBridge {
   private closing?: Promise<void>;
   private turn?: SessionTurnRequest;
   private callCount = 0;
+  private readonly sessions: Pick<SessionPool, "turn" | "forgetWorker">;
+  private readonly now: () => number;
 
-  constructor(readonly key: string, readonly sessionID: string | undefined, readonly cwd: string) { tokens.set(this.token, this); }
+  constructor(
+    readonly key: string,
+    readonly sessionID: string | undefined,
+    readonly cwd: string,
+    options: { sessions?: Pick<SessionPool, "turn" | "forgetWorker">; now?: () => number } = {},
+  ) {
+    this.sessions = options.sessions ?? sessionPool;
+    this.now = options.now ?? Date.now;
+    tokens.set(this.token, this);
+  }
   get waiting(): boolean { return this.pending.size > 0; }
   get evictable(): boolean { return !this.active && !this.consuming && !this.waiting; }
 
@@ -330,7 +342,7 @@ export class HostBridge {
         this.turn = turn;
         this.pumping = (async () => {
           try {
-            for await (const event of sessionPool.turn(turn)) this.queue.push(event);
+            for await (const event of this.sessions.turn(turn)) this.queue.push(event);
             this.queue.close();
           } catch (error) { this.queue.close(error); }
         })();
@@ -350,7 +362,12 @@ export class HostBridge {
           await new Promise((resolve) => setTimeout(resolve, 25));
           this.reported = new Set(this.pending.keys());
           parked = true;
-          yield { event: "host_tools", calls: [...this.pending.values()].filter(p => !p.result).map((p) => p.call) };
+          const contextOccupancy = freezeContextOccupancy(this.turn?.responseCursor?.contextOccupancy, this.now());
+          yield {
+            event: "host_tools",
+            calls: [...this.pending.values()].filter(p => !p.result).map((p) => p.call),
+            ...(contextOccupancy ? { contextOccupancy } : {}),
+          };
           return;
         }
         // ACP already processed these updates for activity/lifecycle tracking.
@@ -380,7 +397,7 @@ export class HostBridge {
       for (const pending of this.pending.values()) pending.reject(new AgyAbortError());
       this.pending.clear(); this.queue.close(new AgyAbortError());
       await this.pumping;
-      await sessionPool.forgetWorker(this.key);
+      await this.sessions.forgetWorker(this.key);
     })();
   }
 }
