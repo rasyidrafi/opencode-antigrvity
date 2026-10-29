@@ -68,7 +68,7 @@ export async function installAcpServer(directory = acpInstallDirectory(), downlo
     }
     return executable;
   } finally {
-    if (staging) await rm(staging, { recursive: true, force: true });
-    await release();
+    try { if (staging) await rm(staging, { recursive: true, force: true }); }
+    finally { await release(); }
   }
 }

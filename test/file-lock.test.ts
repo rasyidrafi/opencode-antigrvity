@@ -1,147 +1,252 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { basename, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, test } from "bun:test";
-import { acquireFileLock } from "../src/file-lock.js";
+import koffi from "koffi";
+import { acquireFileLock, decodeWindowsProfilePath } from "../src/file-lock.js";
 import { AgyBusyError } from "../src/errors.js";
 
-/** A token whose owner cannot exist: reap the exiting child before using it. */
+async function isolatedData(): Promise<() => Promise<void>> {
+  const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
+  const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-native-lock-"));
+  process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
+  return async () => {
+    if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
+    else process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  };
+}
+
 async function deadOwnerToken(): Promise<string> {
-  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const child = Bun.spawn([process.execPath, "--eval", ""], { stdout: "ignore", stderr: "ignore" });
   const pid = child.pid;
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("exit", () => resolve());
-  });
-  if (pid === undefined) throw new Error("Could not start a child process for the dead-owner fixture");
-  return `${pid}:00000000-0000-0000-0000-000000000000`;
+  await child.exited;
+  if (pid === undefined) throw new Error("Could not start dead-owner fixture");
+  return `${pid}:${randomUUID()}`;
 }
 
-/** Build base plus `levels` reaper chain files, all owned by `token`. */
-async function poison(directory: string, levels: number, token: string): Promise<string> {
-  const base = join(directory, "resource.lock");
-  await writeFile(base, token);
-  let path = base;
-  for (let index = 0; index < levels; index++) {
-    path = `${path}.reap`;
-    await writeFile(path, token);
+async function poison(path: string, levels: number, token: string): Promise<void> {
+  await writeFile(path, token);
+  for (let depth = 1, current = `${path}.reap`; depth <= levels; depth++, current += ".reap") {
+    await writeFile(current, token);
   }
-  return base;
 }
 
-async function expectBusy(path: string, waitMs: number): Promise<void> {
-  let release: (() => Promise<void>) | undefined;
-  let failure: unknown;
-  try {
-    release = await acquireFileLock(path, waitMs);
-  } catch (error) {
-    failure = error;
-  } finally {
-    await release?.();
-  }
-  expect(failure).toBeInstanceOf(AgyBusyError);
+async function startHolder(path: string, environment: Record<string, string> = {}) {
+  const module = pathToFileURL(join(import.meta.dir, "../src/file-lock.ts")).href;
+  const script = `
+    const { acquireFileLock } = await import(${JSON.stringify(module)});
+    const release = await acquireFileLock(${JSON.stringify(path)}, 5000);
+    console.log("acquired");
+    await Bun.stdin.text();
+    await release();
+  `;
+  return Bun.spawn([process.execPath, "--eval", script], {
+    env: { ...process.env, ...environment },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
 }
 
-describe("stale-lock recovery at the reaper guard depth", () => {
-  test("recovers a fully dead base + 8-reaper chain", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-lock-"));
-    try {
-      const base = await poison(directory, 8, await deadOwnerToken());
-      const release = await acquireFileLock(base, 2_000);
-      await release();
+async function expectBusy(path: string, waitMs = 0): Promise<void> {
+  await expect(acquireFileLock(path, waitMs)).rejects.toBeInstanceOf(AgyBusyError);
+}
 
-      // The recovered lock must remain reusable.
-      const again = await acquireFileLock(base, 2_000);
-      await again();
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
+describe("crash-released native file locks", () => {
+  test("Windows account-profile decoding reads inline UTF-16 buffers", () => {
+    const home = "C:\\Users\\Ångström\\AppData\\Local";
+    const buffer = Buffer.from(`${home}\0`, "utf16le");
+    expect(decodeWindowsProfilePath(koffi, buffer)).toBe(home);
   });
 
-  test("recovers the same bounded stale chain with zero wait", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-lock-"));
+  test("recovers fully dead legacy chains of any historical depth", async () => {
+    const restore = await isolatedData();
     try {
-      const base = await poison(directory, 8, await deadOwnerToken());
-      const release = await acquireFileLock(base);
-      await release();
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("reclaims a single dead owner without a reaper chain", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-lock-"));
-    try {
-      const base = await poison(directory, 0, await deadOwnerToken());
-      const release = await acquireFileLock(base, 1_000);
-      await release();
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("fails closed at the new boundary for a fully dead chain", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-lock-"));
-    try {
-      const token = await deadOwnerToken();
-      const base = await poison(directory, 9, token);
-      await expectBusy(base, 250);
-
-      // Base plus all nine reapers remain untouched at the new guard boundary.
-      expect((await readdir(directory)).length).toBe(10);
-      let path = base;
-      for (let index = 0; index <= 9; index++) {
-        expect(await readFile(path, "utf8")).toBe(token);
-        path = `${path}.reap`;
-      }
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("preserves a live owner in a mixed dead/live chain", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-lock-"));
-    try {
-      const deadToken = await deadOwnerToken();
-      const liveToken = `${process.pid}:11111111-1111-1111-1111-111111111111`;
-      const base = await poison(directory, 0, deadToken);
-      let livePath = base;
-      for (let index = 0; index < 8; index++) {
-        livePath = `${livePath}.reap`;
-        await writeFile(livePath, index === 3 ? liveToken : deadToken);
-      }
-
-      await expectBusy(base, 250);
-      expect(await readFile(base, "utf8")).toBe(deadToken);
-      expect(await readFile(`${base}.reap.reap.reap.reap`, "utf8")).toBe(liveToken);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("serializes concurrent recovery and lock ownership", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "opencode-antigravity-lock-"));
-    try {
-      const base = await poison(directory, 8, await deadOwnerToken());
-      let active = 0;
-      let maximumActive = 0;
-      const contender = async () => {
-        const release = await acquireFileLock(base, 3_000);
-        active++;
-        maximumActive = Math.max(maximumActive, active);
-        try {
-          await new Promise(resolve => setTimeout(resolve, 40));
-        } finally {
-          active--;
-          await release();
+      for (const depth of [0, 8, 9, 32]) {
+        const path = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!, `resource-${depth}.lock`);
+        await poison(path, depth, await deadOwnerToken());
+        const release = await acquireFileLock(path, 1000);
+        await release();
+        await expect(readFile(path, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+        for (let index = 1, current = `${path}.reap`; index <= depth; index++, current += ".reap") {
+          await expect(readFile(current, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
         }
-      };
+      }
+    } finally { await restore(); }
+  });
 
-      await Promise.all([contender(), contender()]);
-      expect(maximumActive).toBe(1);
+  test("preserves live, malformed, and unknown legacy owners", async () => {
+    const restore = await isolatedData();
+    try {
+      const livePath = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!, "live.lock");
+      const live = `${process.pid}:${randomUUID()}`;
+      await writeFile(livePath, live);
+      await writeFile(`${livePath}.reap`, await deadOwnerToken());
+      await expectBusy(livePath);
+      expect(await readFile(livePath, "utf8")).toBe(live);
+      expect(await readFile(`${livePath}.reap`, "utf8")).not.toBe("");
+
+      for (const [name, token] of [["malformed", "not-an-owner"], ["unknown", `${process.pid}:not-a-uuid`]]) {
+        const path = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!, `${name}.lock`);
+        await writeFile(path, token);
+        await expectBusy(path);
+        expect(await readFile(path, "utf8")).toBe(token);
+      }
+    } finally { await restore(); }
+  });
+
+  test("zero and bounded waits preserve ownership; release is idempotent", async () => {
+    const restore = await isolatedData();
+    try {
+      const path = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!, "wait.lock");
+      const release = await acquireFileLock(path);
+      const start = Date.now();
+      await expectBusy(path);
+      expect(Date.now() - start).toBeLessThan(250);
+      const boundedStart = Date.now();
+      await expectBusy(path, 100);
+      expect(Date.now() - boundedStart).toBeGreaterThanOrEqual(70);
+      expect(Date.now() - boundedStart).toBeLessThan(1000);
+      await release();
+      await release();
+      const next = await acquireFileLock(path);
+      await next();
+    } finally { await restore(); }
+  });
+
+  test("independent keys progress and competing processes never overlap", async () => {
+    const restore = await isolatedData();
+    const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
+    const path = join(root, "shared.lock");
+    const parentRelease = await acquireFileLock(path);
+    const other = await acquireFileLock(join(root, "unrelated.lock"));
+    await other();
+    const child = await startHolder(path);
+    const reader = child.stdout.getReader();
+    try {
+      const pendingOutput = reader.read();
+      const acquiredEarly = await Promise.race([pendingOutput.then(() => true), Bun.sleep(100).then(() => false)]);
+      expect(acquiredEarly).toBe(false);
+      await parentRelease();
+      expect(new TextDecoder().decode((await pendingOutput).value)).toContain("acquired");
+      child.stdin.end();
+      expect(await child.exited).toBe(0);
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      reader.releaseLock();
+      child.kill();
+      await child.exited;
+      await parentRelease();
+      await restore();
     }
+  });
+
+  test("physical path aliases share a guard, including missing descendants", async () => {
+    const restore = await isolatedData();
+    try {
+      const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
+      const target = join(root, "physical-target");
+      const alias = join(root, "physical-alias");
+      await mkdir(target);
+      await symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
+      const directPath = join(target, "not-created-yet", "resource.lock");
+      const aliasPath = join(alias, "not-created-yet", "resource.lock");
+      const release = await acquireFileLock(directPath);
+      await expectBusy(aliasPath);
+      await release();
+
+      if (process.platform === "win32") {
+        const differentlyCased = join(dirname(target), basename(target).toUpperCase(), "not-created-yet", "resource.lock");
+        const caseRelease = await acquireFileLock(directPath);
+        await expectBusy(differentlyCased);
+        await caseRelease();
+      }
+    } finally { await restore(); }
+  });
+
+  test("same-store processes share the guard despite HOME and XDG overrides", async () => {
+    const restore = await isolatedData();
+    const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
+    const path = join(root, "sessions.lock");
+    const holder = await startHolder(path, {
+      OPENCODE_ANTIGRAVITY_DATA_DIR: root,
+      XDG_DATA_HOME: join(root, "xdg-holder"),
+      HOME: join(root, "home-holder"),
+    });
+    const holderReader = holder.stdout.getReader();
+    let contenderReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      expect(new TextDecoder().decode((await holderReader.read()).value)).toContain("acquired");
+      const module = pathToFileURL(join(import.meta.dir, "../src/file-lock.ts")).href;
+      const script = `
+        const { acquireFileLock } = await import(${JSON.stringify(module)});
+        try {
+          const release = await acquireFileLock(${JSON.stringify(path)});
+          await release();
+          console.log("acquired");
+        } catch (error) {
+          if (error.code !== "agy_session_busy") throw error;
+          console.log("busy");
+        }
+      `;
+      const contender = Bun.spawn([process.execPath, "--eval", script], {
+        env: {
+          ...process.env,
+          OPENCODE_ANTIGRAVITY_DATA_DIR: root,
+          XDG_DATA_HOME: join(root, "xdg-contender"),
+          HOME: join(root, "home-contender"),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      contenderReader = contender.stdout.getReader();
+      const output = new TextDecoder().decode((await contenderReader.read()).value);
+      expect(await contender.exited).toBe(0);
+      expect(output).toContain("busy");
+      holder.stdin.end();
+      expect(await holder.exited).toBe(0);
+    } finally {
+      contenderReader?.releaseLock();
+      holderReader.releaseLock();
+      holder.kill();
+      await holder.exited;
+      await restore();
+    }
+  });
+
+  test("a killed native-lock holder is reclaimed by the OS", async () => {
+    const restore = await isolatedData();
+    const path = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!, "crash.lock");
+    const holder = await startHolder(path);
+    const reader = holder.stdout.getReader();
+    try {
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("acquired");
+      await expectBusy(path);
+      holder.kill();
+      await holder.exited;
+      const recovered = await acquireFileLock(path, 2000);
+      await recovered();
+    } finally {
+      reader.releaseLock();
+      holder.kill();
+      await holder.exited;
+      await restore();
+    }
+  });
+
+  test("utility-directory removal cannot replace an active lock inode", async () => {
+    const restore = await isolatedData();
+    try {
+      const utility = join(process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!, "utilities", "utility-retention");
+      const path = join(utility, ".owner");
+      const release = await acquireFileLock(path);
+      await rm(utility, { recursive: true, force: true });
+      await expectBusy(path);
+      await release();
+      const next = await acquireFileLock(path);
+      await next();
+    } finally { await restore(); }
   });
 });

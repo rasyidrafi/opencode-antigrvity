@@ -18,6 +18,7 @@ import { WorkspaceRegistry } from "./workspace-registry.js";
 import { closeHostBridges } from "./host-tools.js";
 import { sessionStore } from "./session-store.js";
 import { sessionPool } from "./session-pool.js";
+import { BoundedRetryQueue } from "./bounded-retry-queue.js";
 import { ContextTelemetry } from "./telemetry-rpc.js";
 import { onContextSnapshot, readContextSnapshot, markContextStale } from "./telemetry.js";
 import { AgyError, retryAfterSeconds } from "./errors.js";
@@ -95,28 +96,19 @@ export const AntigravityPlugin = Plugin.define({
     const events = new AbortController();
     let stopTelemetry: (() => void) | undefined;
     let disposeTelemetry: (() => Promise<void>) | undefined;
-    const pendingDeletions = new Set<string>();
-    const deletionJobs = new Map<string, Promise<void>>();
-    const cleanupDeleted = (sessionID: string): Promise<void> => {
-      const existing = deletionJobs.get(sessionID);
-      if (existing) return existing;
-      const job = (async () => {
-        try {
-          await sessionStore.markHostDeleted(sessionID);
-          await closeHostBridges(sessionID);
-          await sessionPool.quiesceHostSession(sessionID);
-          await sessionStore.removeHostSession(sessionID);
-          pendingDeletions.delete(sessionID);
-        } catch { warn("Deleted session cleanup waiting for ownership release", { sessionID, reason: "deletion_cleanup_pending" }); }
-      })().finally(() => { deletionJobs.delete(sessionID); });
-      deletionJobs.set(sessionID, job);
-      return job;
-    };
-    const deletionTimer = setInterval(() => { for (const id of pendingDeletions) void cleanupDeleted(id); }, 15_000);
-    deletionTimer.unref?.();
+    const deletionQueue = new BoundedRetryQueue(async (sessionID: string) => {
+      await sessionStore.markHostDeleted(sessionID);
+      await closeHostBridges(sessionID);
+      await sessionPool.quiesceHostSession(sessionID);
+      await sessionStore.removeHostSession(sessionID);
+    }, {
+      concurrency: 4,
+      retryDelayMs: 15_000,
+      onError: () => warn("Deleted session cleanup waiting for ownership release", { reason: "deletion_cleanup_pending" }),
+    });
 
     try {
-      for (const sessionID of await sessionStore.deletedHosts()) { pendingDeletions.add(sessionID); void cleanupDeleted(sessionID); }
+      for (const sessionID of await sessionStore.deletedHosts()) deletionQueue.enqueue(sessionID);
       await workspaces.add(ctx.location.directory);
       if (ctx.rpc) {
         const registration = await ctx.rpc.register(ContextTelemetry, {
@@ -196,8 +188,10 @@ export const AntigravityPlugin = Plugin.define({
             attempts = 0;
             const e = event as { id?: string; type?: string; data?: { sessionID?: string; messageID?: string; id?: string } };
             if (e.type === "session.deleted" && e.data?.sessionID) {
-              pendingDeletions.add(e.data.sessionID);
-              await cleanupDeleted(e.data.sessionID);
+              // The queue owns tombstone persistence too. Enqueue first so a
+              // transient write failure remains retryable instead of losing
+              // this lifecycle event before it reaches the durable backlog.
+              await deletionQueue.enqueue(e.data.sessionID);
               continue;
             }
             if (e.data?.sessionID && await sessionStore.isHostDeleted(e.data.sessionID)) continue;
@@ -288,12 +282,13 @@ export const AntigravityPlugin = Plugin.define({
         { providerID: PROVIDER_ID },
       );
 
-      return async () => { disposed = true; events.abort(); clearInterval(metadataTimer); clearInterval(deletionTimer); unsubscribe?.(); stopTelemetry?.(); await Promise.all(deletionJobs.values()); await disposeTelemetry?.(); await workspaces.cleanup(); };
+      return async () => { disposed = true; events.abort(); clearInterval(metadataTimer); deletionQueue.close(); unsubscribe?.(); stopTelemetry?.(); await deletionQueue.drain(); await disposeTelemetry?.(); await workspaces.cleanup(); };
     } catch (error) {
       disposed = true;
       events.abort();
       clearInterval(metadataTimer);
-      clearInterval(deletionTimer);
+      deletionQueue.close();
+      await deletionQueue.drain();
       unsubscribe?.();
       stopTelemetry?.();
       await disposeTelemetry?.();

@@ -39,9 +39,9 @@ jobs:
           unzip "$RUNNER_TEMP/agy-acp.zip" -d "$directory"
           chmod +x "$directory/agy_acp_server.par" "$directory/localharness_external"
           echo "AGY_TEST_MACOS_ACP_DIR=$directory" >> "$GITHUB_ENV"
-      # Linux runs the complete suite (including /proc-based crash recovery).
-      # macOS exercises native ACP plus portable process/auth/isolation checks.
-      - run: bun test test/macos-support.test.ts test/windows-support.test.ts test/file-lock.test.ts test/cli-credentials.test.ts test/auth-bridge.test.ts test/host-environment.test.ts test/acp-process.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts --timeout 30000
+      # Linux runs the complete suite; these platform jobs also exercise the
+      # portable native-lock, tombstone, atomic-write and deletion-queue cases.
+      - run: bun test test/macos-support.test.ts test/windows-support.test.ts test/file-lock.test.ts test/acp-install.test.ts test/atomic-write.test.ts test/deletion-recovery.test.ts test/bounded-retry-queue.test.ts test/cli-credentials.test.ts test/auth-bridge.test.ts test/host-environment.test.ts test/acp-process.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts --timeout 30000
   windows:
     runs-on: windows-latest
     timeout-minutes: 15
@@ -64,6 +64,6 @@ jobs:
           "AGY_TEST_WINDOWS_ACP_DIR=$directory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       # Process fixtures elsewhere use POSIX shebangs; native tests below
       # exercise Windows executables, filesystem, authentication and budgets.
-      - run: bun test test/windows-support.test.ts test/file-lock.test.ts test/cli-credentials.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts --timeout 30000
+      - run: bun test test/windows-support.test.ts test/file-lock.test.ts test/acp-install.test.ts test/atomic-write.test.ts test/deletion-recovery.test.ts test/bounded-retry-queue.test.ts test/cli-credentials.test.ts test/budget-config.test.ts test/plugin-entrypoint.test.ts --timeout 30000
         env:
           AGY_TEST_NATIVE_KEYRING: '1'

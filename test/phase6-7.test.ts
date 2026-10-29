@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { useFixtureAuthentication } from "./fixtures/compatibility.js";
 useFixtureAuthentication();
 import { mkdtemp, writeFile, readFile, readdir, mkdir, rm, utimes } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { acquireFileLock } from "../src/file-lock.js";
 import { effectiveAuth } from "../src/effective-auth.js";
@@ -39,6 +40,37 @@ test("successful turns do not accumulate abort listeners", async () => {
       expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
       expect(getEventListeners(signal, "abort")).toHaveLength(baseline);
     }
+  } finally { await pool.close(); await restore(); }
+});
+
+test("fake ACP turn recovers a stale session-store chain and completes its durable receipt", async () => {
+  const restore = await isolatedData();
+  const root = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR!;
+  const pool = new SessionPool();
+  try {
+    const dead = Bun.spawn([process.execPath, "--eval", ""], { stdout: "ignore", stderr: "ignore" });
+    const pid = dead.pid;
+    await dead.exited;
+    if (pid === undefined) throw new Error("Could not create stale store-lock fixture");
+    const token = `${pid}:${randomUUID()}`;
+    let legacy = join(root, "sessions.lock");
+    await writeFile(legacy, token);
+    for (let depth = 0; depth < 8; depth++) {
+      legacy += ".reap";
+      await writeFile(legacy, token);
+    }
+
+    const key = "stale-store-recovery";
+    const requestId = "stale-store-recovery-request";
+    for await (const _ of pool.turn({
+      key,
+      requestId,
+      prompt: [{ type: "text", text: "reply with a short test response" }],
+      settings: { cwd: process.cwd(), model: "fake-model-low", executable: join(import.meta.dir, "fixtures/fake-acp.mjs") },
+    })) {}
+
+    expect((await new SessionStore().receipt(key, requestId))?.state).toBe("completed");
+    expect(await readdir(root)).not.toContain("sessions.lock");
   } finally { await pool.close(); await restore(); }
 });
 
@@ -84,7 +116,7 @@ test("utility retention removes dead abandoned private directories but protects 
     const live = join(root, "utility-live");
     const other = join(root, "unrelated");
     await Promise.all([dead, live, other].map(path => mkdir(path, { recursive: true })));
-    await writeFile(join(dead, ".owner"), "2147483647:dead");
+    await writeFile(join(dead, ".owner"), "2147483647");
     const release = await acquireFileLock(join(live, ".owner"));
     const old = new Date(Date.now() - 8 * 24 * 60 * 60_000);
     await Promise.all([dead, live, other].map(path => utimes(path, old, old)));
@@ -98,21 +130,18 @@ test("unknown ACP overrides fail closed regardless of version text", async () =>
   await expect(assertHostToolCompatibility(join(import.meta.dir, "fixtures/fake-acp.mjs"))).rejects.toMatchObject({ code: "agy_acp_compatibility", kind: "unsupported" });
 });
 
-test("lock release cannot delete a replacement owner; dead reaper and primary recover", async () => {
+test("legacy stale owners recover, releases are idempotent, and unrelated locks progress", async () => {
   const directory = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-lock-`);
   try {
     const path = join(directory, "turn.lock");
     const release = await acquireFileLock(path);
-    await writeFile(path, `${process.pid}:replacement`);
     await release();
-    expect(await readFile(path, "utf8")).toContain("replacement");
-    await writeFile(path, "2147483647:dead");
-    await writeFile(`${path}.reap`, "2147483647:dead-reaper");
+    await release();
+    await writeFile(path, "2147483647");
+    await writeFile(`${path}.reap`, "2147483647");
     const recovered = await acquireFileLock(path);
     await recovered();
     let active = 0; let maximum = 0;
-    await writeFile(path, "2147483647:dead");
-    await writeFile(`${path}.reap`, "2147483647:dead-reaper");
     await Promise.all(Array.from({ length: 12 }, async () => {
       const release = await acquireFileLock(path, 2000);
       active++; maximum = Math.max(maximum, active);
@@ -120,6 +149,10 @@ test("lock release cannot delete a replacement owner; dead reaper and primary re
       await release();
     }));
     expect(maximum).toBe(1);
+    const releaseOne = await acquireFileLock(path);
+    const unrelated = await acquireFileLock(`${path}.other`);
+    await unrelated();
+    await releaseOne();
     expect(await readdir(directory)).toEqual([]);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

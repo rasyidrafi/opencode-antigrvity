@@ -1,9 +1,10 @@
-import { chmod, mkdir, open, readFile, readdir, rename, unlink, rm } from "node:fs/promises";
+import { chmod, readFile, readdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { createHash, randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { DEFAULT_IDLE_WORKER_TIMEOUT_MS } from "./constants.js";
 import { acquireFileLock } from "./file-lock.js";
+import { atomicWrite, sweepHistoricalDeletedTemps } from "./atomic-write.js";
 import { AgyBusyError, AgyError } from "./errors.js";
 import type { AcpEvent } from "./protocol.js";
 import type { ContextSnapshot } from "./telemetry.js";
@@ -109,27 +110,62 @@ function sanitizeRecord(value: SessionRecord): SessionRecord {
   };
 }
 
+async function readDeletionTombstone(path: string, hostSessionID: string): Promise<{ cleaned?: boolean } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    if (!value || value.version !== 1 || value.hostSessionID !== hostSessionID ||
+        value.cleaned !== undefined && typeof value.cleaned !== "boolean") throw new Error("Invalid deletion record");
+    return { ...(value.cleaned === true ? { cleaned: true } : {}) };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function releaseLocks(...releases: Array<(() => Promise<void>) | undefined>): Promise<void> {
+  let failure: unknown;
+  for (const release of releases) {
+    try { await release?.(); }
+    catch (error) { failure ??= error; }
+  }
+  if (failure !== undefined) throw failure;
+}
+
 export class SessionStore {
   async markHostDeleted(hostSessionID: string): Promise<void> {
-    await atomicWrite(join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`), { version: 1, hostSessionID });
+    const path = join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`);
+    const release = await acquireFileLock(`${path}.tombstone`);
+    try {
+      const current = await readDeletionTombstone(path, hostSessionID);
+      // Pending is already durable; cleaned is monotonic and must never be
+      // rewritten as pending by a retrying deletion worker.
+      if (current) return;
+      await atomicWrite(path, { version: 1, hostSessionID });
+    } finally { await release(); }
   }
   async deletedHosts(): Promise<string[]> {
     const root = join(dataDirectory(), "deleted");
+    await sweepHistoricalDeletedTemps(root);
     const hosts: string[] = [];
     for (const file of await readdir(root, { withFileTypes: true }).catch((error: any) => { if (error.code === "ENOENT") return []; throw error; })) {
       if (!file.isFile() || !/^[a-f0-9]{64}\.json$/.test(file.name)) continue;
       const path = join(root, file.name);
       try {
         const value = JSON.parse(await readFile(path, "utf8"));
-        if (typeof value.hostSessionID !== "string" || `${digest(value.hostSessionID)}.json` !== file.name) throw new Error("Invalid deletion index");
-        if (!value.cleaned && await this.isHostDeleted(value.hostSessionID)) hosts.push(value.hostSessionID);
+        if (typeof value.hostSessionID !== "string" || `${digest(value.hostSessionID)}.json` !== file.name ||
+            value.version !== 1 || value.cleaned !== undefined && typeof value.cleaned !== "boolean") throw new Error("Invalid deletion index");
+        if (value.cleaned !== true && await this.isHostDeleted(value.hostSessionID)) hosts.push(value.hostSessionID);
       } catch { await quarantineJson(path, "invalid_deletion_index"); }
     }
     return hosts;
   }
   async isHostDeleted(hostSessionID: string): Promise<boolean> {
     const path = join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`);
-    try { const value = JSON.parse(await readFile(path, "utf8")); if (value.version !== 1 || value.hostSessionID !== hostSessionID) throw new Error("Invalid deletion record"); return true; }
+    try {
+      const value = JSON.parse(await readFile(path, "utf8"));
+      if (value.version !== 1 || value.hostSessionID !== hostSessionID || value.cleaned !== undefined && typeof value.cleaned !== "boolean") throw new Error("Invalid deletion record");
+      return true;
+    }
     catch (error: any) { if (error.code === "ENOENT") return false; await quarantineJson(path, "invalid_deletion"); throw error; }
   }
 
@@ -171,8 +207,18 @@ export class SessionStore {
       }
       await this.mutate(records => { for (const key of keys) delete records[key]; });
       for (const name of ["context", "execution", "host-keys"]) await rm(join(dataDirectory(), name, `${digest(hostSessionID)}.json`), { force: true });
-      await atomicWrite(join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`), { version: 1, hostSessionID, cleaned: true });
-    } finally { await unlockRecords?.(); await unlock?.(); await unlockLifecycle(); }
+      await this.markHostCleaned(hostSessionID);
+    } finally { await releaseLocks(unlockRecords, unlock, unlockLifecycle); }
+  }
+
+  private async markHostCleaned(hostSessionID: string): Promise<void> {
+    const path = join(dataDirectory(), "deleted", `${digest(hostSessionID)}.json`);
+    const release = await acquireFileLock(`${path}.tombstone`);
+    try {
+      const current = await readDeletionTombstone(path, hostSessionID);
+      if (current?.cleaned === true) return;
+      await atomicWrite(path, { version: 1, hostSessionID, cleaned: true });
+    } finally { await release(); }
   }
 
   /** Retire only bindings that still belong to a lost event subscription. */
@@ -300,7 +346,7 @@ export class SessionStore {
       const record = { ...value, version: 2, conversationKey: key, hostSessionID: value.hostSessionID ?? null, profile: value.profile ?? null, profileDigest: value.profileDigest ?? (typeof value.profile === "string" ? digest(value.profile) : null), argumentsDigest: value.argumentsDigest ?? digest(canonical((value.call as any)?.input)), updatedAt: Date.now() };
       validateTool(record, key, id);
       await atomicWrite(join(dataDirectory(), "tools", digest(key), `${digest(id)}.json`), record);
-    } finally { await unlock?.(); await release?.(); }
+    } finally { await releaseLocks(unlock, release); }
   }
 
   async saveToolResult(key: string, id: string, result: unknown): Promise<void> {
@@ -378,7 +424,7 @@ export class SessionStore {
           // Host-authoritative matching results can rehydrate this tombstone.
           await atomicWrite(path, { ...current, payloadExpired: true });
         } catch (error) { if (!(error instanceof AgyBusyError)) throw error; }
-        finally { await unlockResult?.(); await unlockTurn?.(); }
+        finally { await releaseLocks(unlockResult, unlockTurn); }
       }
     }
   }
@@ -463,27 +509,4 @@ async function quarantineJson(path: string, reason: string): Promise<void> {
 }
 function receiptPath(key: string, request: string): string {
   return join(dataDirectory(), "requests", digest(key), `${digest(request)}.json`);
-}
-
-async function atomicWrite(path: string, value: unknown): Promise<void> {
-  await mkdir(join(path, ".."), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try { await file.writeFile(JSON.stringify(value), "utf8"); await file.sync(); }
-    finally { await file.close(); }
-    await rename(temporary, path);
-    // Node cannot open/fsync directory handles on Windows. The file contents
-    // were flushed above and replacement is atomic; directory-entry crash
-    // durability is available only on platforms with directory fsync support.
-    if (process.platform === "win32") return;
-    // Persist the rename and newly created private directory entries before
-    // exposing calls/results. Atomic rename alone is not power-loss durability.
-    const stop = dirname(resolve(dataDirectory()));
-    for (let directory = dirname(resolve(path)); ; directory = dirname(directory)) {
-      const handle = await open(directory, "r");
-      try { await handle.sync(); } finally { await handle.close(); }
-      if (directory === stop || directory === dirname(directory)) break;
-    }
-  } finally { await unlink(temporary).catch(() => undefined); }
 }
