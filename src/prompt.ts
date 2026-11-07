@@ -148,7 +148,12 @@ async function attachmentPart(part: MessageContentPart, roots: string[], budget:
     const source = part.image_url ?? part.image ?? part.audio_url ?? part.audio ?? part.source ?? part.url;
     if (source && typeof source === "object" && (source as Record<string, unknown>).type === "base64") {
       const sourceRecord = source as Record<string, unknown>;
-      if (typeof sourceRecord.data === "string") return binaryBlock(sourceRecord.data, typeof sourceRecord.media_type === "string" ? sourceRecord.media_type : undefined, roots, budget);
+      if (typeof sourceRecord.data === "string") {
+        const mediaType = typeof sourceRecord.media_type === "string" ? sourceRecord.media_type : undefined;
+        if (!mediaType || !mediaType.startsWith("image/")) throw new UnsupportedMediaError(mediaType || "attachment_reference");
+        reserveMedia(budget, mediaBytes(sourceRecord.data));
+        return mediaBlock(sourceRecord.data, mediaType);
+      }
     }
     const value = typeof source === "string"
       ? source

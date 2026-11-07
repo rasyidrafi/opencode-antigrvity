@@ -259,6 +259,13 @@ export class HostBridge {
           const delivery = [...deliveryContent, ...steering];
           validateMediaBlocks(delivery);
           blockBudget(input.settings.model, delivery, input.settings.outputBudget);
+          // Result images re-enter natively instead of being offloaded by MCP.
+          if (delivery.some((block) => block.type === "image")) {
+            await this.close();
+            yield* hostBridge(this.key, this.sessionID, this.cwd).request(input);
+            finished = true;
+            return;
+          }
           const last = [...this.reported].at(-1);
           const requestID = this.turn?.identity?.value ?? this.turn?.requestId;
           if (requestID) await sessionStore.saveReceipt(this.key, requestID, { state: "running" });
