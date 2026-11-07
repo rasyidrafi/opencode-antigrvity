@@ -73,7 +73,7 @@ async function sendParallel(session: string, messages: any[]): Promise<Response>
   finally { clearTimeout(deadline); persistence.mockRestore(); }
 }
 
-test("installed host encoder preserves inline/promoted result images and image steering through proxy/MCP", async () => {
+test("installed host encoder routes inline/promoted result and steering images into the rebuilt prompt", async () => {
   // Sanitized synthetic payloads, >90 KiB decoded each; no private screenshots.
   const resultImage = Buffer.alloc(96 * 1024, 17).toString("base64");
   const steeringImage = Buffer.alloc(100 * 1024, 23).toString("base64");
@@ -98,10 +98,12 @@ test("installed host encoder preserves inline/promoted result images and image s
   const final = await (await send("encoder-media", body.messages)).json();
   expect(final.stop_reason).toBe("end_turn");
   const content = JSON.stringify(final.content);
-  expect(content).toContain("ENCODER_RESULT");
-  expect(content).toContain("IMAGE_STEERING");
-  expect(content).toContain(resultImage);
-  expect(content).toContain(steeringImage);
+  expect(content).toContain("IMAGE_OK");
+  expect(content).not.toContain(resultImage);
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([resultImage, steeringImage]);
+  expect(rebuilt.text).toContain("ENCODER_RESULT");
+  expect(rebuilt.text).toContain("IMAGE_STEERING");
 
   const recoveredInitial = [{ role: "user", content: "FAKE_MCP IMAGE_RECOVERY" }];
   const lost = await (await send("encoder-image-recovery", recoveredInitial)).json();
@@ -115,8 +117,8 @@ test("installed host encoder preserves inline/promoted result images and image s
   const recoveredBody = await recoveredResponse.json();
   expect(recoveredBody.error).toBeUndefined();
   expect(recoveredResponse.status).toBe(200);
-  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
-  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([resultImage, steeringImage]);
+  const recoveredPrompt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(recoveredPrompt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([resultImage, steeringImage]);
 });
 
 test("MCP cancellation request IDs interrupt their bridge without a successful empty result", async () => {
@@ -491,6 +493,302 @@ test("waiting for host approval suspends the watchdog; changed instructions rebu
     expect(logged.text).not.toContain("HOST_INSTRUCTIONS_UNTRUNCATED");
     expect(final.content.some((part: { type: string }) => part.type === "tool_use")).toBe(false);
   } finally { if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_TURN_STALL_MS; else process.env.OPENCODE_ANTIGRAVITY_TURN_STALL_MS = previous; }
+});
+
+const hostImage = (data: string) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
+const promptLines = async () => (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").length;
+/** Observe a real event barrier without polling; a hang fails loudly. */
+async function within<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} did not happen`)), 5_000); })]); }
+  finally { clearTimeout(timer); }
+}
+
+test("image tool results rebuild a native prompt instead of an MCP delivery", async () => {
+  const host = "image-native-delivery";
+  const image = Buffer.alloc(96 * 1024, 47).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP NATIVE_IMAGE" }];
+  const first = await (await send(host, messages)).json();
+  expect(first.stop_reason).toBe("tool_use");
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const oldIdentity = String((await sessionStore.toolCall(key, call.id))!.requestId);
+  messages.push({ role: "assistant", content: first.content }, {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: call.id, content: [{ type: "text", text: "RESULT_TEXT_BEFORE_IMAGE" }, hostImage(image)] }, { type: "text", text: "STEERING_AFTER_IMAGE" }],
+  });
+  const saveReceipt = sessionStore.saveReceipt.bind(sessionStore);
+  let handoffIdentity: string | undefined;
+  const receipts = spyOn(sessionStore, "saveReceipt").mockImplementation(async (...args) => {
+    await saveReceipt(...args);
+    if (args[0] === key && args[1] !== oldIdentity) handoffIdentity = args[1];
+  });
+  let final: any;
+  try { final = await (await send(host, messages)).json(); }
+  finally { receipts.mockRestore(); }
+  expect(final.stop_reason).toBe("end_turn");
+  const content = JSON.stringify(final.content);
+  expect(content).toContain("IMAGE_OK");
+  expect(content).not.toContain(image);
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([image]);
+  expect(rebuilt.text).toContain("RESULT_TEXT_BEFORE_IMAGE");
+  expect(rebuilt.text).toContain("STEERING_AFTER_IMAGE");
+  expect(rebuilt.text).toContain("[tool result");
+  const saved = (await sessionStore.toolCall(key, call.id))!;
+  expect(saved.delivery).toBe("result-persisted");
+  expect((await sessionStore.receipt(key, oldIdentity))?.state).toBe("interrupted");
+  expect(handoffIdentity).toBeString();
+  expect((await sessionStore.receipt(key, handoffIdentity!))?.state).toBe("completed");
+
+  // The same continuation replays the new completed receipt without a prompt.
+  const beforeReplay = await promptLines();
+  const revision = (await sessionStore.get(key))?.revision;
+  const replay = await (await send(host, messages)).json();
+  expect(replay.stop_reason).toBe("end_turn");
+  expect(replay.content).toEqual(final.content);
+  expect(await promptLines()).toBe(beforeReplay);
+  expect((await sessionStore.get(key))?.revision).toBe(revision);
+
+  // A later plain-text tool batch on the rebuilt session must not rebuild again.
+  messages.push({ role: "assistant", content: final.content }, { role: "user", content: "FAKE_MCP SECOND_TEXT_TURN" });
+  const beforeSecond = await promptLines();
+  const second = await (await send(host, messages)).json();
+  expect(second.stop_reason).toBe("tool_use");
+  const next = second.content.find((part: any) => part.type === "tool_use");
+  messages.push({ role: "assistant", content: second.content }, { role: "user", content: [result(next.id, "PLAIN_SECOND_RESULT")] });
+  const beforeDelivery = await promptLines();
+  const third = await (await send(host, messages)).json();
+  expect(third.stop_reason).toBe("end_turn");
+  expect(JSON.stringify(third.content)).toContain("PLAIN_SECOND_RESULT");
+  expect(await promptLines()).toBe(beforeDelivery);
+  expect(beforeDelivery).toBe(beforeSecond + 1);
+});
+
+test("image half-batch stays parked until every reported result arrives", async () => {
+  const host = "image-half-batch";
+  const image = Buffer.alloc(48 * 1024, 53).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP_PARALLEL HALF_IMAGE" }];
+  const first = await (await sendParallel(host, messages)).json();
+  expect(first.content).toHaveLength(2);
+  const [a, b] = first.content;
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: a.id, content: [{ type: "text", text: "HALF_TEXT" }, hostImage(image)] },
+  ] });
+  const partial = await send(host, messages);
+  expect(partial.status).toBe(400);
+  expect((await partial.json()).error.message).toContain("pending results");
+  // Incomplete reported batches must not retire the parked bridge.
+  expect(hostBridge(key, host, directory)).toBe(bridge);
+  // Only B is submitted again; A must be recovered from pending + durable state.
+  messages.at(-1).content = [result(b.id, "SECOND_TEXT")];
+  const final = await (await send(host, messages)).json();
+  expect(final.stop_reason).toBe("end_turn");
+  expect(JSON.stringify(final.content)).toContain("IMAGE_OK");
+  expect(hostBridge(key, host, directory)).not.toBe(bridge);
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([image]);
+  expect(rebuilt.text).toContain("HALF_TEXT");
+  expect(rebuilt.text).toContain("SECOND_TEXT");
+});
+
+test("invalid steering media rejects before the image switch and keeps the result", async () => {
+  const host = "image-invalid-steering";
+  const image = Buffer.alloc(20 * 1024, 59).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP INVALID_STEERING" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const request = (steering: unknown) => [...messages, { role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: call.id, content: [hostImage(image)] }, steering,
+  ] }];
+  const rejected = await send(host, request({ type: "audio", data: "AA==" }));
+  expect(rejected.status).toBe(400);
+  const failure = await rejected.json();
+  expect(failure.content).toBeUndefined();
+  expect(failure.error.code).toBe("agy_unsupported_content");
+  expect((await sessionStore.toolCall(key, call.id))?.resultDigest).toBeString();
+  expect((await sessionStore.toolCall(key, call.id))?.delivery).toBe("result-persisted");
+  // The persisted result survives; a corrected continuation rebuilds with it.
+  const final = await (await send(host, request({ type: "text", text: "STEERING_OK" }))).json();
+  expect(final.stop_reason).toBe("end_turn");
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([image]);
+  expect(rebuilt.text).toContain("STEERING_OK");
+});
+
+test("image delivery preserves explicit repeated request-ID rejection", async () => {
+  const host = "image-repeat-id";
+  const image = Buffer.alloc(16 * 1024, 61).toString("base64");
+  const headers = { "x-opencode-antigravity-message": "fixed-image-request" };
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP REPEAT_ID" }];
+  const first = await (await send(host, messages, {}, headers)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: call.id, content: [hostImage(image)] },
+  ] });
+  const response = await send(host, messages, {}, headers);
+  expect(response.status).toBe(400);
+  const failure = await response.json();
+  expect(failure.content).toBeUndefined();
+  expect(failure.error.code).toBe("agy_request_already_started");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  expect((await sessionStore.toolCall(key, call.id))?.resultDigest).toBeString();
+  expect((await sessionStore.receipt(key, "fixed-image-request"))?.state).not.toBe("completed");
+});
+
+test("image switch cancels calls that were never reported as a host batch", async () => {
+  const host = "image-late-call";
+  const image = Buffer.alloc(24 * 1024, 67).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP LATE_CALL" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  const url = getProxyBaseUrl().replace(/\/v1$/, "") + `/mcp/${bridge.token}/${bridge.catalogID}`;
+  // The parked turn consumed its own park; the next queue push is the late call.
+  const queue = (bridge as any).queue;
+  const push = queue.push;
+  let parked!: () => void;
+  const park = new Promise<void>((resolve) => { parked = resolve; });
+  queue.push = (value: any) => { push.call(queue, value); if (value?.event === "park") parked(); };
+  const saveToolCall = sessionStore.saveToolCall.bind(sessionStore);
+  let lateID: string | undefined;
+  const calls = spyOn(sessionStore, "saveToolCall").mockImplementation(async (...args) => {
+    await saveToolCall(...args);
+    if (args[1] !== call.id) lateID = args[1];
+  });
+  let late: Promise<Response> | undefined;
+  let continuation: Promise<Response> | undefined;
+  try {
+    late = fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: "late-unreported", method: "tools/call", params: { name: "shell", arguments: { index: 9 } } }) });
+    await within(park, "late MCP park");
+    expect(lateID).toBeString();
+    messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+      { type: "tool_result", tool_use_id: call.id, content: [hostImage(image)] },
+    ] });
+    continuation = send(host, messages);
+    const final = await (await continuation).json();
+    expect(final.stop_reason).toBe("end_turn");
+    expect(JSON.stringify(final.content)).toContain("IMAGE_OK");
+    expect(final.content.some((part: any) => part.type === "tool_use")).toBe(false);
+    const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+    expect(rebuilt.text).not.toContain(lateID!);
+    const stored = await sessionStore.toolCall(key, lateID!);
+    expect(stored?.result).toBeUndefined();
+    expect(stored?.delivery).toBeUndefined();
+    const replacement = hostBridge(key, host, directory);
+    expect(replacement).not.toBe(bridge);
+    expect((replacement as any).pending.has(lateID!)).toBe(false);
+    const lateResponse = await (await late).json();
+    expect(lateResponse.result).toBeUndefined();
+    expect(lateResponse.error.message).toMatch(/cancel|abort/i);
+  } finally {
+    queue.push = push;
+    try { calls.mockRestore(); } catch { /* preserve the original failure */ }
+    try { await closeHostBridges(host); } catch { /* preserve the original failure */ }
+    try { await within(Promise.allSettled([late, continuation].filter((request): request is Promise<Response> => request !== undefined)), "late requests settle"); } catch { /* already closed */ }
+  }
+});
+
+test("cancelling the continuation during the handoff submits no replacement prompt", async () => {
+  const host = "image-handoff-cancel";
+  const image = Buffer.alloc(18 * 1024, 71).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP HANDOFF_CANCEL" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: call.id, content: [hostImage(image)] },
+  ] });
+  const { sessionPool } = await import("../src/session-pool.js");
+  const turn = sessionPool.turn.bind(sessionPool);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reached!: () => void;
+  const started = new Promise<void>((resolve) => { reached = resolve; });
+  // Pause the replacement before its pooled turn can submit a prompt.
+  const pause = spyOn(sessionPool, "turn").mockImplementation((request: any) => (async function* () {
+    reached();
+    await gate;
+    yield* turn(request);
+  })());
+  let response: Promise<Response> | undefined;
+  let closing: Promise<void> | undefined;
+  try {
+    const before = await promptLines();
+    response = send(host, messages);
+    await within(started, "replacement turn");
+    expect(await promptLines()).toBe(before);
+    expect((await sessionStore.toolCall(key, call.id))?.resultDigest).toBeString();
+    closing = closeHostBridges(host);
+    release();
+    await closing;
+    const http = await response;
+    const outcome = await http.json();
+    expect(http.status).toBeGreaterThanOrEqual(400);
+    expect(outcome.error).toBeDefined();
+    expect(outcome.content).toBeUndefined();
+    expect(await promptLines()).toBe(before);
+    const saved = (await sessionStore.toolCall(key, call.id))!;
+    expect(saved.resultDigest).toBeString();
+    expect(saved.delivery).toBe("result-persisted");
+    expect(hostBridge(key, host, directory)).not.toBe(bridge);
+  } finally {
+    // Close first, then release the paused pump, then settle both requests.
+    try { closing = closing ?? closeHostBridges(host); } catch { /* preserve the original failure */ }
+    release();
+    try { await closing; } catch { /* preserve the original failure */ }
+    try { pause.mockRestore(); } catch { /* preserve the original failure */ }
+    try { await closeHostBridges(host); } catch { /* preserve the original failure */ }
+    try { if (response) await within(response, "response settle"); } catch { /* already settled */ }
+  }
+});
+
+test("replacement prompt failure preserves the result and cannot resubmit", async () => {
+  const host = "image-quota-failure";
+  const image = Buffer.alloc(22 * 1024, 73).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP QUOTA_HANDOFF" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const oldIdentity = String((await sessionStore.toolCall(key, call.id))!.requestId);
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: call.id, content: [hostImage(image)] },
+    { type: "text", text: "FAKE_QUOTA_UNCERTAIN" },
+  ] });
+  const saveReceipt = sessionStore.saveReceipt.bind(sessionStore);
+  let failedIdentity: string | undefined;
+  const receipts = spyOn(sessionStore, "saveReceipt").mockImplementation(async (...args) => {
+    await saveReceipt(...args);
+    if (args[0] === key && args[1] !== oldIdentity) failedIdentity = args[1];
+  });
+  let http: Response;
+  let failure: any;
+  try { http = await send(host, messages); failure = await http.json(); }
+  finally { receipts.mockRestore(); }
+  expect(http.status).toBe(429);
+  expect(failure.content).toBeUndefined();
+  expect(failure.error).toBeDefined();
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([image]);
+  expect(rebuilt.text).toContain("FAKE_QUOTA_UNCERTAIN");
+  expect(failedIdentity).toBeString();
+  expect((await sessionStore.receipt(key, failedIdentity!))?.state).not.toBe("completed");
+  const saved = (await sessionStore.toolCall(key, call.id))!;
+  expect(saved.resultDigest).toBeString();
+  expect(saved.delivery).toBe("result-persisted");
+  // Content identity (not an explicit header) blocks resubmission and tool replay.
+  const before = await promptLines();
+  const retry = await send(host, messages);
+  expect(retry.status).toBe(400);
+  const retryBody = await retry.json();
+  expect(retryBody.error.code).toBe("agy_request_already_started");
+  expect(retryBody.content).toBeUndefined();
+  expect(await promptLines()).toBe(before);
 });
 
 test("clearing instructions during a parked tool turn rebuilds without old instructions or reexecuting tools", async () => {
