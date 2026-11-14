@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { unzipSync } from "fflate";
 import { acquireFileLock } from "./file-lock.js";
 
-export const ACP_VERSION = "1.3.0";
+export const ACP_VERSION = "1.4.5";
 
 export function acpDistribution(platform = process.platform, arch = process.arch) {
   const os = platform === "darwin" ? "macos" : platform === "win32" ? "windows" : platform === "linux" ? "linux" : undefined;
