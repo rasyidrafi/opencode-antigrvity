@@ -5,24 +5,21 @@ import { join } from "node:path";
 import { bridgeCliAuthentication } from "../src/auth-bridge.js";
 import { createAcpWorker } from "../src/acp-process.js";
 
-test("workers require CLI credentials even if an ACP token remains, and never start login", async () => {
-  const home = await mkdtemp(join(tmpdir(), "agy-cli-only-"));
-  const environment = { GEMINI_HOME: home, OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: "oauth-business", FAKE_ACP_REJECT_AUTHENTICATE: "1" };
-  const options = { cwd: process.cwd(), executable: join(import.meta.dir, "fixtures/fake-acp.mjs"), environment };
-  const token = join(home, "antigravity-cli/antigravity-oauth-token");
+test("workers start without CLI credentials; the CLI bridge is best-effort", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agy-cli-optional-"));
+  const environment = { GEMINI_HOME: home };
+  const options = { cwd: process.cwd(), executable: join(import.meta.dir, "fixtures/fake-acp.mjs"), environment, nonInteractive: true };
   try {
-    await mkdir(join(home, "antigravity-acp"));
-    await writeFile(join(home, "antigravity-acp/acp_token.json"), '{"refresh_token":"stale-acp-only"}');
-    await expect(createAcpWorker(options)).rejects.toMatchObject({ code: "agy_cli_auth_required" });
-    await mkdir(join(home, "antigravity-cli"));
-    await writeFile(token, "{broken");
-    await expect(createAcpWorker(options)).rejects.toMatchObject({ code: "agy_cli_auth_required" });
-    await writeFile(token, JSON.stringify({ auth_method: "consumer", token: { refresh_token: "cli-fixture" } }));
+    // No agy CLI token at all: the worker still starts.
     const worker = await createAcpWorker(options);
     await worker.stop(true);
+
+    // When a CLI token exists it is still bridged into the ACP credential file.
+    await mkdir(join(home, "antigravity-cli"));
+    await writeFile(join(home, "antigravity-cli/antigravity-oauth-token"), JSON.stringify({ auth_method: "consumer", token: { refresh_token: "cli-fixture" } }));
+    const withCli = await createAcpWorker(options);
+    await withCli.stop(true);
     expect(JSON.parse(await readFile(join(home, "antigravity-acp/acp_token.json"), "utf8")).refresh_token).toBe("cli-fixture");
-    await rm(token);
-    await expect(createAcpWorker(options)).rejects.toMatchObject({ code: "agy_cli_auth_required" });
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
@@ -70,4 +67,16 @@ test("CLI login seeds and repairs ACP credentials and follows CLI account change
     expect(await readFile(acpPath, "utf8")).toBe(saved);
     expect(JSON.parse(await readFile(settingsPath, "utf8"))).toEqual({ auth: { type: "oauth-personal" }, other: true });
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("does not require an agy CLI token file when the ACP server has its own auth", async () => {
+  const { requireCliAuthentication } = await import("../src/auth-bridge.js");
+  const home = await mkdtemp(join(tmpdir(), "opencode-antigravity-no-cli-"));
+  try {
+    // No antigravity-cli token exists under this home. The server may still be
+    // authenticated through its own store (keychain on macOS, acp_token.json).
+    await expect(requireCliAuthentication({ ...process.env, HOME: home, GEMINI_HOME: home })).resolves.toBeUndefined();
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });

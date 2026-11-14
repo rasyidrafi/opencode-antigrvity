@@ -17,7 +17,7 @@ test("native discovery deadlines allow slow Windows cold start but stay bounded"
   expect(discoveryTimeoutMs("darwin")).toBe(45_000);
 });
 
-test("file-backed auth scopes and gating follow account changes and signout", async () => {
+test("file-backed auth scopes and bridging follow account changes and signout", async () => {
   const home = await mkdtemp(join(tmpdir(), "agy-file-revision-"));
   const environment = { GEMINI_HOME: home };
   const path = join(home, "antigravity-cli", "antigravity-oauth-token");
@@ -32,7 +32,9 @@ test("file-backed auth scopes and gating follow account changes and signout", as
     await requireCliAuthentication(environment);
     await rm(path);
     expect((await effectiveAuth(environment)).scope).not.toBe(second.scope);
-    await expect(requireCliAuthentication(environment)).rejects.toMatchObject({ code: "agy_cli_auth_required" });
+    // Signout removes the bridge source but does not block workers: the ACP
+    // server may still hold its own credentials and reports auth itself.
+    await expect(requireCliAuthentication(environment)).resolves.toBeUndefined();
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
