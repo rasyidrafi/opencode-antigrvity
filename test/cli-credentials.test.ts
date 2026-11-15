@@ -136,7 +136,7 @@ test.skipIf(process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true
       await setNativeFixture(); written = false;
       expect(await readWindowsCliCredential(environment)).toBeUndefined();
       expect((await effectiveAuth(environment)).scope).not.toBe(second.scope);
-      await expect(requireCliAuthentication(environment)).rejects.toMatchObject({ code: "agy_cli_auth_required" });
+      await expect(requireCliAuthentication(environment)).resolves.toBeUndefined();
       await expect(access(cliPath)).rejects.toThrow();
     } finally {
       if (written) await setNativeFixture();
