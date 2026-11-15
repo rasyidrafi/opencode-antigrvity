@@ -2,10 +2,10 @@ import { test, expect } from "bun:test";
 import { open, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fixtureCompatibility } from "./compatibility.js";
-import { startProxy, stopProxy, getProxyBaseUrl } from "../../src/proxy.js";
+import { startRuntime, stopRuntime } from "../../src/runtime.js";
 import { sessionStore } from "../../src/session-store.js";
 import { HostBridge } from "../../src/host-tools.js";
-import { SESSION_HEADER } from "../../src/constants.js";
+import { driveBridge } from "./drive.js";
 
 // This file is run only in a separate test process. No shipped hooks or env bypass.
 if (process.env.AGY_CRASH_CHILD) test("integrated crash child", async () => {
@@ -47,11 +47,14 @@ if (process.env.AGY_CRASH_CHILD) test("integrated crash child", async () => {
       }
     };
   }
-  await startProxy(root);
+  await startRuntime(root);
   const initial = [{ role: "user", content: "FAKE_MCP CRASH_ONCE" }];
-  const send = (messages: unknown) => fetch(getProxyBaseUrl() + "/messages", {
-    method: "POST", headers: { "content-type": "application/json", "x-api-key": "opencode-antigravity-local", [SESSION_HEADER]: "crash-host" },
-    body: JSON.stringify({ model: "gemini-3.8-flash", tools: [{ name: "shell", input_schema: { type: "object" } }], messages }),
+  const send = (messages: unknown) => driveBridge({
+    session: "crash-host",
+    directory: root,
+    model: "gemini-3.8-flash",
+    tools: [{ name: "shell", input_schema: { type: "object" } }],
+    messages,
   });
   if (recovery) {
     const exposed = await readFile(join(root, "exposed.json"), "utf8").then(JSON.parse).catch(() => undefined);
@@ -60,7 +63,7 @@ if (process.env.AGY_CRASH_CHILD) test("integrated crash child", async () => {
     const body = await response.json();
     expect(body.content?.some((p: any) => p.type === "tool_use") ?? false).toBe(false);
     process.send!({ recovered: true, status: response.status, body, bindings: await sessionStore.entries() });
-    await stopProxy();
+    await stopRuntime(root);
     return;
   }
   const first = await (await send(initial)).json();

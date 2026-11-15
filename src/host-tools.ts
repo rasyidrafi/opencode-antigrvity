@@ -86,11 +86,35 @@ export function hostInstructions(system: unknown): string {
 }
 
 // Reloaded modules must keep live MCP waiters and endpoint tokens together.
-const owner = globalThis as typeof globalThis & { __agyBridgeV1?: { bridges: Map<string, HostBridge>; tokens: Map<string, HostBridge>; mcpRequests?: Map<string, () => void>; localDeliveries?: WeakMap<object, { key: string; id: string }> } };
-const bridgeRuntime = owner.__agyBridgeV1 ??= { bridges: new Map<string, HostBridge>(), tokens: new Map<string, HostBridge>(), mcpRequests: new Map<string, () => void>() };
+const owner = globalThis as typeof globalThis & { __agyBridgeV1?: { bridges: Map<string, HostBridge>; tokens: Map<string, HostBridge>; mcpRequests?: Map<string, () => void>; localDeliveries?: WeakMap<object, { key: string; id: string }>; bridgeServer: ReturnType<typeof Bun.serve> | null } };
+const bridgeRuntime = owner.__agyBridgeV1 ??= { bridges: new Map<string, HostBridge>(), tokens: new Map<string, HostBridge>(), mcpRequests: new Map<string, () => void>(), bridgeServer: null };
 const { bridges, tokens } = bridgeRuntime;
 const mcpRequests = bridgeRuntime.mcpRequests ??= new Map<string, () => void>();
 const localDeliveries = bridgeRuntime.localDeliveries ??= new WeakMap<object, { key: string; id: string }>();
+
+/**
+ * The tool bridge is a loopback streamable-HTTP MCP server. OpenCode's tools are
+ * offered to ACP here; the model route itself is in-process, so this server has
+ * no model endpoints. The handle is process-global so a compatible module
+ * reload reuses and stops the same listener.
+ */
+export async function ensureHostBridgeServer(): Promise<string> {
+  if (bridgeRuntime.bridgeServer) return `http://127.0.0.1:${bridgeRuntime.bridgeServer.port}`;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    idleTimeout: 0,
+    fetch: (request) => handleHostMcp(request),
+  });
+  bridgeRuntime.bridgeServer = server;
+  return `http://127.0.0.1:${server.port}`;
+}
+
+export async function stopHostBridgeServer(): Promise<void> {
+  const server = bridgeRuntime.bridgeServer;
+  bridgeRuntime.bridgeServer = null;
+  server?.stop(true);
+}
 async function locallyHandedOff(result: unknown): Promise<void> {
   const identity = result && typeof result === "object" ? localDeliveries.get(result) : undefined;
   if (identity) await sessionStore.toolDelivery(identity.key, identity.id, "locally-handed-off");
@@ -192,13 +216,14 @@ export class HostBridge {
     return result;
   }
 
-  async *request(input: { messages: unknown; system?: unknown; tools?: unknown; settings: SessionSettings; baseURL: string; requestId?: string; signal?: AbortSignal }): AsyncGenerator<BridgeEvent> {
+  async *request(input: { messages: unknown; system?: unknown; tools?: unknown; settings: SessionSettings; baseURL?: string; requestId?: string; signal?: AbortSignal }): AsyncGenerator<BridgeEvent> {
     if (this.closed) throw new AgyAbortError();
     if (this.consuming) throw new AgyBusyError("An OpenCode request is already consuming this turn");
     this.consuming = true;
     clearTimeout(this.idle);
     let parked = false;
     let finished = false;
+    const baseURL = input.baseURL ?? (await ensureHostBridgeServer()) ?? undefined;
     const abort = () => { void this.close(); };
     input.signal?.addEventListener("abort", abort, { once: true });
     try {
@@ -331,7 +356,7 @@ export class HostBridge {
         const schema = createHash("sha256").update(JSON.stringify(tools)).digest("hex");
         this.catalogID = schema;
         const settings: SessionSettings = { ...input.settings, hostTools: true,
-          mcpServers: tools.length ? [{ type: "http", name: HOST_MCP_SERVER_NAME, url: `${input.baseURL}/mcp/${this.token}/${schema}`, headers: [] }] : [],
+          mcpServers: tools.length && baseURL ? [{ type: "http", name: HOST_MCP_SERVER_NAME, url: `${baseURL}/mcp/${this.token}/${schema}`, headers: [] }] : [],
           waitingForTools: () => this.waiting, hasToolActivity: () => this.callCount > 0 };
         const turn: SessionTurnRequest = { key: this.key, requestId: input.requestId, prompt: normalized.blocks,
           messages: normalized.messages, hostSessionID: this.sessionID,

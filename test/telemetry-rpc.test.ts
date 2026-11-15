@@ -11,8 +11,9 @@ import { AntigravityPlugin } from "../src/index.js";
 import { ContextTelemetry } from "@rasyid_rafi/opencode-antigravity/rpc";
 import { sessionStore } from "../src/session-store.js";
 import { AsyncEventQueue } from "../src/acp-process.js";
-import { getProxyBaseUrl } from "../src/proxy.js";
-import { LOCAL_API_KEY, SESSION_HEADER } from "../src/constants.js";
+import { LOCAL_API_KEY } from "../src/constants.js";
+import { readContextSnapshot } from "../src/telemetry.js";
+import { driveBridge } from "./fixtures/drive.js";
 
 // Resolve the exact client shipped with the installed plugin, not a separately
 // upgraded SDK. The wire fixture implements the published V2 HTTP RPC/event
@@ -70,6 +71,7 @@ test("installed V2 client reads telemetry, consumes change events, resyncs, and 
       session: { hook: async () => ({ dispose: async () => {} }), get: async ({ sessionID }: { sessionID: string }) => ({ location: { directory: sessionID === "foreign" ? root + "-foreign" : root } }) },
       integration: { connection: { active: async () => ({}), resolve: async () => ({ type: "key", key: LOCAL_API_KEY }) }, transform: async (fn: any) => { fn({ update() {}, method: { update() {} } }); } },
       provider: { reload: async () => {}, transform: async (fn: any) => { fn({ add() {} }); } },
+      aisdk: { hook: async () => ({ dispose: async () => {} }) },
     };
     cleanup = await (AntigravityPlugin as any).setup(ctx);
     const client = OpenCode.make({ baseUrl: server.url.toString() });
@@ -83,21 +85,18 @@ test("installed V2 client reads telemetry, consumes change events, resyncs, and 
     const firstEvent = changes.next();
     for (let i = 0; i < 100 && !eventControllers.size; i++) await Bun.sleep(10);
     expect(eventControllers.size).toBe(1);
-    const headers = { "x-api-key": LOCAL_API_KEY, [SESSION_HEADER]: "host", "content-type": "application/json" };
-    expect((await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "RPC_ACTUAL_PUMP" }] }) })).status).toBe(200);
+    expect((await driveBridge({ session: "host", directory: root, messages: [{ role: "user", content: "RPC_ACTUAL_PUMP" }] })).status).toBe(200);
     const changed = await firstEvent;
     expect(changed.value.type).toBe("rpc.antigravity-context-v1.changed");
     expect(changed.value.location.directory).toBe(root);
     expect(changed.value.data).toMatchObject({ epoch: 0, state: "measured", used: 12, size: 1000 });
     expect(await rpc.read({ sessionID: "host" })).toEqual(changed.value.data);
-    expect(await (await fetch(getProxyBaseUrl() + "/usage", { headers })).json()).toEqual(changed.value.data);
-    expect((await fetch(getProxyBaseUrl() + "/usage", { headers: { [SESSION_HEADER]: "host" } })).status).toBe(401);
-    expect((await fetch(getProxyBaseUrl() + "/usage", { headers: { "x-api-key": LOCAL_API_KEY } })).status).toBe(400);
-    // The replacement supplies no usage. Both the actual strict RPC schema
-    // and authenticated /v1/usage must resync to unknown, not old occupancy.
+    expect(await readContextSnapshot("host")).toEqual(changed.value.data);
+    // The replacement supplies no usage. The strict RPC read must resync to
+    // unknown, not old occupancy.
     process.env.FAKE_ACP_NO_USAGE = "1";
     const replacementEvent = changes.next();
-    expect((await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "EDITED_RPC_BASELINE" }] }) })).status).toBe(200);
+    expect((await driveBridge({ session: "host", directory: root, messages: [{ role: "user", content: "EDITED_RPC_BASELINE" }] })).status).toBe(200);
     const invalidated = (await replacementEvent).value.data;
     expect(invalidated).toMatchObject({ epoch: 0, state: "unknown" });
     expect(invalidated.sequence).toBeGreaterThan(changed.value.data.sequence);
@@ -105,15 +104,15 @@ test("installed V2 client reads telemetry, consumes change events, resyncs, and 
     const replaced = await rpc.read({ sessionID: "host" });
     expect(replaced.state).toBe("unknown");
     expect(replaced.used).toBeUndefined();
-    expect(await (await fetch(getProxyBaseUrl() + "/usage", { headers })).json()).toEqual(replaced);
+    expect(await readContextSnapshot("host")).toEqual(replaced);
     delete process.env.FAKE_ACP_NO_USAGE;
     const freshEvent = changes.next();
-    expect((await fetch(getProxyBaseUrl() + "/messages", { method: "POST", headers, body: JSON.stringify({ model: "gemini-3.8-flash", messages: [{ role: "user", content: "FRESH_RPC_BASELINE" }] }) })).status).toBe(200);
+    expect((await driveBridge({ session: "host", directory: root, messages: [{ role: "user", content: "FRESH_RPC_BASELINE" }] })).status).toBe(200);
     let fresh = await freshEvent;
     for (let i = 0; i < 3 && fresh.value.data.state === "unknown"; i++) fresh = await changes.next();
     expect(fresh.value.data).toMatchObject({ state: "measured", used: 12 });
     expect(await rpc.read({ sessionID: "host" })).toEqual(fresh.value.data);
-    expect(await (await fetch(getProxyBaseUrl() + "/usage", { headers })).json()).toEqual(fresh.value.data);
+    expect(await readContextSnapshot("host")).toEqual(fresh.value.data);
     const persisted = (await sessionStore.contextSnapshot("host"))!;
     await sessionStore.saveContextSnapshot("host", { ...persisted, observedAt: Date.now() - 300_001 });
     expect(await rpc.read({ sessionID: "host" })).toMatchObject({ state: "stale" });

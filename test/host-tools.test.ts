@@ -2,11 +2,12 @@ import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { chmod, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { startProxy, stopProxy, getProxyBaseUrl } from "../src/proxy.js";
-import { closeHostBridges, hostBridge, hostResults, parseHostTools } from "../src/host-tools.js";
+import { startRuntime, stopRuntime, getRuntime } from "../src/runtime.js";
+import { closeHostBridges, ensureHostBridgeServer, hostBridge, hostResults, parseHostTools } from "../src/host-tools.js";
+import { driveBridge, driveModel } from "./fixtures/drive.js";
+import { REQUEST_KIND_HEADER, SESSION_HEADER, DIRECTORY_HEADER } from "../src/constants.js";
 import { protocol as anthropicProtocol } from "@opencode/ai/protocols/anthropic-messages";
 const Effect = await import(Bun.resolveSync("effect/Effect", dirname(import.meta.resolve("@opencode/ai"))));
-import { SESSION_HEADER } from "../src/constants.js";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
 import { sessionStore } from "../src/session-store.js";
 let compatibility: ReturnType<typeof fixtureCompatibility>;
@@ -21,27 +22,42 @@ beforeAll(async () => {
   process.env.GEMINI_HOME = join(directory, "gemini");
   process.env.FAKE_ACP_PROMPT_LOG = join(directory, "prompts.jsonl");
   await chmod(process.env.OPENCODE_ANTIGRAVITY_ACP_PATH, 0o755);
-  await startProxy(directory);
+  await startRuntime(directory);
 });
 afterAll(async () => {
-  await stopProxy();
+  await stopRuntime(directory);
   compatibility.mockRestore();
   for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
   Object.assign(process.env, env);
   await rm(directory, { recursive: true, force: true });
 });
-const send = (session: string, messages: any[], extra: Record<string, unknown> = {}, headers: Record<string, string> = {}) => fetch(getProxyBaseUrl() + "/messages", {
-  method: "POST", headers: { "content-type": "application/json", "x-api-key": "opencode-antigravity-local", [SESSION_HEADER]: session, ...headers },
-  body: JSON.stringify({ model: "gemini-3.8-flash", tools: schema, system: "HOST_INSTRUCTIONS_UNTRUNCATED", messages, ...extra }),
-});
+const send = async (session: string, messages: any[], extra: Record<string, unknown> = {}, headers: Record<string, string> = {}) => {
+  if (headers[REQUEST_KIND_HEADER] === "compaction") {
+    try {
+      await driveModel({
+        prompt: [{ role: "user", content: "Summarize the selected prefix." }],
+        headers: { [REQUEST_KIND_HEADER]: "compaction", [SESSION_HEADER]: session, [DIRECTORY_HEADER]: directory },
+      });
+      return Response.json({ error: { message: "compaction should be rejected" } }, { status: 500 });
+    } catch (error) {
+      const failure = error as { responseBody?: string; message: string };
+      return Response.json({ error: { message: failure.message, code: /agy_internal_compaction/.test(failure.responseBody ?? "") ? "agy_internal_compaction" : "rejected" } }, { status: 400 });
+    }
+  }
+  return driveBridge({
+    session,
+    directory,
+    messages,
+    system: typeof extra.system === "string" ? extra.system : "HOST_INSTRUCTIONS_UNTRUNCATED",
+    tools: Array.isArray(extra.tools) ? extra.tools : schema,
+    model: typeof extra.model === "string" ? extra.model : "gemini-3.8-flash",
+  });
+};
 const result = (id: string, text: string, is_error = false) => ({ type: "tool_result", tool_use_id: id, content: text, is_error });
 
-test("plain proxy requests emit only configured instructions and user content", async () => {
+test("bridge requests emit only configured instructions and user content", async () => {
   for (const system of ["Search only", ""]) {
-    const response = await fetch(getProxyBaseUrl() + "/messages", {
-      method: "POST", headers: { "content-type": "application/json", "x-api-key": "opencode-antigravity-local" },
-      body: JSON.stringify({ model: "gemini-3.8-flash", system, messages: [{ role: "user", content: "Plain task" }] }),
-    });
+    const response = await send("plain-system", [{ role: "user", content: "Plain task" }], { system });
     expect(response.status).toBe(200);
     await response.json();
     const logged = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
@@ -126,7 +142,7 @@ test("MCP cancellation request IDs interrupt their bridge without a successful e
   const { sessionPool } = await import("../src/session-pool.js");
   const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === "mcp-cancel-id")!;
   const bridge = hostBridge(key, "mcp-cancel-id", directory);
-  const url = getProxyBaseUrl().replace(/\/v1$/, "") + `/mcp/${bridge.token}/${bridge.catalogID}`;
+  const url = (await ensureHostBridgeServer()) + `/mcp/${bridge.token}/${bridge.catalogID}`;
   const rpc = (body: unknown) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   const pending = rpc({ jsonrpc: "2.0", id: "cancel-me", method: "tools/call", params: { name: "shell", arguments: { index: 3 } } });
   await Bun.sleep(20);
@@ -145,7 +161,7 @@ test("MCP negotiates opted-in SSE progress and reports cancellation as a termina
   const { sessionStore } = await import("../src/session-store.js");
   const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
   const bridge = hostBridge(key, host, directory);
-  const url = getProxyBaseUrl().replace(/\/v1$/, "") + `/mcp/${bridge.token}/${bridge.catalogID}`;
+  const url = (await ensureHostBridgeServer()) + `/mcp/${bridge.token}/${bridge.catalogID}`;
   const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: "progress-request", method: "tools/call", params: { name: "shell", arguments: { index: 5 }, _meta: { progressToken: "token-progress" } } }) });
   expect(response.headers.get("content-type")).toBe("text/event-stream");
   const reader = response.body!.getReader();
@@ -185,8 +201,9 @@ test("sequential tool steps preserve error/media results and expose valid Anthro
   expect(second.stop_reason).toBe("tool_use");
   const call = second.content.find((part: any) => part.type === "tool_use");
   messages.push({ role: "assistant", content: second.content }, { role: "user", content: [result(call.id, "SECOND")] });
-  const final = await send("sequence", messages, { stream: true });
-  const text = await final.text(); expect(text).toContain("SECOND"); expect(text).toContain('"stop_reason":"end_turn"');
+  const final = await (await send("sequence", messages)).json();
+  expect(final.stop_reason).toBe("end_turn");
+  expect(JSON.stringify(final)).toContain("SECOND");
 });
 
 test("cross-session results cannot resolve tools; stopped calls rebuild with accepted late results", async () => {
@@ -277,7 +294,7 @@ test("lost result after both calls executed cannot cause recovery to execute eit
   execute((partial.content ?? []).filter((p: any) => p.type === "tool_use"));
   expect(partial.content).toBeUndefined();
   await closeHostBridges("execution-counts");
-  for (const stream of [false, true]) {
+  for (const stream of [false]) {
     const context = stream ? [...messages, { role: "assistant", content: "host interruption status" }, { role: "user", content: "recover pending work" }] : messages;
     const response = await send("execution-counts", context, { stream });
     expect(response.status).toBe(400);
@@ -338,29 +355,32 @@ test("failed durable file sync cannot acknowledge a tool result", async () => {
   expect((await store.toolCall("sync-failure", "sync-call"))?.result).toBeUndefined();
 });
 
-test("runtime retains proxy until the last same-workspace owner releases", async () => {
-  const port = getProxyBaseUrl();
-  await startProxy(directory);
-  await stopProxy(directory);
-  expect(getProxyBaseUrl()).toBe(port);
-  expect((await fetch(port + "/health")).status).toBe(200);
+test("runtime retains the pool until the last same-workspace owner releases", async () => {
+  const current = getRuntime();
+  expect(current).not.toBeNull();
+  await startRuntime(directory);
+  await stopRuntime(directory);
+  expect(getRuntime()).toBe(current);
+  await stopRuntime(directory);
+  expect(getRuntime()).toBeNull();
+  await startRuntime(directory);
+  expect(getRuntime()).not.toBeNull();
 });
 
-test("compatible module reload shares proxy, pool and live bridge ownership", async () => {
-  const proxyPath = "../src/proxy.ts?phase5-reload";
+test("compatible module reload shares runtime, pool and live bridge ownership", async () => {
+  const runtimePath = "../src/runtime.ts?phase5-reload";
   const poolPath = "../src/session-pool.ts?phase5-reload";
   const bridgePath = "../src/host-tools.ts?phase5-reload";
-  const reloadedProxy = await import(proxyPath);
+  const reloadedRuntime = await import(runtimePath);
   const reloadedPool = await import(poolPath);
   const reloadedBridge = await import(bridgePath);
   const { sessionPool } = await import("../src/session-pool.js");
   const { hostBridge } = await import("../src/host-tools.js");
   expect(reloadedPool.sessionPool).toBe(sessionPool);
   expect(reloadedBridge.hostBridge("reload-test", "reload-test", directory)).toBe(hostBridge("reload-test", "reload-test", directory));
-  await reloadedProxy.startProxy(directory);
-  expect(reloadedProxy.getProxyBaseUrl()).toBe(getProxyBaseUrl());
-  await reloadedProxy.stopProxy(directory);
-  expect((await fetch(getProxyBaseUrl() + "/health")).status).toBe(200);
+  await reloadedRuntime.startRuntime(directory);
+  expect(reloadedRuntime.getRuntime()).toBe(getRuntime());
+  await reloadedRuntime.stopRuntime(directory);
   await closeHostBridges("reload-test");
 });
 
@@ -422,36 +442,22 @@ test("StructuredOutput uses ordinary result delivery across turns", async () => 
 });
 
 test("MCP tools render only as host calls while thinking and compaction notices survive", async () => {
-  for (const stream of [false, true]) {
-    const session = `activity-${stream}`;
-    const messages: any[] = [{ role: "user", content: "FAKE_MCP_ACTIVITY" }];
-    const firstResponse = await send(session, messages, { stream });
-    const firstText = await firstResponse.text();
-    expect(firstText).toContain("GENUINE_THOUGHT_BEFORE");
-    expect(firstText).not.toContain("Antigravity tool");
-    expect(firstText).not.toContain("duplicate-command");
-    let call: any;
-    if (stream) {
-      expect(firstText).toContain("GENUINE_THOUGHT_BEFORE");
-      const events = firstText.split("\n").filter((line) => line.startsWith("data: ")).map((line) => JSON.parse(line.slice(6)));
-      const starts = events.filter((event) => event.type === "content_block_start" && event.content_block.type === "tool_use");
-      expect(starts).toHaveLength(1);
-      call = starts[0].content_block;
-      call.input = JSON.parse(events.find((event) => event.index === starts[0].index && event.delta?.type === "input_json_delta").delta.partial_json);
-    } else {
-      const first = JSON.parse(firstText);
-      expect(first.stop_reason).toBe("tool_use");
-      expect(first.content.filter((part: any) => part.type === "tool_use")).toHaveLength(1);
-      call = first.content.find((part: any) => part.type === "tool_use");
-    }
-    messages.push({ role: "assistant", content: [call] }, { role: "user", content: [result(call.id, "HOST_TOOL_DENIED", true)] });
-    const finalText = await (await send(session, messages, { stream })).text();
-    expect(finalText).not.toContain("Antigravity tool");
-    expect(finalText).toContain("GENUINE_THOUGHT_AFTER");
-    expect(finalText).toContain("context compacted");
-    expect(finalText).toContain("HOST_TOOL_DENIED");
-    expect(finalText).toContain('"stop_reason":"end_turn"');
-  }
+  const session = "activity-false";
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP_ACTIVITY" }];
+  const first = await (await send(session, messages)).json();
+  expect(JSON.stringify(first)).toContain("GENUINE_THOUGHT_BEFORE");
+  expect(JSON.stringify(first)).not.toContain("Antigravity tool");
+  expect(JSON.stringify(first)).not.toContain("duplicate-command");
+  expect(first.stop_reason).toBe("tool_use");
+  expect(first.content.filter((part: any) => part.type === "tool_use")).toHaveLength(1);
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  messages.push({ role: "assistant", content: [call] }, { role: "user", content: [result(call.id, "HOST_TOOL_DENIED", true)] });
+  const final = await (await send(session, messages)).json();
+  expect(JSON.stringify(final)).not.toContain("Antigravity tool");
+  expect(JSON.stringify(final)).toContain("GENUINE_THOUGHT_AFTER");
+  expect(JSON.stringify(final)).toContain("context compacted");
+  expect(JSON.stringify(final)).toContain("HOST_TOOL_DENIED");
+  expect(final.stop_reason).toBe("end_turn");
 });
 
 test("quota rejection evidence cannot erase already emitted and completed host calls", async () => {

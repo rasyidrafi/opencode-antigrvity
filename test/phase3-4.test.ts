@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { AgyError, retryAfterSeconds } from "../src/errors.js";
 import { usageFromAcp, mapAcpEvent, collectTurn } from "../src/translate.js";
-import { errorType } from "../src/proxy.js";
+import { errorType } from "../src/errors.js";
 import { observeContext, readContextSnapshot } from "../src/telemetry.js";
 import { sessionStore } from "../src/session-store.js";
 import { classifyProviderFailure } from "@opencode/ai/provider-error";

@@ -5,7 +5,6 @@ import {
   EFFORT_HEADER,
   LOCAL_API_KEY,
   MODEL_HEADER,
-  MESSAGE_HEADER,
   PROVIDER_ID,
   PROVIDER_NAME,
   REQUEST_KIND_HEADER,
@@ -13,7 +12,7 @@ import {
 } from "./constants.js";
 import { refreshModelMetadata, researchedMetadataFor } from "./model-metadata.js";
 import { fallbackAcpModelCatalog, type AcpModel, type AcpModelCatalog } from "./models.js";
-import { getProxyBaseUrl, getProxyRuntime, onModelCatalogChange, startProxy, stopProxy } from "./proxy.js";
+import { getRuntime, onModelCatalogChange, startRuntime, stopRuntime } from "./runtime.js";
 import { WorkspaceRegistry } from "./workspace-registry.js";
 import { closeHostBridges } from "./host-tools.js";
 import { sessionStore } from "./session-store.js";
@@ -22,22 +21,19 @@ import { BoundedRetryQueue } from "./bounded-retry-queue.js";
 import { ContextTelemetry } from "./telemetry-rpc.js";
 import { onContextSnapshot, readContextSnapshot, markContextStale } from "./telemetry.js";
 import { AgyError, retryAfterSeconds } from "./errors.js";
-import { withAgentSystem } from "./request-instructions.js";
 import { warn, info as lifecycleInfo } from "./log.js";
+import { AGENT_OPTION, AntigravityLanguageModel } from "./language-model.js";
 
 export const PLUGIN_ID = "opencode-antigravity";
 export const INTEGRATION_ID = PROVIDER_ID;
-const PROVIDER_PACKAGE = "@opencode/ai/providers/anthropic";
+export const PROVIDER_PACKAGE = "aisdk:antigravity";
 
-async function retainWorkspace(directory: string): Promise<string> {
-  const root = resolvePath(directory);
-  await startProxy(root);
-  return root;
+async function retainWorkspace(directory: string): Promise<void> {
+  await startRuntime(resolvePath(directory));
 }
 
 async function releaseWorkspace(directory: string): Promise<void> {
-  const root = resolvePath(directory);
-  await stopProxy(root);
+  await stopRuntime(resolvePath(directory));
 }
 
 function providerModel(model: AcpModel): Model.Info {
@@ -134,7 +130,6 @@ export const AntigravityPlugin = Plugin.define({
         integrationID: Integration.ID.make(INTEGRATION_ID),
         package: PROVIDER_PACKAGE,
         settings: {
-          baseURL: getProxyBaseUrl(),
           provider: PROVIDER_ID,
           apiKey: LOCAL_API_KEY,
         },
@@ -158,7 +153,7 @@ export const AntigravityPlugin = Plugin.define({
       }
 
       await ctx.provider.transform((editor) => {
-        editor.add({ info, models: buildProviderModels(getProxyRuntime()?.catalog ?? fallbackAcpModelCatalog()) });
+        editor.add({ info, models: buildProviderModels(getRuntime()?.catalog ?? fallbackAcpModelCatalog()) });
       });
       unsubscribe = onModelCatalogChange(() => { void ctx.provider.reload().catch(() => undefined); });
       const refreshMetadata = () => { void refreshModelMetadata().then(() => { if (!disposed) return ctx.provider.reload(); }).catch(() => undefined); };
@@ -171,8 +166,6 @@ export const AntigravityPlugin = Plugin.define({
         while (!events.signal.aborted) {
         try {
           if (attempts) {
-            // Missing events never authorize resume: force alignment/rebuild
-            // from the next authoritative request, retaining durable results.
             for (const [sessionID, expectedBindings] of lostBindings) {
               if (await sessionStore.isHostDeleted(sessionID)) { await sessionStore.removeHostSession(sessionID); continue; }
               await sessionStore.reconcileLostBinding(sessionID, expectedBindings, async () => {
@@ -188,9 +181,6 @@ export const AntigravityPlugin = Plugin.define({
             attempts = 0;
             const e = event as { id?: string; type?: string; data?: { sessionID?: string; messageID?: string; id?: string } };
             if (e.type === "session.deleted" && e.data?.sessionID) {
-              // The queue owns tombstone persistence too. Enqueue first so a
-              // transient write failure remains retryable instead of losing
-              // this lifecycle event before it reaches the durable backlog.
               await deletionQueue.enqueue(e.data.sessionID);
               continue;
             }
@@ -222,17 +212,17 @@ export const AntigravityPlugin = Plugin.define({
         }
       })();
 
-      for (const kind of ["context", "compaction", "generate", "title"] as const) {
-        await ctx.session.hook(kind, stripAcpOwnedOptions, { providerID: PROVIDER_ID });
+      // The agent system travels in provider options; the adapter reads it from
+      // the same key the session hook wrote under. OpenCode's assembled system
+      // is not forwarded to ACP for primary requests.
+      for (const kind of ["context", "compaction", "generate"] as const) {
+        await ctx.session.hook(kind, async (event) => {
+          stripAcpOwnedOptions(event);
+          const agent = await ctx.agent.get({ agentID: event.agent });
+          event.options[AGENT_OPTION] = agent.data.system ?? "";
+        }, { providerID: PROVIDER_ID });
       }
-
-      // Read the agent itself, not the system assembled from host instructions,
-      // skills and environment. A failed lookup must not leak the generated system.
-      await ctx.session.hook("http.request", async event => {
-        if (event.kind !== "primary") return;
-        const agent = await ctx.agent.get({ agentID: event.agent });
-        event.request = await withAgentSystem(event.request, agent.data.system);
-      }, { providerID: PROVIDER_ID });
+      await ctx.session.hook("title", stripAcpOwnedOptions, { providerID: PROVIDER_ID });
 
       await ctx.session.hook("retry", event => {
         if (!event.decision.retry) return;
@@ -242,9 +232,13 @@ export const AntigravityPlugin = Plugin.define({
           event.decision = { retry: false };
           return;
         }
-        // Mid-stream Anthropic errors have no HTTP Retry-After header. V2
-        // retains the raw provider body on SessionError, so honor our normalized
-        // seconds hint here without changing the host's retry eligibility.
+        // AI SDK errors carry the provider's normalized hint directly; the
+        // response body is still parsed for older shapes.
+        const retryAfterMs = (event.error as { retryAfterMs?: unknown }).retryAfterMs;
+        if (typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+          event.decision.delay = Math.ceil(retryAfterMs);
+          return;
+        }
         try {
           const payload = JSON.parse(event.error.response?.body ?? "null");
           const seconds = payload?.error?.retry_after;
@@ -263,21 +257,30 @@ export const AntigravityPlugin = Plugin.define({
           const session = await ctx.session.get({ sessionID: event.sessionID });
           const directory = session.location.directory;
           await workspaces.add(directory);
-          event.baseURL = getProxyBaseUrl();
-          event.headers["x-api-key"] = LOCAL_API_KEY;
-          for (const header of Object.keys(event.headers)) {
-            if (header.toLowerCase() === "authorization") delete event.headers[header];
-          }
           event.headers[MODEL_HEADER] = event.model.id;
           if (event.model.variant && event.model.variant !== "default") event.headers[EFFORT_HEADER] = event.model.variant;
           else delete event.headers[EFFORT_HEADER];
           event.headers[DIRECTORY_HEADER] = directory;
           event.headers[SESSION_HEADER] = event.sessionID;
-          event.headers["x-opencode-antigravity-host-tools"] = "1";
           event.headers[REQUEST_KIND_HEADER] = requestKind(event.kind);
-          // V2's model.request event has no messageID. The proxy uses its stable
-          // request-content hash for replay protection when this header is absent.
-          delete event.headers[MESSAGE_HEADER];
+          // The LanguageModelV3 route has no HTTP authorization to replace;
+          // the host's bearer header is transport metadata and never reaches ACP.
+          for (const header of Object.keys(event.headers)) {
+            if (header.toLowerCase() === "authorization") delete event.headers[header];
+          }
+        },
+        { providerID: PROVIDER_ID },
+      );
+
+      // Supply the LanguageModelV3 for this provider: OpenCode calls it instead
+      // of loading an npm package or talking to an HTTP endpoint.
+      await ctx.aisdk.hook(
+        "sdk",
+        (event) => {
+          event.sdk = {
+            languageModel: (modelID: string) =>
+              new AntigravityLanguageModel(modelID, event.options, event.model.canonical ?? event.model.providerID),
+          };
         },
         { providerID: PROVIDER_ID },
       );
@@ -304,14 +307,7 @@ export const AntigravityPlugin = Plugin.define({
 
 export { acpModelCatalog, fallbackAcpModelCatalog } from "./models.js";
 export { detectAcpServer } from "./acp-detect.js";
-export {
-  getProxyBaseUrl,
-  getProxyPort,
-  getProxyRuntime,
-  refreshModels,
-  startProxy,
-  stopProxy,
-} from "./proxy.js";
+export { getRuntime, refreshModels } from "./runtime.js";
 export { sessionPool } from "./session-pool.js";
 
 export default AntigravityPlugin;

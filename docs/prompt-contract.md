@@ -1,10 +1,13 @@
 # Host prompt contract
 
-For primary Antigravity requests, the plugin replaces OpenCode's assembled
-system text at the HTTP request hook with the active agent's `system` field.
-This excludes generated skills, AGENTS.md instructions, model identity and
-environment metadata. A missing, empty or whitespace-only field means no
-instructions; agent lookup failures propagate instead of falling back.
+The plugin is an OpenCode `LanguageModelV3` provider (`aisdk:antigravity`), so
+OpenCode calls `doStream` in-process and owns the agent loop. For primary
+Antigravity requests, the `context` session hook writes the active agent's
+`system` field into provider options; the adapter forwards that text and drops
+OpenCode's assembled system message. This excludes generated skills, AGENTS.md
+instructions, model identity and environment metadata. A missing, empty or
+whitespace-only field means no instructions; agent lookup failures propagate
+instead of falling back.
 
 The adapter sends a nonempty agent prompt as one text block:
 

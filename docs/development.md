@@ -44,12 +44,13 @@ Do not trust dependencies broadly: Koffi's optional platform package supplies
 its prebuilt native binary, so its Node-based install script is intentionally
 left untrusted. A clean Bun install and Koffi import were verified on Linux.
 
-## Anthropic usage fallback
+## Usage fallback
 
 ACP prompt-response usage is authoritative when present, including explicit
-zero values. If it is absent, the proxy may report a fresh measured context
-occupancy as `input_tokens` with zero output tokens. This is an approximation
-of the current context, not per-request token accounting or billing usage.
+zero values. If it is absent, the language model may report a fresh measured
+context occupancy as input tokens with zero output tokens. This is an
+approximation of the current context, not per-request token accounting or
+billing usage.
 Fallback measurements stay bound to the response receipt and execution
 generation. A turn without a new sample may reuse the latest measurement from
 that same generation for up to five minutes, rechecked when each new terminal
@@ -71,8 +72,10 @@ files.
 
 ## Verified baseline
 
-Setup was verified with Bun 1.4.4: the build succeeded, with 205 tests passing,
-10 skipped, and no failures.
+Setup was verified with Bun 1.4.4: the build succeeded, with 200 tests passing,
+10 skipped, and no failures. The provider registers through OpenCode's
+`LanguageModelV3` AI SDK hook (`aisdk:antigravity`); there is no loopback HTTP
+proxy or Anthropic Messages emulation.
 
 A prior lockfile audit reported 4 dependency vulnerabilities (1 moderate,
 3 high). Dependency upgrades were deliberately left out of this migration;

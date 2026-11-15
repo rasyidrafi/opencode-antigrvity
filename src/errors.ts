@@ -109,6 +109,19 @@ export class AgyAbortError extends AgyError {
   }
 }
 
+/** Provider-facing error type, kept stable for host error classification. */
+export function errorType(error: AgyError): string {
+  if (error.kind === "context_overflow") return "context_length_exceeded";
+  if (error.kind === "auth") return "authentication_error";
+  if (error.kind === "quota") return "insufficient_quota";
+  if (error.kind === "rate_limit") return "rate_limit_error";
+  if (error.kind === "overload") return "overloaded_error";
+  if (error.kind === "refusal") return "content_policy_violation";
+  if (error.code === "agy_cancelled" || error.code === "agy_client_cancelled") return "invalid_request_error";
+  if (error.kind === "invalid_request" || error.kind === "unsupported" || error.kind === "unknown_model") return "invalid_request_error";
+  return "api_error";
+}
+
 export function asAgyError(error: unknown, fallback = "Antigravity request failed"): AgyError {
   if (error instanceof AgyError) return error;
   if (error instanceof Error) return new AgyError("internal", error.message || fallback, { cause: error });
