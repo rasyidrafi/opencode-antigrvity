@@ -157,6 +157,7 @@ export class ModelCatalog {
         // Store choices, not arbitrary server payloads or authentication data.
         await writeFile(temporary, JSON.stringify({ schema: 1, discoveredAt: catalog.discoveredAt,
           version: catalog.version, currentModel: catalog.currentModel,
+          ...(catalog.thinking ? { thinking: catalog.thinking } : {}),
           entries: catalog.exactModels.map((model) => [model.id, model.name]),
         }), { mode: 0o600, flag: "wx" });
         await rename(temporary, path);
@@ -168,8 +169,13 @@ export class ModelCatalog {
     const data = await jsonFile(join(context.cacheDirectory, `${context.scope}.json`));
     if (data.schema !== 1 || !Array.isArray(data.entries) || !Number.isFinite(data.discoveredAt) || data.discoveredAt > Date.now() ||
         !data.entries.every((entry: unknown) => Array.isArray(entry) && entry.length === 2 && entry.every((value) => typeof value === "string"))) return;
+    const thinking = data.thinking && typeof data.thinking === "object" && Array.isArray(data.thinking.values) &&
+      data.thinking.values.every((value: unknown) => typeof value === "string") &&
+      (data.thinking.current === undefined || typeof data.thinking.current === "string")
+      ? { values: data.thinking.values as string[], ...(typeof data.thinking.current === "string" ? { current: data.thinking.current } : {}) }
+      : undefined;
     const catalog = acpModelCatalog(context.executable, typeof data.version === "string" ? data.version : null, data.entries,
-      typeof data.currentModel === "string" ? data.currentModel : undefined);
+      typeof data.currentModel === "string" ? data.currentModel : undefined, thinking);
     catalog.source = "cache";
     catalog.discoveredAt = data.discoveredAt;
     if (!this.closed) this.adopt(catalog, false);

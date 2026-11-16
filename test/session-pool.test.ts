@@ -49,6 +49,29 @@ describe("session pool isolation", () => {
     }
   });
 
+  test("evicts by the injected clock, not wall time", async () => {
+    await chmod(fixture, 0o755);
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(join(tmpdir(), "opencode-antigravity-clock-"));
+    delete process.env.FAKE_ACP_STATE_FILE;
+    let now = 10_000;
+    const pool = new SessionPool({ maxSessions: 2, idleMs: 60_000, now: () => now });
+    try {
+      await turn(pool, "clock-a", "hello");
+      now = 5_000;
+      await turn(pool, "clock-b", "hello");
+      now = 6_000;
+      await turn(pool, "clock-c", "hello");
+      expect(pool.size).toBe(2);
+      // The injected clock says clock-b is oldest even though wall time says
+      // clock-a is. Eviction must follow the injected clock.
+      expect(await pool.status("clock-b")).toMatchObject({ workerState: "none" });
+      expect(await pool.status("clock-a")).toMatchObject({ workerState: "ready" });
+      expect(await pool.status("clock-c")).toMatchObject({ workerState: "ready" });
+    } finally {
+      await pool.close();
+    }
+  });
+
   test("persists an ACP session id and resumes it in a new pool", async () => {
     await chmod(fixture, 0o755);
     process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(join(tmpdir(), "opencode-antigravity-resume-"));

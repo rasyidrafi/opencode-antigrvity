@@ -141,10 +141,10 @@ export class SessionPool {
   private lifecycleController = new AbortController();
   private readonly now: () => number;
 
-  constructor(options: { maxQueue?: number; idleMs?: number; now?: () => number } = {}) {
+  constructor(options: { maxQueue?: number; maxSessions?: number; idleMs?: number; now?: () => number } = {}) {
     this.now = options.now ?? Date.now;
     this.maxQueue = Math.max(0, Math.floor(options.maxQueue ?? envNumber("OPENCODE_ANTIGRAVITY_MAX_QUEUE", DEFAULT_MAX_QUEUE_PER_SESSION, 0)));
-    this.maxSessions = Math.max(1, Math.floor(envNumber("OPENCODE_ANTIGRAVITY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS, 1)));
+    this.maxSessions = Math.max(1, Math.floor(options.maxSessions ?? envNumber("OPENCODE_ANTIGRAVITY_MAX_SESSIONS", DEFAULT_MAX_SESSIONS, 1)));
     this.idleMs = options.idleMs ?? envNumber("OPENCODE_ANTIGRAVITY_IDLE_WORKER_MS", DEFAULT_IDLE_WORKER_TIMEOUT_MS, 1_000);
     this.open();
   }
@@ -172,12 +172,12 @@ export class SessionPool {
         if (idle) await this.forgetWorker(idle[0]);
       }
       if (this.entries.size >= this.maxSessions) throw new AgyBusyError("The Antigravity session pool has reached its session limit");
-      entry = { tail: Promise.resolve(), pending: 0, lastUsedAt: Date.now(), turnCount: 0, historyTransferred: false };
+      entry = { tail: Promise.resolve(), pending: 0, lastUsedAt: this.now(), turnCount: 0, historyTransferred: false };
       this.entries.set(request.key, entry);
     }
     if (entry.pending > this.maxQueue) throw new AgyBusyError();
     entry.pending += 1;
-    entry.lastUsedAt = Date.now();
+    entry.lastUsedAt = this.now();
     const signal = combineSignals(request.signal, this.lifecycleController.signal);
     let release!: () => void;
     const previous = entry.tail.catch(() => undefined);
@@ -208,7 +208,7 @@ export class SessionPool {
     } finally {
       void previous.then(release);
       entry.pending = Math.max(0, entry.pending - 1);
-      entry.lastUsedAt = Date.now();
+      entry.lastUsedAt = this.now();
     }
   }
 
@@ -427,7 +427,7 @@ export class SessionPool {
 
   async cleanup(): Promise<void> {
     if (this.disposed) return;
-    const threshold = Date.now() - this.idleMs;
+    const threshold = this.now() - this.idleMs;
     for (const [key, entry] of this.entries) {
       if (entry.pending === 0 && entry.lastUsedAt < threshold) {
         this.entries.delete(key);

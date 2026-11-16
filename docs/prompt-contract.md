@@ -3,17 +3,20 @@
 The plugin is an OpenCode `LanguageModelV3` provider (`aisdk:antigravity`), so
 OpenCode calls `doStream` in-process and owns the agent loop. For primary
 Antigravity requests, the `context` session hook writes the active agent's
-`system` field into provider options; the adapter forwards that text and drops
-OpenCode's assembled system message. This excludes generated skills, AGENTS.md
-instructions, model identity and environment metadata. A missing, empty or
-whitespace-only field means no instructions; agent lookup failures propagate
-instead of falling back.
+`system` field and OpenCode's instruction sources into provider options; the
+adapter forwards both and drops OpenCode's assembled system message. Instruction
+sources include AGENTS.md files, generated skills, MCP guidance and project
+references; OpenCode's date and environment are omitted because the ACP harness
+supplies its own. A missing, empty or whitespace-only field means no
+instructions; agent lookup failures propagate instead of falling back.
 
-The adapter sends a nonempty agent prompt as one text block:
+The adapter sends a nonempty agent prompt and instructions as one text block:
 
 ```xml
 <instruction>
 Configured agent system prompt, unchanged.
+
+OpenCode instruction sources, unchanged.
 </instruction>
 ```
 
@@ -31,4 +34,7 @@ field with a server named `external_tool`; model selection is unchanged.
 
 These rules govern the host input to ACP, not Antigravity's own internal
 system prompt/metadata. Auxiliary title/generate requests keep their dedicated
-utility behavior. This does not promise to resolve Google location restrictions.
+utility behavior. Compaction also runs as an isolated summary turn: its result
+lets the host rewrite history, and the next primary request reseeds a fresh ACP
+session from that rewritten history. This does not promise to resolve Google
+location restrictions.

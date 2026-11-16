@@ -10,6 +10,10 @@ export type AcpModel = {
   variants?: Record<string, { effort: AcpEffort; acpModel: string }>;
 };
 
+/** Runtime 1.4 reports thinking as its own session option instead of encoding
+ * it in the model id. The values are the same effort names. */
+export type AcpThinking = { values: string[]; current?: string };
+
 export type AcpModelCatalog = {
   models: AcpModel[];
   exactModels: AcpModel[];
@@ -17,6 +21,7 @@ export type AcpModelCatalog = {
   executable: string;
   discoveredAt: number;
   currentModel?: string;
+  thinking?: AcpThinking;
   source: "acp" | "cache" | "empty";
 };
 
@@ -27,6 +32,7 @@ export function acpModelCatalog(
   version: string | null = null,
   entries: Array<[string, string]> = [],
   currentModel?: string,
+  thinking?: AcpThinking,
 ): AcpModelCatalog {
   const ids = new Set(entries.map(([id]) => id));
   const seen = new Set<string>();
@@ -60,7 +66,7 @@ export function acpModelCatalog(
       variants: Object.fromEntries(members.map((member) => [member.effort!, { effort: member.effort!, acpModel: member.id }])),
     });
   }
-  return { models, exactModels: exact, executable, version, currentModel, discoveredAt: Date.now(), source: "acp" };
+  return { models, exactModels: exact, executable, version, currentModel, ...(thinking ? { thinking } : {}), discoveredAt: Date.now(), source: "acp" };
 }
 
 /** No invented availability when discovery has never succeeded. */
@@ -75,6 +81,9 @@ export function catalogFromSession(response: unknown, executable: string, versio
   const model = Array.isArray(data.configOptions)
     ? data.configOptions.find((option: any) => option?.category === "model") ?? data.configOptions.find((option: any) => option?.id === "model")
     : undefined;
+  const thinkingOption = Array.isArray(data.configOptions)
+    ? data.configOptions.find((option: any) => option?.category === "thought_level" || option?.id === "thought_level" || option?.id === "effort" || option?.id === "reasoning_effort")
+    : undefined;
   const entries: Array<[string, string]> = [];
   const flatten = (options: unknown[]) => {
     for (const option of options) {
@@ -84,15 +93,30 @@ export function catalogFromSession(response: unknown, executable: string, versio
       else if (typeof entry.value === "string" && entry.value) entries.push([entry.value, typeof entry.name === "string" ? entry.name : entry.value]);
     }
   };
+  const thinkingValues: string[] = [];
+  if (thinkingOption && Array.isArray(thinkingOption.options)) {
+    for (const option of thinkingOption.options) {
+      if (!option || typeof option !== "object") continue;
+      const entry = option as Record<string, any>;
+      if (Array.isArray(entry.options)) {
+        for (const nested of entry.options) if (typeof nested?.value === "string" && nested.value) thinkingValues.push(nested.value);
+      } else if (typeof entry.value === "string" && entry.value) {
+        thinkingValues.push(entry.value);
+      }
+    }
+  }
+  const thinking: AcpThinking | undefined = thinkingOption && thinkingValues.length
+    ? { values: thinkingValues, ...(typeof thinkingOption.currentValue === "string" ? { current: thinkingOption.currentValue } : {}) }
+    : undefined;
   if (model && Array.isArray(model.options)) {
     flatten(model.options);
-    return acpModelCatalog(executable, version, entries, typeof model.currentValue === "string" ? model.currentValue : undefined);
+    return acpModelCatalog(executable, version, entries, typeof model.currentValue === "string" ? model.currentValue : undefined, thinking);
   }
   if (Array.isArray(data.models?.availableModels)) {
     for (const entry of data.models.availableModels) {
       if (typeof entry?.modelId === "string" && entry.modelId) entries.push([entry.modelId, typeof entry.name === "string" ? entry.name : entry.modelId]);
     }
-    return acpModelCatalog(executable, version, entries, data.models.currentModelId);
+    return acpModelCatalog(executable, version, entries, data.models.currentModelId, thinking);
   }
 }
 
@@ -101,17 +125,38 @@ export type AcpModelSelection = { requestedModel: string; acpModel: string; effo
 export function resolveAcpModelSelection(requestedModel: string | undefined, requestedEffort: string | undefined, catalog: AcpModelCatalog): AcpModelSelection {
   const raw = (requestedModel ?? catalog.models[0]?.id ?? "").replace(/^antigravity\//, "").trim();
   if (!raw) throw new AgyError("unknown_model", "Antigravity model discovery has not returned any available models", { code: "agy_no_model" });
-  const model = catalog.models.find((entry) => entry.id === raw) ?? catalog.exactModels.find((entry) => entry.id === raw);
+  let model = catalog.models.find((entry) => entry.id === raw) ?? catalog.exactModels.find((entry) => entry.id === raw);
+  let effort = requestedEffort?.trim().toLowerCase();
+  if (!model) {
+    // Runtime 1.4 lists the family id (`gemini-3.8-flash`) where 1.3 listed
+    // effort-suffixed ids. The agent still accepts the old id, so map it back
+    // to the family and carry the suffix as the thinking level.
+    const legacy = raw.match(/^(.*)-(low|medium|high)$/);
+    if (legacy) {
+      const family = catalog.models.find((entry) => entry.id === legacy[1]) ?? catalog.exactModels.find((entry) => entry.id === legacy[1]);
+      if (family) {
+        model = family;
+        effort = effort ?? legacy[2];
+      }
+    }
+  }
   if (!model) throw new AgyError("unknown_model", `Unknown Antigravity model "${raw}"`, { code: "agy_unknown_model", details: { available: catalog.exactModels.map((entry) => entry.id) } });
-  const effort = requestedEffort?.trim().toLowerCase();
   if (!effort || effort === "default") return { requestedModel: raw, acpModel: model.acpModel };
   if (!(SUPPORTED_EFFORTS as readonly string[]).includes(effort)) throw new AgyError("invalid_request", `Unsupported effort "${effort}"`, { code: "agy_invalid_effort" });
-  const variant = model.variants?.[effort];
+  const level = effort as AcpEffort;
+  if (catalog.thinking) {
+    // 1.4 applies thinking through its own session option, not a model id.
+    if (catalog.thinking.values.length && !catalog.thinking.values.includes(level)) {
+      throw new AgyError("invalid_request", `Antigravity did not advertise effort "${level}" for "${raw}"`, { code: "agy_invalid_effort", details: { available: catalog.thinking.values } });
+    }
+    return { requestedModel: raw, acpModel: model.acpModel, effort: level };
+  }
+  const variant = model.variants?.[level];
   if (variant) return { requestedModel: raw, acpModel: variant.acpModel };
-  const sibling = model.family && catalog.exactModels.find((entry) => entry.family === model.family && entry.effort === effort);
+  const sibling = model.family && catalog.exactModels.find((entry) => entry.family === model.family && entry.effort === level);
   if (sibling) return { requestedModel: raw, acpModel: sibling.acpModel };
-  if (model.effort === effort) return { requestedModel: raw, acpModel: model.acpModel };
-  throw new AgyError("invalid_request", `Antigravity did not advertise effort "${effort}" for "${raw}"`, { code: "agy_invalid_effort" });
+  if (model.effort === level) return { requestedModel: raw, acpModel: model.acpModel };
+  throw new AgyError("invalid_request", `Antigravity did not advertise effort "${level}" for "${raw}"`, { code: "agy_invalid_effort" });
 }
 
 export function providerModelEntries(catalog: AcpModelCatalog): AcpModel[] { return catalog.models; }

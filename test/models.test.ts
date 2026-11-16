@@ -52,6 +52,26 @@ test("ACP config options win over legacy models and preserve opaque wire IDs", (
   expect(buildProviderModels(catalog)[1].name).toContain("limits estimated");
 });
 
+test("1.4 family ids and thought_level replace effort-suffixed model ids", () => {
+  const catalog = catalogFromSession({
+    configOptions: [
+      { id: "model", category: "model", currentValue: "gemini-3.8-flash", options: [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }] },
+      { id: "thought_level", category: "thought_level", currentValue: "high", options: [{ value: "low" }, { value: "medium" }, { value: "high" }] },
+    ],
+  }, "fake")!;
+  expect(catalog.thinking).toEqual({ values: ["low", "medium", "high"], current: "high" });
+  expect(resolveAcpModelSelection("gemini-3.8-flash", "high", catalog)).toEqual({ requestedModel: "gemini-3.8-flash", acpModel: "gemini-3.8-flash", effort: "high" });
+  // A 1.3-style id still resolves to the 1.4 family plus its thinking level.
+  expect(resolveAcpModelSelection("gemini-3.8-flash-high", undefined, catalog)).toEqual({ requestedModel: "gemini-3.8-flash-high", acpModel: "gemini-3.8-flash", effort: "high" });
+  const limited = catalogFromSession({
+    configOptions: [
+      { id: "model", category: "model", currentValue: "gemini-3.8-flash", options: [{ value: "gemini-3.8-flash" }] },
+      { id: "thought_level", category: "thought_level", options: [{ value: "low" }, { value: "high" }] },
+    ],
+  }, "fake")!;
+  expect(() => resolveAcpModelSelection("gemini-3.8-flash", "medium", limited)).toThrow(/did not advertise/);
+});
+
 test("missing, empty, legacy, and colliding catalogs do not invent model availability", () => {
   expect(fallbackAcpModelCatalog().models).toEqual([]);
   expect(catalogFromSession({ configOptions: [] }, "fake")).toBeUndefined();

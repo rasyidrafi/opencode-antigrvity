@@ -34,7 +34,9 @@ export function contextOccupancyForExecution(
       typeof observedAt !== "number" || !Number.isFinite(observedAt) || observedAt <= 0) return undefined;
   const age = now - observedAt;
   if (age < 0 || age >= 300_000) return undefined;
-  return { used, observedAt };
+  // Occupancy is a share of the advertised window; a server that reports more
+  // used tokens than its own size must not surface as more than 100%.
+  return { used: Math.min(used, size), observedAt };
 }
 
 /** Freeze a candidate for one new response, rechecking its age at emission. */
@@ -94,7 +96,7 @@ export async function observeContext(hostSessionID: string, epoch: number, sourc
   const binding = await sessionStore.executionBinding(hostSessionID);
   if (binding && (binding.generation !== executionGeneration || binding.sourceSessionID !== sourceSessionID)) return undefined;
   const previous = await sessionStore.contextSnapshot(hostSessionID);
-  const snapshot: ContextSnapshot = { version: 1, hostSessionID, epoch, sourceSessionID, requestedModel, ...(actualModel ? { model: actualModel } : {}), baseline, sequence: (previous?.sequence ?? 0) + 1, observedAt: now, used: sample.used, size: sample.size, state: "measured" };
+  const snapshot: ContextSnapshot = { version: 1, hostSessionID, epoch, sourceSessionID, requestedModel, ...(actualModel ? { model: actualModel } : {}), baseline, sequence: (previous?.sequence ?? 0) + 1, observedAt: now, used: Math.min(sample.used, sample.size), size: sample.size, state: "measured" };
   if (executionGeneration) snapshot.executionGeneration = executionGeneration;
   await sessionStore.saveContextSnapshot(hostSessionID, snapshot);
   await publishContextSnapshot(hostSessionID);

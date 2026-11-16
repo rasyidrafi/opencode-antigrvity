@@ -1,4 +1,5 @@
-import { chmod } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
@@ -144,21 +145,71 @@ describe("ACP process manager", () => {
     }
   });
 
-  test("rejects native tool permission requests", async () => {
+  test("surfaces and denies native tool permission requests by default", async () => {
     await chmod(fixture, 0o755);
     const worker = await createAcpWorker({ cwd: process.cwd(), executable: fixture, model: "fake-model-low" });
-    let sawTool = false;
+    let surface: { title?: string; status?: string } | undefined;
     let stopReason: string | undefined;
     try {
       for await (const event of worker.runTurn("FAKE_PERMISSION")) {
-        if (event.event === "update" && (event.update as { sessionUpdate?: string }).sessionUpdate === "tool_call") sawTool = true;
+        if (event.event === "update" && (event.update as { sessionUpdate?: string }).sessionUpdate === "tool_call") {
+          const update = event.update as { title?: string; status?: string };
+          if (update.title?.includes("(denied)")) surface = update;
+        }
         if (event.event === "result") stopReason = event.result.stopReason;
       }
     } finally {
       await worker.stop(true);
     }
-    expect(sawTool).toBe(false);
+    expect(surface?.status).toBe("failed");
     expect(stopReason).toBe("cancelled");
+  });
+
+  test("allows native tool permission requests when the policy permits them", async () => {
+    await chmod(fixture, 0o755);
+    const worker = await createAcpWorker({ cwd: process.cwd(), executable: fixture, model: "fake-model-low", permissionPolicy: "allow" });
+    let surface: { title?: string; status?: string } | undefined;
+    let stopReason: string | undefined;
+    try {
+      for await (const event of worker.runTurn("FAKE_PERMISSION")) {
+        if (event.event === "update" && (event.update as { sessionUpdate?: string }).sessionUpdate === "tool_call") {
+          const update = event.update as { title?: string; status?: string };
+          if (update.title?.includes("(allowed)")) surface = update;
+        }
+        if (event.event === "result") stopReason = event.result.stopReason;
+      }
+    } finally {
+      await worker.stop(true);
+    }
+    expect(surface?.status).toBe("completed");
+    expect(stopReason).toBe("end_turn");
+  });
+
+  test("applies 1.4 thought_level instead of a model variant", async () => {
+    await chmod(fixture, 0o755);
+    const directory = await mkdtemp(join(tmpdir(), "agy-thought-level-"));
+    const log = join(directory, "rpc.jsonl");
+    const worker = await createAcpWorker({
+      cwd: process.cwd(),
+      executable: fixture,
+      model: "gemini-3.8-flash",
+      effort: "high",
+      environment: { FAKE_ACP_THOUGHT_LEVEL: "1", FAKE_ACP_RPC_LOG: log },
+    });
+    try {
+      const rpcs = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(rpcs).toContainEqual(expect.objectContaining({
+        method: "session/set_config_option",
+        params: expect.objectContaining({ configId: "thought_level", value: "high" }),
+      }));
+      expect(rpcs).toContainEqual(expect.objectContaining({
+        method: "session/set_config_option",
+        params: expect.objectContaining({ configId: "model", value: "gemini-3.8-flash" }),
+      }));
+    } finally {
+      await worker.stop(true);
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   test("never sends authenticate even with an explicit OAuth method", async () => {

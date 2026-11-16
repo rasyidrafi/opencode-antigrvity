@@ -48,9 +48,10 @@ test("occupancy replaces samples and rejects outdated execution generations", as
     expect((await readContextSnapshot("host")).used).toBe(8_000);
     expect((await readContextSnapshot("host")).sequence).toBe(3);
     await observeContext("host", 0, "remote", "requested", { used: 120_000, size: 100_000 }, "boundary", "actual-fallback");
-    expect(await readContextSnapshot("host")).toMatchObject({ used: 120_000, requestedModel: "requested", model: "actual-fallback" });
+    // Occupancy is a share of the advertised window; it never exceeds 100%.
+    expect(await readContextSnapshot("host")).toMatchObject({ used: 100_000, requestedModel: "requested", model: "actual-fallback" });
     await observeContext("host", 0, "remote", "requested", { used: -1, size: 100_000 });
-    expect((await readContextSnapshot("host")).used).toBe(120_000);
+    expect((await readContextSnapshot("host")).used).toBe(100_000);
     await sessionStore.saveExecutionBinding("host", { generation: "new", sourceSessionID: "remote" });
     await observeContext("host", 0, "remote", "model", { used: 99_000, size: 100_000 }, undefined, undefined, "old");
     expect((await readContextSnapshot("host")).state).toBe("unknown");

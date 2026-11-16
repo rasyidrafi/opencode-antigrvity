@@ -20,6 +20,7 @@ export const DEFAULT_SSE_HEARTBEAT_MS = 5_000;
 export const MODEL_HEADER = "x-opencode-antigravity-model";
 export const EFFORT_HEADER = "x-opencode-antigravity-effort";
 export const SESSION_HEADER = "x-opencode-antigravity-session";
+export const FORK_HEADER = "x-opencode-antigravity-fork";
 export const DIRECTORY_HEADER = "x-opencode-antigravity-directory";
 export const MESSAGE_HEADER = "x-opencode-antigravity-message";
 export const REQUEST_KIND_HEADER = "x-opencode-antigravity-request-kind";
@@ -27,6 +28,14 @@ export const REQUEST_TOKEN_HEADER = "x-opencode-antigravity-token";
 
 export const SUPPORTED_EFFORTS = ["low", "medium", "high"] as const;
 export type AcpEffort = (typeof SUPPORTED_EFFORTS)[number];
+
+/** Antigravity's own tool approvals. OpenCode's tools are gated by OpenCode. */
+export type AcpPermissionPolicy = "allow" | "deny";
+
+export function configuredPermissionPolicy(): AcpPermissionPolicy {
+  const value = process.env.OPENCODE_ANTIGRAVITY_ACP_PERMISSION?.trim().toLowerCase();
+  return value === "allow" || value === "allow-always" ? "allow" : "deny";
+}
 
 export function envNumber(name: string, fallback: number, minimum = 0): number {
   const value = Number(process.env[name]);

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelCatalog, type CatalogContext } from "../src/model-catalog.js";
-import { acpModelCatalog } from "../src/models.js";
+import { acpModelCatalog, resolveAcpModelSelection } from "../src/models.js";
 import { emitAcpCatalog } from "../src/catalog-events.js";
 
 test("malformed inventory caches are quarantined and never create available models", async () => {
@@ -60,6 +60,24 @@ test("discovery is coalesced, caches last success, isolates accounts, and ignore
     expect(changes.at(-1)).toEqual(["new-id"]);
     emitAcpCatalog("account-b", acpModelCatalog("fake", "test", []));
     expect(manager.catalog.models).toEqual([]);
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("cached 1.4 catalogs retain their thinking dialect", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-catalog-thinking-"));
+  const context = async (): Promise<CatalogContext> => ({ scope: "account", executable: "fake", args: [], cacheDirectory: directory });
+  const probe = async () => acpModelCatalog("fake", "1.4.5", [["gemini-3.8-flash", "Gemini 3.8 Flash"]], "gemini-3.8-flash", { values: ["low", "medium", "high"], current: "high" });
+  let manager = new ModelCatalog(directory, { context, probe });
+  try {
+    await manager.refresh();
+    expect(manager.catalog.thinking).toEqual({ values: ["low", "medium", "high"], current: "high" });
+    await manager.close();
+    manager = new ModelCatalog(directory, { context, probe: async () => { throw new Error("offline"); } });
+    await manager.refresh();
+    expect(manager.catalog.source).toBe("cache");
+    expect(manager.catalog.thinking).toEqual({ values: ["low", "medium", "high"], current: "high" });
+    expect(resolveAcpModelSelection("gemini-3.8-flash", "high", manager.catalog)).toEqual({ requestedModel: "gemini-3.8-flash", acpModel: "gemini-3.8-flash", effort: "high" });
+    expect(resolveAcpModelSelection("gemini-3.8-flash-high", undefined, manager.catalog)).toEqual({ requestedModel: "gemini-3.8-flash-high", acpModel: "gemini-3.8-flash", effort: "high" });
   } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
 

@@ -21,7 +21,7 @@ import { emitAcpCatalog } from "../src/catalog-events.js";
 import { acpModelCatalog } from "../src/models.js";
 import { AsyncEventQueue } from "../src/acp-process.js";
 import { driveBridge, driveModel, textOf } from "./fixtures/drive.js";
-import { AGENT_OPTION, AntigravityLanguageModel } from "../src/language-model.js";
+import { AGENT_OPTION, AntigravityLanguageModel, INSTRUCTIONS_OPTION } from "../src/language-model.js";
 
 const user = (text: string) => ({ role: "user" as const, content: [{ type: "text" as const, text }] });
 
@@ -152,10 +152,22 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
   for (const kind of ["context", "compaction", "generate"] as const) {
     const hook = hooks.get(kind)!;
     expect(hook.options).toEqual({ providerID: PROVIDER_ID });
-    const request = { agent: "build", options: { temperature: 0.5, reasoningEffort: "high", maxTokens: 1024 } };
+    const request = {
+      agent: "build",
+      options: { temperature: 0.5, reasoningEffort: "high", maxTokens: 1024 },
+      system: [
+        { text: "OpenCode built-in prompt" },
+        { text: "AGENTS.md rules", metadata: { experimental: { instructions: [{ key: "project/AGENTS.md", text: "AGENTS.md rules" }] } } },
+        { text: "2026-01-01", metadata: { experimental: { instructions: [{ key: "core/date", text: "2026-01-01" }] } } },
+        { text: "linux", metadata: { experimental: { instructions: [{ key: "core/environment", text: "linux" }] } } },
+        { text: "Skill guidance" },
+        { text: "Malformed fallback", metadata: { experimental: { instructions: [{ key: 1, text: "bad" }] } } },
+      ],
+    };
     await hook.callback(request);
     expect(request.options.maxTokens).toBe(1024);
     expect(request.options[AGENT_OPTION]).toBe(configuredSystem);
+    expect(request.options[INSTRUCTIONS_OPTION]).toBe("AGENTS.md rules\n\nSkill guidance\n\nMalformed fallback");
     expect(request.options.temperature).toBeUndefined();
   }
   await expect(hooks.get("context")!.callback({ agent: "build", options: {} })).resolves.toBeUndefined();
@@ -220,12 +232,13 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
   });
   expect(titleParts.some((part) => part.type === "text-delta")).toBe(true);
 
-  // Compaction stays owned by ACP.
-  await expect(driveModel({
+  // Compaction runs as a summary turn; the rewritten history reseeds the pool.
+  const compactionParts = await driveModel({
     instance,
     prompt: [user("Summarize")],
     headers: { ...headers, [REQUEST_KIND_HEADER]: "compaction" },
-  })).rejects.toBeTruthy();
+  });
+  expect(compactionParts.some((part) => part.type === "text-delta")).toBe(true);
 
   const retry = hooks.get("retry")!;
   const retryEvent = { error: { type: "rate-limit", message: "rate limit; retry in 2 minutes" }, decision: { retry: true, delay: 10 } };

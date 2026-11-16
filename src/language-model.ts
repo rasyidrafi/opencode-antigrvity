@@ -9,16 +9,18 @@ import type {
   LanguageModelV3StreamResult,
 } from "@ai-sdk/provider";
 import { AgyError, AgyProtocolError, asAgyError, errorType, retryAfterSeconds } from "./errors.js";
-import { DIRECTORY_HEADER, EFFORT_HEADER, MODEL_HEADER, PROVIDER_ID, REQUEST_KIND_HEADER, SESSION_HEADER } from "./constants.js";
+import { DIRECTORY_HEADER, EFFORT_HEADER, FORK_HEADER, MODEL_HEADER, PROVIDER_ID, REQUEST_KIND_HEADER, SESSION_HEADER } from "./constants.js";
 import { sdkPromptToHostMessages } from "./sdk-prompt.js";
 import { ensureHostBridgeServer, hostBridge, type BridgeEvent, type HostTool } from "./host-tools.js";
 import { getRuntime, workspaceContains } from "./runtime.js";
 import { resolveAcpModelSelection } from "./models.js";
 import { buildUtilityPrompt, runAcpOneShot } from "./utility.js";
+import { TRANSCRIPT_INPUT_BYTE_CAP } from "./budget.js";
 import { StreamConverter, toAIUsage } from "./stream-converter.js";
 import type { SessionSettings } from "./session-pool.js";
 
 export const AGENT_OPTION = "antigravityAgent";
+export const INSTRUCTIONS_OPTION = "antigravityInstructions";
 
 type RequestKind = "primary" | "compaction" | "title" | "generate";
 
@@ -82,6 +84,11 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
     return typeof providerOptions?.[AGENT_OPTION] === "string" ? providerOptions[AGENT_OPTION] : "";
   }
 
+  private instructions(options: LanguageModelV3CallOptions): string {
+    const providerOptions = options.providerOptions?.[this.providerOptionKey] as Record<string, unknown> | undefined;
+    return typeof providerOptions?.[INSTRUCTIONS_OPTION] === "string" ? providerOptions[INSTRUCTIONS_OPTION] : "";
+  }
+
   private providerError(error: AgyError): APICallError {
     const retryAfter = retryAfterSeconds(error);
     return new APICallError({
@@ -125,14 +132,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
     const kind = requestKind(headers[REQUEST_KIND_HEADER] as string | undefined);
     const directory = headers[DIRECTORY_HEADER] ?? process.cwd();
 
-    if (kind === "compaction") {
-      throw this.providerError(new AgyError(
-        "unsupported",
-        "Compaction is managed internally by Antigravity; OpenCode compaction is disabled.",
-        { code: "agy_internal_compaction", retryable: false },
-      ));
-    }
-    if (kind === "title" || kind === "generate") {
+    if (kind === "compaction" || kind === "title" || kind === "generate") {
       return this.runUtility(kind, options, directory);
     }
 
@@ -152,23 +152,31 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
 
     const settings = this.settingsFor(directory, options);
     const agentSystem = this.agentSystem(options);
+    const instructions = this.instructions(options);
+    // The agent role and OpenCode's instruction sources travel together as the
+    // ACP instruction block; a change to either rebuilds the ACP context.
+    const system = [agentSystem, instructions].filter((text) => text.trim()).join("\n\n");
     const messages = sdkPromptToHostMessages(options.prompt, { includeSystem: false });
-    const tools = hostTools(functionTools(options));
+    // The final step keeps tool definitions for the cached prefix but must not
+    // call them; offering none is the portable equivalent for ACP.
+    const tools = options.toolChoice?.type === "none" ? [] : hostTools(functionTools(options));
     const bridge = hostBridge(bridgeKey(directory, sessionID), sessionID, directory);
     const baseURL = await ensureHostBridgeServer();
+    const fork = headers[FORK_HEADER];
     const events = bridge.request({
       messages,
-      system: agentSystem,
+      system,
       tools,
       settings,
       baseURL,
+      fork: typeof fork === "string" && fork.length > 0,
       signal: options.abortSignal,
     });
     return this.streamEvents(events, options.abortSignal);
   }
 
   private async runUtility(
-    kind: "title" | "generate",
+    kind: "title" | "generate" | "compaction",
     options: LanguageModelV3CallOptions,
     directory: string,
   ): Promise<LanguageModelV3StreamResult> {
@@ -191,6 +199,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
         ...(selected.effort ? { effort: selected.effort } : {}),
         executable: runtime.catalog.executable,
         signal: options.abortSignal,
+        ...(kind === "compaction" ? { maxChars: TRANSCRIPT_INPUT_BYTE_CAP } : {}),
       });
     } catch (error) {
       throw this.providerError(asAgyError(error));

@@ -1,7 +1,7 @@
-import type { LanguageModelV3, LanguageModelV3FunctionTool, LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import type { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3FunctionTool, LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { asAgyError } from "../../src/errors.js";
 import { ensureHostBridgeServer, hostBridge, type HostTool } from "../../src/host-tools.js";
-import { bridgeKey, AGENT_OPTION, AntigravityLanguageModel } from "../../src/language-model.js";
+import { bridgeKey, AGENT_OPTION, INSTRUCTIONS_OPTION, AntigravityLanguageModel } from "../../src/language-model.js";
 import { fallbackAcpModelCatalog, resolveAcpModelSelection } from "../../src/models.js";
 import { getRuntime } from "../../src/runtime.js";
 import { createAcpTranslationState, mapAcpEvent } from "../../src/translate.js";
@@ -80,7 +80,9 @@ export type ModelDriveOptions = {
   prompt: LanguageModelV3Prompt;
   headers?: Record<string, string>;
   tools?: LanguageModelV3FunctionTool[];
+  toolChoice?: LanguageModelV3CallOptions["toolChoice"];
   agentSystem?: string;
+  instructions?: string;
   model?: string;
   abortSignal?: AbortSignal;
   instance?: LanguageModelV3;
@@ -89,13 +91,17 @@ export type ModelDriveOptions = {
 /** Drive the real LanguageModelV3 boundary and collect its stream parts. */
 export async function driveModel(options: ModelDriveOptions): Promise<LanguageModelV3StreamPart[]> {
   const model = options.instance ?? new AntigravityLanguageModel(options.model ?? "gemini-3.8-flash", {});
-  const providerOptions = options.agentSystem === undefined
+  const providerOptions = options.agentSystem === undefined && options.instructions === undefined
     ? undefined
-    : { antigravity: { [AGENT_OPTION]: options.agentSystem } };
+    : { antigravity: {
+        ...(options.agentSystem === undefined ? {} : { [AGENT_OPTION]: options.agentSystem }),
+        ...(options.instructions === undefined ? {} : { [INSTRUCTIONS_OPTION]: options.instructions }),
+      } };
   const result = await model.doStream({
     prompt: options.prompt,
     headers: options.headers,
     tools: options.tools,
+    toolChoice: options.toolChoice,
     providerOptions,
     abortSignal: options.abortSignal,
   });

@@ -17,6 +17,8 @@ export type OneShotSettings = {
   signal?: AbortSignal;
   /** Keep the current generate request intact; reject rather than silently truncate. */
   preserveRequest?: string;
+  /** Override the conservative utility byte budget (compaction needs the transcript). */
+  maxChars?: number;
 };
 
 export type OneShotResult = {
@@ -49,7 +51,26 @@ export function buildGenerateUtilityPrompt(messages: HostMessage[]): { context: 
   };
 }
 
-export function buildUtilityPrompt(kind: "title" | "generate", messages: HostMessage[]): string {
+export function buildCompactionPrompt(messages: HostMessage[]): string {
+  const transcript = messages
+    .map((message) => {
+      const text = extractTextContent(message.content).trim();
+      return text ? `[${String(message.role)}]\n${text}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+  return [
+    "Summarize the conversation below so it can replace the full history and the work can continue.",
+    "Preserve the user's goals and constraints, decisions, files and paths touched, code changes, important tool results, and open tasks.",
+    "Be concise but complete. Output only the summary, with no preamble or closing remarks.",
+    "<conversation>",
+    quoteContext(transcript),
+    "</conversation>",
+  ].join("\n");
+}
+
+export function buildUtilityPrompt(kind: "title" | "generate" | "compaction", messages: HostMessage[]): string {
+  if (kind === "compaction") return buildCompactionPrompt(messages);
   if (kind === "generate") {
     const generated = buildGenerateUtilityPrompt(messages);
     return `${generated.context}\n\n<current-user-message>\n${generated.request}\n</current-user-message>`;
@@ -66,7 +87,7 @@ export function buildUtilityPrompt(kind: "title" | "generate", messages: HostMes
 }
 
 export async function runAcpOneShot(prompt: string, settings: OneShotSettings): Promise<OneShotResult> {
-  const maxPromptChars = Number(process.env.OPENCODE_ANTIGRAVITY_UTILITY_MAX_CHARS) || DEFAULT_UTILITY_MAX_CHARS;
+  const maxPromptChars = settings.maxChars ?? (Number(process.env.OPENCODE_ANTIGRAVITY_UTILITY_MAX_CHARS) || DEFAULT_UTILITY_MAX_CHARS);
   const requestSection = settings.preserveRequest === undefined
     ? ""
     : `\n\n<current-user-message>\n${settings.preserveRequest}\n</current-user-message>`;

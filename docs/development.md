@@ -72,7 +72,7 @@ files.
 
 ## Verified baseline
 
-Setup was verified with Bun 1.4.4: the build succeeded, with 200 tests passing,
+Setup was verified with Bun 1.4.4: the build succeeded, with 212 tests passing,
 10 skipped, and no failures. The provider registers through OpenCode's
 `LanguageModelV3` AI SDK hook (`aisdk:antigravity`); there is no loopback HTTP
 proxy or Anthropic Messages emulation.

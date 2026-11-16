@@ -86,6 +86,8 @@ test("only accepts fresh measurements from the exact bound execution", async () 
   const candidate = contextOccupancyForExecution(measured, binding, "usage-host", "acp-source", "generation-a", now)!;
   expect(candidate).toEqual({ used: 101, observedAt: now });
   expect(contextOccupancyForExecution(snapshot({ used: 0, observedAt: now }), binding, "usage-host", "acp-source", "generation-a", now)).toEqual({ used: 0, observedAt: now });
+  // Occupancy is a share of the advertised window; it never exceeds 100%.
+  expect(contextOccupancyForExecution(snapshot({ used: 1200, size: 1000, observedAt: now }), binding, "usage-host", "acp-source", "generation-a", now)).toEqual({ used: 1000, observedAt: now });
 
   for (const invalid of [
     snapshot({ state: "unknown", observedAt: now }),
@@ -119,9 +121,11 @@ test("rechecks a 299-second seed when freezing a terminal response", async () =>
   // two-second turn with no new telemetry. The clock advances by calls rather
   // than sleeping, so this boundary test is deterministic.
   let clockReads = 0;
-  scheduledClock = () => ++clockReads === 1 ? observedAt + 299_000 : observedAt + 301_000;
+  // Reads 1–2 (turn start, seed) see a 299-second-old sample; the freeze and
+  // the turn's final bookkeeping see it two seconds later.
+  scheduledClock = () => ++clockReads <= 2 ? observedAt + 299_000 : observedAt + 301_000;
   const later = await collect(sessions.turn(request("clock-later", "FAKE_NO_USAGE_UPDATE FAKE_NO_RESULT_USAGE")));
-  expect(clockReads).toBe(2);
+  expect(clockReads).toBe(4);
   expect(terminal(later).contextOccupancy).toBeUndefined();
 });
 

@@ -164,6 +164,12 @@ function profile(tools: HostTool[], settings: SessionSettings): string {
   return canonical({ tools: tools.map(({ name, input_schema }) => ({ name, input_schema })).sort((a, b) => a.name.localeCompare(b.name)), model: settings.model, effort: settings.effort });
 }
 
+/** Synthetic permission notices are the only ACP tool telemetry the host must
+ * see; ordinary MCP calls are rendered by OpenCode itself. */
+function isPermissionNotice(update: { toolCallId?: unknown }): boolean {
+  return typeof update.toolCallId === "string" && update.toolCallId.startsWith("agy-permission-");
+}
+
 export class HostBridge {
   readonly token = randomBytes(32).toString("hex");
   tools: HostTool[] = [];
@@ -216,7 +222,7 @@ export class HostBridge {
     return result;
   }
 
-  async *request(input: { messages: unknown; system?: unknown; tools?: unknown; settings: SessionSettings; baseURL?: string; requestId?: string; signal?: AbortSignal }): AsyncGenerator<BridgeEvent> {
+  async *request(input: { messages: unknown; system?: unknown; tools?: unknown; settings: SessionSettings; baseURL?: string; requestId?: string; fork?: boolean; signal?: AbortSignal }): AsyncGenerator<BridgeEvent> {
     if (this.closed) throw new AgyAbortError();
     if (this.consuming) throw new AgyBusyError("An OpenCode request is already consuming this turn");
     this.consuming = true;
@@ -232,7 +238,12 @@ export class HostBridge {
       // The ID alone is not authority to replace the originating arguments.
       for (const id of results.keys()) {
         const saved = await sessionStore.toolCall(this.key, id);
-        if (!saved) throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
+        // A fork copies the source's history without its tool records; that
+        // history is context, not a pending call to re-execute.
+        if (!saved) {
+          if (input.fork) continue;
+          throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
+        }
         const calls = Array.isArray(input.messages) ? input.messages.flatMap(m => m?.role === "assistant" && Array.isArray(m.content) ? m.content : []) : [];
         const call = calls.find(p => p?.type === "tool_use" && p.id === id);
         if (call && canonical(saved.call) !== canonical(call)) throw new AgyError("invalid_request", "Tool call conflicts with its originating record");
@@ -299,7 +310,10 @@ export class HostBridge {
         }
       } else {
         for (const [id, result] of results) {
-          if (!(await sessionStore.toolCall(this.key, id))) throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
+          if (!(await sessionStore.toolCall(this.key, id))) {
+            if (input.fork) continue;
+            throw new AgyError("invalid_request", "Tool result has no originating call in this conversation");
+          }
           await sessionStore.saveToolResult(this.key, id, result);
         }
         // A dead MCP transport cannot be resumed. Recover its last host batch
@@ -318,6 +332,9 @@ export class HostBridge {
           for (const call of calls) {
             const saved = await sessionStore.toolCall(this.key, call.id);
             if (!saved) {
+              // A fork copies the source's history without its tool records;
+              // that history is context, not a pending call to re-execute.
+              if (input.fork) continue;
               // Earlier history may belong to another provider, but the current
               // continuation must have an originating adapter call record.
               if (Array.isArray(assistant?.content) && assistant.content.includes(call)) throw new AgyError("invalid_request", "Tool call has no originating record in this conversation");
@@ -398,8 +415,11 @@ export class HostBridge {
         // ACP already processed these updates for activity/lifecycle tracking.
         // OpenCode renders the actual call and result through the MCP bridge;
         // replaying ACP tool telemetry as thinking would duplicate that UI.
+        // Synthetic permission notices are the exception: they are the only
+        // user-visible surface for Antigravity's own tool approvals.
         if (next.value.event === "update" &&
-            (next.value.update.sessionUpdate === "tool_call" || next.value.update.sessionUpdate === "tool_call_update")) continue;
+            (next.value.update.sessionUpdate === "tool_call" || next.value.update.sessionUpdate === "tool_call_update") &&
+            !isPermissionNotice(next.value.update)) continue;
         yield next.value;
         if (next.value.event === "result") { finished = true; this.active = false; await this.pumping; return; }
       }

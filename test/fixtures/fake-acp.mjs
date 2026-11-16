@@ -238,16 +238,22 @@ input.on("line", (line) => {
     // Distinct sessions must not alias one private trajectory across unrelated
     // host owners. session/load below still preserves its requested identity.
     sessionId = `fake-acp-session-${randomUUID()}`;
+    const thoughtLevel = Boolean(process.env.FAKE_ACP_THOUGHT_LEVEL);
     respond(message.id, {
       sessionId,
       configOptions: [
-        { id: "model", category: "model", name: "Model", type: "select", currentValue: "gemini-3.8-flash-high", options: [
-          { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
-          { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
-          { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
-          { value: "fake-model-low", name: "Fake Model" },
-          ...(process.env.FAKE_ACP_EXTRA_MODEL ? [{ value: process.env.FAKE_ACP_EXTRA_MODEL, name: process.env.FAKE_ACP_EXTRA_MODEL }] : []),
-        ] },
+        { id: "model", category: "model", name: "Model", type: "select", currentValue: thoughtLevel ? "gemini-3.8-flash" : "gemini-3.8-flash-high", options: thoughtLevel
+          ? [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }]
+          : [
+            { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+            { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
+            { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
+            { value: "fake-model-low", name: "Fake Model" },
+            ...(process.env.FAKE_ACP_EXTRA_MODEL ? [{ value: process.env.FAKE_ACP_EXTRA_MODEL, name: process.env.FAKE_ACP_EXTRA_MODEL }] : []),
+          ] },
+        ...(thoughtLevel ? [{ id: "thought_level", category: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [
+          { value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" },
+        ] }] : []),
         { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }, { value: "plan", name: "Plan" }, { value: "default", name: "Default" }] },
       ],
     });

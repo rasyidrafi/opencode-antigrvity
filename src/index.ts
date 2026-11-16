@@ -3,6 +3,7 @@ import { resolve as resolvePath } from "node:path";
 import {
   DIRECTORY_HEADER,
   EFFORT_HEADER,
+  FORK_HEADER,
   LOCAL_API_KEY,
   MODEL_HEADER,
   PROVIDER_ID,
@@ -22,7 +23,7 @@ import { ContextTelemetry } from "./telemetry-rpc.js";
 import { onContextSnapshot, readContextSnapshot, markContextStale } from "./telemetry.js";
 import { AgyError, retryAfterSeconds } from "./errors.js";
 import { warn, info as lifecycleInfo } from "./log.js";
-import { AGENT_OPTION, AntigravityLanguageModel } from "./language-model.js";
+import { AGENT_OPTION, AntigravityLanguageModel, INSTRUCTIONS_OPTION } from "./language-model.js";
 
 export const PLUGIN_ID = "opencode-antigravity";
 export const INTEGRATION_ID = PROVIDER_ID;
@@ -69,16 +70,54 @@ function requestKind(kind: string): string {
   return "chat";
 }
 
-let warnedTemperature = false;
-function stripAcpOwnedOptions(event: { options: Record<string, unknown> }): void {
+const warnedTemperature = new Set<string>();
+function stripAcpOwnedOptions(event: { sessionID?: string; options: Record<string, unknown> }): void {
   // ACP's own effort variants control reasoning; its Anthropic adapter does
   // not support model temperature overrides.
   delete event.options.reasoningEffort;
-  if (event.options.temperature !== undefined && !warnedTemperature) {
-    warnedTemperature = true;
-    warn("Ignoring temperature: generation sampling is owned by ACP", { reason: "unsupported_temperature" });
+  if (event.options.temperature !== undefined) {
+    // Warn once per session. A process-wide flag hides the notice from every
+    // session that starts after the first one.
+    const key = event.sessionID ?? "";
+    if (!warnedTemperature.has(key)) {
+      if (warnedTemperature.size >= 1_000) warnedTemperature.clear();
+      warnedTemperature.add(key);
+      warn("Ignoring temperature: generation sampling is owned by ACP", { reason: "unsupported_temperature" });
+    }
   }
   delete event.options.temperature;
+}
+
+/** OpenCode's date and environment are supplied by the ACP harness itself. */
+const ACP_SUPPLIED_INSTRUCTIONS = new Set(["core/date", "core/environment"]);
+
+type SystemPartLike = { text?: unknown; metadata?: unknown };
+
+/** Extract OpenCode's instruction sources (AGENTS.md, skills, MCP guidance,
+ * references) from the assembled system parts. The first part is OpenCode's
+ * own prompt, which the agent role replaces. */
+function instructionText(system: ReadonlyArray<SystemPartLike> | undefined): string {
+  if (!Array.isArray(system)) return "";
+  const texts: string[] = [];
+  for (const part of system.slice(1)) {
+    if (!part || typeof part !== "object") continue;
+    const metadata = part.metadata as { experimental?: { instructions?: unknown } } | undefined;
+    const sources = metadata?.experimental?.instructions;
+    // Match OpenCode's own provider: a malformed source list falls back to the
+    // rendered part text instead of silently dropping the instruction.
+    if (Array.isArray(sources) && sources.every((source) =>
+      source && typeof source === "object" &&
+      typeof (source as { key?: unknown }).key === "string" &&
+      typeof (source as { text?: unknown }).text === "string")) {
+      for (const source of sources as Array<{ key: string; text: string }>) {
+        if (ACP_SUPPLIED_INSTRUCTIONS.has(source.key)) continue;
+        if (source.text.trim()) texts.push(source.text);
+      }
+      continue;
+    }
+    if (typeof part.text === "string" && part.text.trim()) texts.push(part.text);
+  }
+  return texts.join("\n\n");
 }
 
 /** V2 plugin entrypoint. ACP owns Google auth; OpenCode sees only a local marker. */
@@ -220,6 +259,7 @@ export const AntigravityPlugin = Plugin.define({
           stripAcpOwnedOptions(event);
           const agent = await ctx.agent.get({ agentID: event.agent });
           event.options[AGENT_OPTION] = agent.data.system ?? "";
+          event.options[INSTRUCTIONS_OPTION] = instructionText(event.system);
         }, { providerID: PROVIDER_ID });
       }
       await ctx.session.hook("title", stripAcpOwnedOptions, { providerID: PROVIDER_ID });
@@ -262,6 +302,11 @@ export const AntigravityPlugin = Plugin.define({
           else delete event.headers[EFFORT_HEADER];
           event.headers[DIRECTORY_HEADER] = directory;
           event.headers[SESSION_HEADER] = event.sessionID;
+          // A fork copies the source's messages but has no local tool records.
+          // Mark it so the bridge treats that copied history as context.
+          const fork = (session as { fork?: { sessionID?: string } }).fork;
+          if (fork?.sessionID) event.headers[FORK_HEADER] = fork.sessionID;
+          else delete event.headers[FORK_HEADER];
           event.headers[REQUEST_KIND_HEADER] = requestKind(event.kind);
           // The LanguageModelV3 route has no HTTP authorization to replace;
           // the host's bearer header is transport metadata and never reaches ACP.

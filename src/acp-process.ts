@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { win32 } from "node:path";
 import { performance } from "node:perf_hooks";
 import { Readable, Writable } from "node:stream";
@@ -14,7 +15,7 @@ import {
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import { AgyAbortError, AgyError, AgyProcessError, AgyProtocolError, AgyTimeoutError } from "./errors.js";
-import { DEFAULT_MAX_STDERR_BYTES, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort } from "./constants.js";
+import { DEFAULT_MAX_STDERR_BYTES, configuredPermissionPolicy, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort, type AcpPermissionPolicy } from "./constants.js";
 import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
 import { cliAuthenticationError, requireCliAuthentication } from "./auth-bridge.js";
 import { debug, info, warn } from "./log.js";
@@ -45,6 +46,7 @@ export type AcpWorkerOptions = {
   hostTools?: boolean;
   mcpServers?: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;
   waitingForTools?: () => boolean;
+  permissionPolicy?: AcpPermissionPolicy;
 };
 
 type QueueWaiter<T> = {
@@ -193,6 +195,22 @@ function isMissingSessionError(error: unknown): boolean {
   return /session.{0,200}not found|unknown session|invalid session|no such session|cannot load (?:stored )?session|method not found|session (?:cannot be resumed|is not resumable|has expired)|resume (?:is )?not supported/i.test(message);
 }
 
+function parseVersion(version: string | null | undefined): [number, number, number] | undefined {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version?.trim() ?? "");
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
+}
+
+function compareVersions(left: [number, number, number], right: [number, number, number]): number {
+  return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+}
+
+/** 1.4.2 through 1.4.5 create or overwrite a run-workflow skill in the
+ * workspace unless the session disables that tool. */
+function writesRunWorkflowSkill(version: string | null | undefined): boolean {
+  const parsed = parseVersion(version);
+  return parsed !== undefined && compareVersions(parsed, [1, 4, 2]) >= 0 && compareVersions(parsed, [1, 4, 5]) <= 0;
+}
+
 async function terminateProcess(child: ChildProcess, force = false): Promise<void> {
   const signal = force ? "SIGKILL" : "SIGTERM";
   try {
@@ -321,11 +339,19 @@ export class AcpWorker {
     }
   }
 
+  /** 1.3 disables built-ins through `agy.enabledTools`; 1.4.2–1.4.5 also
+   * writes a run-workflow skill unless `antigravity.disabledTools` names it. */
+  private sessionMeta(): Record<string, unknown> {
+    const meta: Record<string, unknown> = { agy: { enabledTools: [] } };
+    if (writesRunWorkflowSkill(this.initValue?.agentInfo?.version)) meta.antigravity = { disabledTools: ["run_workflow"] };
+    return meta;
+  }
+
   private async openSession(agent: ClientConnection["agent"], signal?: AbortSignal): Promise<void> {
     const request = {
       cwd: this.options.cwd,
       mcpServers: this.options.mcpServers ?? [],
-      _meta: { agy: { enabledTools: [] } },
+      _meta: this.sessionMeta(),
     };
     if (this.options.sessionId && this.initValue?.agentCapabilities?.loadSession === true) {
       try {
@@ -370,10 +396,15 @@ export class AcpWorker {
     ];
     for (const item of desired) {
       if (!item.value) continue;
-      const option = options.find((candidate) => item.ids.includes(String(candidate.id)) || item.ids[0] === "model" && candidate.category === "model");
+      const option = options.find((candidate) =>
+        item.ids.includes(String(candidate.id)) ||
+        item.ids[0] === "model" && candidate.category === "model" ||
+        item.ids[0] === "effort" && (candidate.category === "thought_level" || candidate.category === "effort" || candidate.category === "reasoning_effort"));
       if (!option) continue;
       const values = item.ids[0] === "model" && this.catalog ? this.catalog.exactModels.map((model) => model.id)
-        : Array.isArray(option.options) ? option.options.map((entry) => String(entry.value)) : [];
+        : Array.isArray(option.options) ? option.options.flatMap((entry) => Array.isArray((entry as { options?: unknown }).options)
+          ? ((entry as { options: Array<{ value?: unknown }> }).options).map((nested) => String(nested.value))
+          : [String(entry.value)]) : [];
       const value = values.length
         ? values.find((entry) => entry === item.value)
         : item.value;
@@ -575,9 +606,40 @@ export class AcpWorker {
     const meta = (params.toolCall as { _meta?: { mcp?: { server?: string } } })._meta;
     // The isolated harness contains only our session-bound MCP endpoint.
     const dispatcher = params.toolCall.title === "Run call_mcp_tool?";
-    const allowed = (this.options.mcpServers?.some(server => server.name === meta?.mcp?.server) || dispatcher) && Boolean(this.options.mcpServers?.length);
-    const option = params.options.find((item) => item.kind === (allowed ? "allow_once" : "reject_once"));
+    const ownMcp = Boolean(this.options.mcpServers?.length) &&
+      (this.options.mcpServers?.some(server => server.name === meta?.mcp?.server) || dispatcher);
+    // OpenCode already gates its own tools, so an own-MCP approval is not a
+    // second decision. Anything else is Antigravity's own tool: surface it and
+    // apply the configured policy instead of silently rejecting it.
+    const policy = this.options.permissionPolicy ?? configuredPermissionPolicy();
+    const allowed = ownMcp || policy === "allow";
+    const option = params.options.find((item) => item.kind === (allowed ? "allow_once" : "reject_once"))
+      ?? params.options.find((item) => item.kind === (allowed ? "allow_always" : "reject_always"));
+    if (!ownMcp) this.surfacePermission(params, allowed);
     return option ? { outcome: { outcome: "selected", optionId: option.optionId } } : { outcome: { outcome: "cancelled" } };
+  }
+
+  /** Make a non-MCP approval visible in the transcript. The plugin API has no
+   * permission-request surface, so the decision and its policy are reported as
+   * a tool activity the user can see and act on. */
+  private surfacePermission(params: import("@agentclientprotocol/sdk").RequestPermissionRequest, allowed: boolean): void {
+    if (!this.turnEvents || !this.sessionIdValue) return;
+    const title = typeof params.toolCall.title === "string" && params.toolCall.title ? params.toolCall.title : "Antigravity tool";
+    const reason = allowed
+      ? "Allowed by OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow."
+      : "Denied. Set OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow to permit Antigravity's own tools.";
+    this.turnEvents.push({
+      event: "update",
+      sessionId: this.sessionIdValue,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: `agy-permission-${randomUUID()}`,
+        title: `${title} (${allowed ? "allowed" : "denied"})`,
+        kind: "other",
+        status: allowed ? "completed" : "failed",
+        content: [{ type: "content", content: { type: "text", text: reason } }],
+      },
+    });
   }
 
   private async withSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { startRuntime, stopRuntime, getRuntime } from "../src/runtime.js";
 import { closeHostBridges, ensureHostBridgeServer, hostBridge, hostResults, parseHostTools } from "../src/host-tools.js";
-import { driveBridge, driveModel } from "./fixtures/drive.js";
+import { driveBridge, driveModel, textOf } from "./fixtures/drive.js";
 import { REQUEST_KIND_HEADER, SESSION_HEADER, DIRECTORY_HEADER } from "../src/constants.js";
 import { protocol as anthropicProtocol } from "@opencode/ai/protocols/anthropic-messages";
 const Effect = await import(Bun.resolveSync("effect/Effect", dirname(import.meta.resolve("@opencode/ai"))));
@@ -33,16 +33,11 @@ afterAll(async () => {
 });
 const send = async (session: string, messages: any[], extra: Record<string, unknown> = {}, headers: Record<string, string> = {}) => {
   if (headers[REQUEST_KIND_HEADER] === "compaction") {
-    try {
-      await driveModel({
-        prompt: [{ role: "user", content: "Summarize the selected prefix." }],
-        headers: { [REQUEST_KIND_HEADER]: "compaction", [SESSION_HEADER]: session, [DIRECTORY_HEADER]: directory },
-      });
-      return Response.json({ error: { message: "compaction should be rejected" } }, { status: 500 });
-    } catch (error) {
-      const failure = error as { responseBody?: string; message: string };
-      return Response.json({ error: { message: failure.message, code: /agy_internal_compaction/.test(failure.responseBody ?? "") ? "agy_internal_compaction" : "rejected" } }, { status: 400 });
-    }
+    const parts = await driveModel({
+      prompt: [{ role: "user", content: "Summarize the selected prefix." }],
+      headers: { [REQUEST_KIND_HEADER]: "compaction", [SESSION_HEADER]: session, [DIRECTORY_HEADER]: directory },
+    });
+    return Response.json({ content: [{ type: "text", text: textOf(parts) }], stop_reason: "end_turn" });
   }
   return driveBridge({
     session,
@@ -237,8 +232,8 @@ test("host compaction leaves parked calls and their completed results intact", a
   const oldBinding = (await sessionStore.entries()).find(([, r]) => r.conversation?.hostSessionID === host)!;
   expect((await sessionStore.toolCall(oldBinding[0], calls[0].id))!.delivery).toBe("result-persisted");
   const summary = await send(host, [...partialMessages, { role: "user", content: "Summarize the selected prefix." }], { system: "Keep exact identifiers", tools: undefined }, { "x-opencode-antigravity-request-kind": "compaction" });
-  expect(summary.status).toBe(400);
-  expect((await summary.json()).error.code).toBe("agy_internal_compaction");
+  expect(summary.status).toBe(200);
+  expect((await summary.json()).content[0].text).toBeTruthy();
   expect(await sessionStore.get(oldBinding[0])).toEqual(oldBinding[1]);
   const continued = await (await send(host, [...original, { role: "assistant", content: first.content }, { role: "user", content: [result(calls[0].id, "COMPLETED_ONCE"), result(calls[1].id, "COMPLETED_SECOND_ONCE")] }])).json();
   expect(continued.stop_reason).toBe("end_turn");
