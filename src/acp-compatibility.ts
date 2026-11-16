@@ -10,14 +10,17 @@ import { acpDistribution } from "./acp-install.js";
 // an empty enabledTools list disables built-ins and subagents, including the
 // safe_view_file substitute. Windows runtime inference is not yet verified.
 // Version strings alone are not a compatibility profile.
+// Hashes are re-pinned by scripts/update-acp-server.ts from the official
+// registry. The review notes in this file describe the 1.3.0 binaries; they
+// have not been re-verified against the version the hashes currently name.
 const profiles: Record<string, [string, string]> = {
-  "linux-x64": ["cf6feaebdacfc2255dcfc8883db99b15de8554698554e2a1e78e5ccec1c68a20", "63042ca43fc7a69600683920f7706689b82cf8aecefe21dc18cf35e99c9dde4d"],
-  "win32-x64": ["bc86a76bfe422a58aed70300fdab65457c7439b9fcb7d3f6c314ea6f79601fa3", "b200d5e01725784b45f99ee532b0da22f5fb43f01b16ecd69f225bf1ddf36557"],
+  "linux-x64": ["7e7019c8989ca066cbac4d6580552b7a4ad39485dd6b6fd81de9daa9a7b39042", "6c6d28b61a704e9bae4351ea8c4ad4b8b0aba7e1f1027bdf1017401b9c6e18c0"],
+  "win32-x64": ["ccca30a4aef1b915b0d8baa17b149de6cda305841fa27717e52c529bb462c51d", "98f808f7796c0a06d104715dbef65025e57243106fff5935d9bedd5843f03cda"],
   // macOS ARM64 PAR's embedded tool_filter.py/server.py reviewed: [] becomes
   // an empty allowlist, disables all built-ins including safe_view_file and
   // subagents/browser; create, restore and rebuild preserve the filter.
   // Static isolation review, not authenticated runtime inference verification.
-  "darwin-arm64": ["cb1f0725183ed922079ed6cd1d2422b4d8be44c5fb60be3e9a43d8d04f99a18e", "b04b00662c1821b953a409d43626b86d1229130eeb2078b4e1304c06199aa481"],
+  "darwin-arm64": ["fb2581fb49738263db15ffccf3f48d979794ffb748350e85c335953f6b6522a2", "9d87cb505e6efa316f55bb98459de614de867dce43cdeb5677b2153d77c283e8"],
 };
 async function sha256(path: string): Promise<string> {
   const hash = createHash("sha256");

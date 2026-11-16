@@ -8,9 +8,14 @@ export function cliAuthenticationError(): AgyError {
   return new AgyError("auth", "Antigravity requires an authenticated agy CLI. Sign in through agy, then retry. The plugin does not start interactive login.", { code: "agy_cli_auth_required" });
 }
 
-/** Check the CLI source before starting ACP, including when old ACP tokens exist. */
+/**
+ * Bridge CLI credentials when they exist, but never require them. The ACP
+ * server can hold its own credentials (macOS keychain, acp_token.json), and
+ * reports authentication failures itself. Blocking workers on the CLI token
+ * file breaks setups where agy is authenticated through a different store.
+ */
 export async function requireCliAuthentication(environment: NodeJS.ProcessEnv): Promise<void> {
-  if (!await bridgeCliAuthentication(environment)) throw cliAuthenticationError();
+  await bridgeCliAuthentication(environment);
 }
 
 function decodeSecret(bytes: number[], key = "gemini"): string {
