@@ -38,6 +38,12 @@ describe("prompt normalization", () => {
     expect(history).toContain("recent");
   });
 
+  test("parses explicit Anthropic base64 image sources instead of treating the data as a path", async () => {
+    const jpeg = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==";
+    const prompt = await normalizePrompt([{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: jpeg } }] }]);
+    expect(prompt.blocks).toEqual([{ type: "image", data: jpeg, mimeType: "image/jpeg" }]);
+  });
+
   test("rebuilt host tool continuation identifies completed calls without losing steering or images", async () => {
     const prompt = await normalizePrompt([
       { role: "assistant", content: [{ type: "tool_use", id: "original", name: "shell", input: { command: "echo completed" } }] },
