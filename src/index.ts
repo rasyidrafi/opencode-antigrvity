@@ -27,7 +27,12 @@ import { AGENT_OPTION, AntigravityLanguageModel, INSTRUCTIONS_OPTION } from "./l
 
 export const PLUGIN_ID = "opencode-antigravity";
 export const INTEGRATION_ID = PROVIDER_ID;
-export const PROVIDER_PACKAGE = "aisdk:antigravity";
+// OpenCode runs its built-in DynamicProviderPlugin before user
+// plugins. For an `aisdk:*` provider it tries to load a `create*` export from
+// the provider package before our `sdk` hook can supply the real SDK. Use a
+// local shim with a `create*` export so that loader succeeds; the hook below
+// then replaces it with the ACP-backed SDK.
+export const PROVIDER_PACKAGE = `aisdk:${new URL("./sdk-shim.mjs", import.meta.url).href}`;
 
 async function retainWorkspace(directory: string): Promise<void> {
   await startRuntime(resolvePath(directory));

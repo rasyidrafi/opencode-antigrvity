@@ -6,7 +6,7 @@ afterAll(() => { compatibility.mockRestore(); });
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AntigravityPlugin, INTEGRATION_ID, PLUGIN_ID } from "../src/index.js";
+import { AntigravityPlugin, INTEGRATION_ID, PLUGIN_ID, PROVIDER_PACKAGE } from "../src/index.js";
 import {
   DIRECTORY_HEADER,
   EFFORT_HEADER,
@@ -133,7 +133,7 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
     name: "Antigravity",
     activation: "enabled",
     integrationID: INTEGRATION_ID,
-    package: "aisdk:antigravity",
+    package: PROVIDER_PACKAGE,
     settings: { provider: PROVIDER_ID, apiKey: LOCAL_API_KEY },
   });
   expect(provider.info.settings.baseURL).toBeUndefined();
@@ -143,8 +143,15 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
 
   const sdkHook = aisdkHooks.get("sdk")!;
   expect(sdkHook.options).toEqual({ providerID: PROVIDER_ID });
-  const sdkEvent: any = { model: { providerID: PROVIDER_ID, id: "gemini-3.8-flash", canonical: undefined }, package: "antigravity", options: {} };
+  expect(PROVIDER_PACKAGE.startsWith("aisdk:file:")).toBe(true);
+  const shim = await import(PROVIDER_PACKAGE.slice("aisdk:".length));
+  const factory = Object.entries(shim).find(([name, value]) => name.startsWith("create") && typeof value === "function")?.[1] as (() => any) | undefined;
+  expect(factory).toBeDefined();
+  const placeholder = factory!();
+  expect(() => placeholder.languageModel("gemini-3.8-flash")).toThrow("placeholder SDK");
+  const sdkEvent: any = { model: { providerID: PROVIDER_ID, id: "gemini-3.8-flash", canonical: undefined }, package: PROVIDER_PACKAGE.slice("aisdk:".length), options: {}, sdk: placeholder };
   sdkHook.callback(sdkEvent);
+  expect(sdkEvent.sdk).not.toBe(placeholder);
   expect(typeof sdkEvent.sdk?.languageModel).toBe("function");
   const instance = sdkEvent.sdk.languageModel("gemini-3.8-flash");
   expect(instance).toBeInstanceOf(AntigravityLanguageModel);
