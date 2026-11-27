@@ -47,6 +47,7 @@ const send = async (session: string, messages: any[], extra: Record<string, unkn
     system: typeof extra.system === "string" ? extra.system : "HOST_INSTRUCTIONS_UNTRUNCATED",
     tools: Array.isArray(extra.tools) ? extra.tools : schema,
     model: typeof extra.model === "string" ? extra.model : "gemini-3.8-flash",
+    requestId: typeof extra.requestId === "string" ? extra.requestId : undefined,
   });
 };
 const result = (id: string, text: string, is_error = false) => ({ type: "tool_result", tool_use_id: id, content: text, is_error });
@@ -519,6 +520,27 @@ test("waiting for host approval suspends the watchdog; changed instructions rebu
   } finally { if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_TURN_STALL_MS; else process.env.OPENCODE_ANTIGRAVITY_TURN_STALL_MS = previous; }
 });
 
+test("changed instructions rebuild a text result even when its assistant call is omitted", async () => {
+  const host = "changed-instructions-omitted-call";
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP OMITTED_CALL_TEXT" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  expect(call).toBeDefined();
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  const before = await promptLines();
+  messages.push({ role: "user", content: [result(call.id, "OMITTED_CALL_RESULT")] });
+  const final = await (await send(host, messages, { system: "CHANGED_INSTRUCTIONS" })).json();
+  expect(final.stop_reason).toBe("end_turn");
+  expect(final.content.some((part: any) => part.type === "tool_use")).toBe(false);
+  expect(hostBridge(key, host, directory)).not.toBe(bridge);
+  expect(await promptLines()).toBe(before + 1);
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.text).toContain("CHANGED_INSTRUCTIONS");
+  expect(rebuilt.text.match(/OMITTED_CALL_RESULT/g)).toHaveLength(1);
+  expect((await sessionStore.toolCall(key, call.id))?.delivery).toBe("result-persisted");
+});
+
 const hostImage = (data: string) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
 const promptLines = async () => (await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").length;
 /** Observe a real event barrier without polling; a hang fails loudly. */
@@ -618,6 +640,88 @@ test("image half-batch stays parked until every reported result arrives", async 
   expect(rebuilt.text).toContain("SECOND_TEXT");
 });
 
+test("image handoff rejects missing reported call and preserves partial batch for retry", async () => {
+  const host = "image-half-missing-call";
+  const image = Buffer.alloc(2048, 47).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP_PARALLEL MISSING_CALL" }];
+  const first = await (await sendParallel(host, messages)).json();
+  const [a, b] = first.content;
+  expect(first.content).toHaveLength(2);
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: a.id, content: [{ type: "text", text: "IMAGE_BATCH_A" }, hostImage(image)] },
+  ] });
+  const partial = await send(host, messages);
+  expect(partial.status).toBe(400);
+  expect((await partial.json()).error.message).toContain("pending results");
+  const before = await promptLines();
+  messages[1].content = [b];
+  messages[2].content = [result(b.id, "IMAGE_BATCH_B")];
+  const rejected = await send(host, messages);
+  expect(rejected.status).toBe(400);
+  const failure = await rejected.json();
+  expect(failure.error.message).toContain("missing or conflicts");
+  expect(failure.content).toBeUndefined();
+  expect(hostBridge(key, host, directory)).toBe(bridge);
+  expect(await promptLines()).toBe(before);
+  expect((await sessionStore.toolCall(key, a.id))?.delivery).toBe("result-persisted");
+  expect((await sessionStore.toolCall(key, b.id))?.delivery).toBe("result-persisted");
+  messages[1].content = first.content;
+  const final = await (await send(host, messages)).json();
+  expect(final.stop_reason).toBe("end_turn");
+  expect(final.content.some((part: any) => part.type === "tool_use")).toBe(false);
+  expect(await promptLines()).toBe(before + 1);
+  const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+  expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([image]);
+  expect(rebuilt.text).toContain("IMAGE_BATCH_A");
+  expect(rebuilt.text).toContain("IMAGE_BATCH_B");
+});
+
+test("handoff rejects historical partial image even when its originating call is present", async () => {
+  const host = "image-historical-partial";
+  const image = Buffer.alloc(2048, 48).toString("base64");
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP_PARALLEL HISTORICAL_PARTIAL" }];
+  const first = await (await sendParallel(host, messages)).json();
+  expect(first.content).toHaveLength(2);
+  const [a, b] = first.content;
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  const imageResult = { type: "tool_result", tool_use_id: a.id, content: [{ type: "text", text: "HISTORICAL_IMAGE_RESULT" }, hostImage(image)] };
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [imageResult] });
+  const partial = await send(host, messages);
+  expect(partial.status).toBe(400);
+  expect((await partial.json()).error.message).toContain("pending results");
+  const previous = process.env.OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS;
+  process.env.OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS = "1";
+  try {
+    const before = await promptLines();
+    messages.push({ role: "assistant", content: [{ type: "text", text: "later assistant boundary" }] }, { role: "user", content: [result(b.id, "LATEST_TEXT_RESULT")] });
+    const rejected = await send(host, messages);
+    expect(rejected.status).toBe(400);
+    const failure = await rejected.json();
+    expect(failure.error.message).toContain("missing or conflicts");
+    expect(failure.content).toBeUndefined();
+    expect(hostBridge(key, host, directory)).toBe(bridge);
+    expect(await promptLines()).toBe(before);
+    expect((await sessionStore.toolCall(key, a.id))?.delivery).toBe("result-persisted");
+    expect((await sessionStore.toolCall(key, b.id))?.delivery).toBe("result-persisted");
+    // Remove the optional copy: recovery restores A into the operative prompt.
+    messages.splice(2, 2);
+    const final = await (await send(host, messages)).json();
+    expect(final.stop_reason).toBe("end_turn");
+    expect(final.content.some((part: any) => part.type === "tool_use")).toBe(false);
+    expect(await promptLines()).toBe(before + 1);
+    const rebuilt = JSON.parse((await readFile(join(directory, "prompts.jsonl"), "utf8")).trim().split("\n").at(-1)!);
+    expect(rebuilt.prompt.filter((part: any) => part.type === "image").map((part: any) => part.data)).toEqual([image]);
+    expect(rebuilt.text).toContain("HISTORICAL_IMAGE_RESULT");
+    expect(rebuilt.text).toContain("LATEST_TEXT_RESULT");
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS;
+    else process.env.OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS = previous;
+  }
+});
+
 test("invalid steering media rejects before the image switch and keeps the result", async () => {
   const host = "image-invalid-steering";
   const image = Buffer.alloc(20 * 1024, 59).toString("base64");
@@ -646,14 +750,14 @@ test("invalid steering media rejects before the image switch and keeps the resul
 test("image delivery preserves explicit repeated request-ID rejection", async () => {
   const host = "image-repeat-id";
   const image = Buffer.alloc(16 * 1024, 61).toString("base64");
-  const headers = { "x-opencode-antigravity-message": "fixed-image-request" };
+  const request = { requestId: "fixed-image-request" };
   const messages: any[] = [{ role: "user", content: "FAKE_MCP REPEAT_ID" }];
-  const first = await (await send(host, messages, {}, headers)).json();
+  const first = await (await send(host, messages, request)).json();
   const call = first.content.find((part: any) => part.type === "tool_use");
   messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
     { type: "tool_result", tool_use_id: call.id, content: [hostImage(image)] },
   ] });
-  const response = await send(host, messages, {}, headers);
+  const response = await send(host, messages, request);
   expect(response.status).toBe(400);
   const failure = await response.json();
   expect(failure.content).toBeUndefined();
@@ -671,7 +775,7 @@ test("image switch cancels calls that were never reported as a host batch", asyn
   const call = first.content.find((part: any) => part.type === "tool_use");
   const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
   const bridge = hostBridge(key, host, directory);
-  const url = getProxyBaseUrl().replace(/\/v1$/, "") + `/mcp/${bridge.token}/${bridge.catalogID}`;
+  const url = (await ensureHostBridgeServer()) + `/mcp/${bridge.token}/${bridge.catalogID}`;
   // The parked turn consumed its own park; the next queue push is the late call.
   const queue = (bridge as any).queue;
   const push = queue.push;
@@ -769,6 +873,117 @@ test("cancelling the continuation during the handoff submits no replacement prom
     try { pause.mockRestore(); } catch { /* preserve the original failure */ }
     try { await closeHostBridges(host); } catch { /* preserve the original failure */ }
     try { if (response) await within(response, "response settle"); } catch { /* already settled */ }
+  }
+});
+
+test("handoff retains ownership while old worker closes, and lifecycle close cancels replacement", async () => {
+  const host = "image-close-gated";
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP CLOSE_GATED" }];
+  const first = await (await send(host, messages)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  const bridge = hostBridge(key, host, directory);
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: call.id, content: [hostImage(Buffer.alloc(100, 3).toString("base64"))] },
+  ] });
+  const { sessionPool } = await import("../src/session-pool.js");
+  const forget = sessionPool.forgetWorker.bind(sessionPool);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let reached!: () => void;
+  const started = new Promise<void>(resolve => { reached = resolve; });
+  const pause = spyOn(sessionPool, "forgetWorker").mockImplementation(async (workerKey) => {
+    if (workerKey === key) { reached(); await gate; }
+    return forget(workerKey);
+  });
+  let continuation: Promise<Response> | undefined;
+  let closing: Promise<void> | undefined;
+  try {
+    const before = await promptLines();
+    continuation = send(host, messages);
+    await within(started, "old worker close");
+    expect(hostBridge(key, host, directory)).toBe(bridge);
+    const competing = await send(host, messages);
+    expect(competing.status).toBeGreaterThanOrEqual(400);
+    closing = closeHostBridges(host);
+    release();
+    await closing;
+    expect((await continuation).status).toBeGreaterThanOrEqual(400);
+    expect(await promptLines()).toBe(before);
+    expect((await sessionStore.toolCall(key, call.id))?.resultDigest).toBeString();
+  } finally {
+    release();
+    await closing;
+    if (continuation) await continuation;
+    pause.mockRestore();
+    await closeHostBridges(host);
+  }
+});
+
+test("host deletion during gated image handoff tombstones and removes state without resurrection", async () => {
+  const host = "image-delete-gated";
+  const messages: any[] = [{ role: "user", content: "FAKE_MCP DELETE_GATED" }];
+  const first = await (await send(host, messages)).json();
+  const calls = first.content.filter((part: any) => part.type === "tool_use");
+  expect(calls).toHaveLength(1);
+  const call = calls[0];
+  const [key] = (await sessionStore.entries()).find(([, record]) => record.conversation?.hostSessionID === host)!;
+  messages.push({ role: "assistant", content: first.content }, { role: "user", content: [
+    { type: "tool_result", tool_use_id: call.id, content: [hostImage(Buffer.alloc(100, 4).toString("base64"))] },
+  ] });
+  const { sessionPool } = await import("../src/session-pool.js");
+  const forget = sessionPool.forgetWorker.bind(sessionPool);
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let reached!: () => void;
+  const started = new Promise<void>(resolve => { reached = resolve; });
+  const pause = spyOn(sessionPool, "forgetWorker").mockImplementation(async workerKey => {
+    if (workerKey === key) { reached(); await gate; }
+    return forget(workerKey);
+  });
+  const saveCall = spyOn(sessionStore, "saveToolCall");
+  let continuation: Promise<Response> | undefined;
+  let deletion: Promise<void> | undefined;
+  try {
+    const before = await promptLines();
+    continuation = send(host, messages);
+    await within(started, "deletion handoff close");
+    const saved = await sessionStore.toolCall(key, call.id);
+    expect(saved?.resultDigest).toBeString();
+    expect(saved?.delivery).toBe("result-persisted");
+    saveCall.mockClear();
+    // Execute the same tombstone-first sequence as the session.deleted worker.
+    await sessionStore.markHostDeleted(host);
+    expect(await sessionStore.isHostDeleted(host)).toBe(true);
+    deletion = (async () => {
+      await closeHostBridges(host);
+      await sessionPool.quiesceHostSession(host);
+      await sessionStore.removeHostSession(host);
+    })();
+    release();
+    await within(deletion, "host deletion");
+    const outcome = await (await continuation).json();
+    expect(outcome.error).toBeDefined();
+    expect(outcome.content).toBeUndefined();
+    expect(await promptLines()).toBe(before);
+    expect(saveCall).not.toHaveBeenCalled();
+    expect(await sessionStore.isHostDeleted(host)).toBe(true);
+    expect(await sessionStore.get(key)).toBeUndefined();
+    expect(await sessionStore.toolCall(key, call.id)).toBeUndefined();
+    const retry = await send(host, messages);
+    expect(retry.status).toBeGreaterThanOrEqual(400);
+    expect((await retry.json()).content).toBeUndefined();
+    expect(await promptLines()).toBe(before);
+    expect(saveCall).not.toHaveBeenCalled();
+    expect(await sessionStore.get(key)).toBeUndefined();
+    expect(await sessionStore.toolCall(key, call.id)).toBeUndefined();
+  } finally {
+    release();
+    if (deletion) await deletion;
+    if (continuation) await continuation;
+    saveCall.mockRestore();
+    pause.mockRestore();
+    await closeHostBridges(host);
   }
 });
 

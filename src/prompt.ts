@@ -149,6 +149,7 @@ async function attachmentPart(part: MessageContentPart, roots: string[], budget:
     if (source && typeof source === "object" && (source as Record<string, unknown>).type === "base64") {
       const sourceRecord = source as Record<string, unknown>;
       if (typeof sourceRecord.data === "string") {
+        if (budget.signal?.aborted) throw new AgyAbortError();
         const mediaType = typeof sourceRecord.media_type === "string" ? sourceRecord.media_type : undefined;
         if (!mediaType || !mediaType.startsWith("image/")) throw new UnsupportedMediaError(mediaType || "attachment_reference");
         reserveMedia(budget, mediaBytes(sourceRecord.data));

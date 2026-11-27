@@ -12,6 +12,7 @@ import { hostResults } from "../src/host-tools.js";
 import { SessionPool } from "../src/session-pool.js";
 import { SessionStore } from "../src/session-store.js";
 import { protocol as anthropicProtocol } from "@opencode/ai/protocols/anthropic-messages";
+import { sdkPromptToHostMessages } from "../src/sdk-prompt.js";
 
 async function withFixturePool(run: (pool: SessionPool, root: string, executable: string) => Promise<void>) {
   const keys = ["OPENCODE_ANTIGRAVITY_DATA_DIR", "OPENCODE_ANTIGRAVITY_HISTORY_MAX_CHARS", "FAKE_ACP_PROMPT_LOG", "FAKE_ACP_STATE_FILE"];
@@ -36,6 +37,18 @@ const image = (data: string) => ({ type: "image" as const, data, mimeType: "imag
 const hostImage = (data: string) => ({ type: "image", source: { type: "base64", media_type: "image/png", data } });
 const text = (blocks: ContentBlock[]) => blocks.filter(b => b.type === "text").map(b => b.text).join("\n");
 const group = (value: string, operative = false, message: ReconstructionGroup["message"] = { role: "user", content: value }): ReconstructionGroup => ({ blocks: [{ type: "text", text: value }], operative, message });
+
+test("explicit JPEG and SDK image retain media type with validation and cancellation", async () => {
+  const jpeg = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "/9j/2Q==" } };
+  expect(await messageContentToAcp([jpeg])).toEqual([{ type: "image", mimeType: "image/jpeg", data: "/9j/2Q==" }]);
+  const sdk = sdkPromptToHostMessages([{ role: "user", content: [{ type: "file", mediaType: "image/jpeg", data: "/9j/2Q==" }] }]);
+  expect((await normalizePrompt(sdk)).blocks).toContainEqual({ type: "image", mimeType: "image/jpeg", data: "/9j/2Q==" });
+  for (const data of ["!!!!", "A".repeat(Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4 + 4)])
+    await expect(messageContentToAcp([{ ...jpeg, source: { ...jpeg.source, data } }])).rejects.toThrow();
+  await expect(messageContentToAcp([{ ...jpeg, source: { ...jpeg.source, media_type: "application/pdf" } }])).rejects.toThrow();
+  const controller = new AbortController(); controller.abort();
+  await expect(messageContentToAcp([jpeg], [], { remaining: MAX_MEDIA_BYTES, signal: controller.signal })).rejects.toThrow("cancel");
+});
 
 test("realistic images use media transport and estimated context, not text/base64 budget", async () => {
   const data = Buffer.alloc(128 * 1024, 31).toString("base64");
