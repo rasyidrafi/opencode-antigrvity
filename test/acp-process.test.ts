@@ -192,24 +192,22 @@ describe("ACP process manager", () => {
     const worker = await createAcpWorker({
       cwd: process.cwd(),
       executable: fixture,
-      model: "gemini-3.8-flash",
+      model: "target-model",
       effort: "high",
       environment: { FAKE_ACP_THOUGHT_LEVEL: "1", FAKE_ACP_RPC_LOG: log },
     });
     try {
       const rpcs = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-      expect(rpcs).toContainEqual(expect.objectContaining({
-        method: "session/set_config_option",
-        params: expect.objectContaining({ configId: "thought_level", value: "high" }),
-      }));
-      expect(rpcs).toContainEqual(expect.objectContaining({
-        method: "session/set_config_option",
-        params: expect.objectContaining({ configId: "model", value: "gemini-3.8-flash" }),
-      }));
+      expect(rpcs.filter(rpc => rpc.method === "session/set_config_option").map(rpc => [rpc.params.configId, rpc.params.value])).toEqual([["model", "target-model"], ["target_effort", "high"]]);
     } finally {
       await worker.stop(true);
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  test("rejects effort when the target model removes its selector", async () => {
+    await expect(createAcpWorker({ cwd: process.cwd(), executable: fixture, model: "target-model", effort: "high", environment: { FAKE_ACP_THOUGHT_LEVEL: "remove" } }))
+      .rejects.toThrow(/does not expose a thinking level selector/);
   });
 
   test("never sends authenticate even with an explicit OAuth method", async () => {
@@ -226,7 +224,7 @@ describe("ACP process manager", () => {
 
   test("authentication required does not trigger an interactive retry", async () => {
     await expect(createAcpWorker({ cwd: process.cwd(), executable: fixture,
-      environment: { FAKE_ACP_REQUIRE_AUTH: "1", FAKE_ACP_REJECT_AUTHENTICATE: "1" } })).rejects.toThrow("Sign in through the agy CLI");
+      environment: { FAKE_ACP_REQUIRE_AUTH: "1", FAKE_ACP_REJECT_AUTHENTICATE: "1" } })).rejects.toThrow("Sign in to the plugin's private agy ACP profile");
   });
 
   test("a browser login attempt during a turn becomes an auth error", async () => {

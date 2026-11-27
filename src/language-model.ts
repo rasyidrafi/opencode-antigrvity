@@ -123,11 +123,15 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
       ...(typeof options.maxOutputTokens === "number" ? { outputBudget: options.maxOutputTokens } : {}),
       executable: runtime.catalog.executable,
       catalogScope: runtime.manager.scope,
+      credentialRevision: runtime.manager.credentialRevision,
       hostTools: true,
     };
   }
 
   async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
+    if (options.toolChoice?.type === "required" || options.toolChoice?.type === "tool") {
+      throw this.providerError(new AgyError("invalid_request", "Antigravity cannot enforce required or named tool choices", { code: "agy_tool_choice_unsupported", retryable: false }));
+    }
     const headers = options.headers ?? {};
     const kind = requestKind(headers[REQUEST_KIND_HEADER] as string | undefined);
     const directory = headers[DIRECTORY_HEADER] ?? process.cwd();
@@ -163,6 +167,8 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
     const bridge = hostBridge(bridgeKey(directory, sessionID), sessionID, directory);
     const baseURL = await ensureHostBridgeServer();
     const fork = headers[FORK_HEADER];
+    const cancellation = new AbortController();
+    const signal = options.abortSignal ? AbortSignal.any([options.abortSignal, cancellation.signal]) : cancellation.signal;
     const events = bridge.request({
       messages,
       system,
@@ -170,9 +176,9 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
       settings,
       baseURL,
       fork: typeof fork === "string" && fork.length > 0,
-      signal: options.abortSignal,
+      signal,
     });
-    return this.streamEvents(events, options.abortSignal);
+    return this.streamEvents(events, signal, cancellation);
   }
 
   private async runUtility(
@@ -198,6 +204,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
         model: selected.acpModel,
         ...(selected.effort ? { effort: selected.effort } : {}),
         executable: runtime.catalog.executable,
+        credentialRevision: runtime.manager.credentialRevision,
         signal: options.abortSignal,
         ...(kind === "compaction" ? { maxChars: TRANSCRIPT_INPUT_BYTE_CAP } : {}),
       });
@@ -222,7 +229,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
     return { stream };
   }
 
-  private streamEvents(events: AsyncIterable<BridgeEvent>, signal: AbortSignal | undefined): LanguageModelV3StreamResult {
+  private streamEvents(events: AsyncIterable<BridgeEvent>, signal: AbortSignal, cancellation: AbortController): LanguageModelV3StreamResult {
     const converter = new StreamConverter();
     let iterator: AsyncIterator<BridgeEvent> | undefined;
     let controller: ReadableStreamDefaultController<LanguageModelV3StreamPart> | undefined;
@@ -276,7 +283,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
         })();
       },
       cancel: () => {
-        void iterator?.return?.();
+        cancellation.abort();
       },
     });
     return { stream };

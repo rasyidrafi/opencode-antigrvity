@@ -237,7 +237,7 @@ export class HostBridge {
       const results = hostResults(input.messages);
       // The ID alone is not authority to replace the originating arguments.
       for (const id of results.keys()) {
-        const saved = await sessionStore.toolCall(this.key, id);
+        const saved = await this.readToolRecord(id);
         // A fork copies the source's history without its tool records; that
         // history is context, not a pending call to re-execute.
         if (!saved) {
@@ -330,7 +330,7 @@ export class HostBridge {
           const missing: HostCall[] = [];
           const restored: Record<string, unknown>[] = [];
           for (const call of calls) {
-            const saved = await sessionStore.toolCall(this.key, call.id);
+            const saved = await this.readToolRecord(call.id);
             if (!saved) {
               // A fork copies the source's history without its tool records;
               // that history is context, not a pending call to re-execute.
@@ -365,6 +365,7 @@ export class HostBridge {
           if (restored.length) messages.push({ role: "user", content: restored });
         }
         const normalized = await normalizePrompt(messages, { allowedRoots: [this.cwd], hostTools: true, signal: input.signal });
+        if (this.closed || input.signal?.aborted) throw new AgyAbortError();
         this.tools = tools; this.signature = signature;
         this.queue = new AsyncEventQueue<Wake>(); this.controller = new AbortController();
         this.settled.clear(); this.reported.clear(); this.active = true;
@@ -402,6 +403,7 @@ export class HostBridge {
           if (!this.pending.size) continue;
           // Short coalescing window; late arrivals are delivered on the next host step.
           await new Promise((resolve) => setTimeout(resolve, 25));
+          if (this.closed || input.signal?.aborted) throw new AgyAbortError();
           this.reported = new Set(this.pending.keys());
           parked = true;
           const contextOccupancy = freezeContextOccupancy(this.turn?.responseCursor?.contextOccupancy, this.now());
@@ -444,6 +446,27 @@ export class HostBridge {
       await this.pumping;
       await this.sessions.forgetWorker(this.key);
     })();
+  }
+
+  /** Copy verified host provenance, never the previous native session ID. */
+  private async readToolRecord(id: string) {
+    const current = await sessionStore.toolCall(this.key, id);
+    if (current || !this.sessionID) return current;
+    const match = /^host-v1:[^:]*:([a-f0-9]{64})$/.exec(this.key);
+    if (!match) return;
+    const candidates = [];
+    for (const [key, binding] of await sessionStore.entries()) {
+      if (key === this.key || !key.startsWith("host-v1:") || !key.endsWith(`:${match[1]}`) || binding.conversation?.hostSessionID !== this.sessionID) continue;
+      const record = await sessionStore.toolCall(key, id);
+      if (record?.hostSessionID === this.sessionID) candidates.push(record);
+    }
+    if (!candidates.length) return;
+    const [first] = candidates;
+    if (candidates.some(record => canonical(record.call) !== canonical(first.call) || record.resultDigest !== first.resultDigest)) {
+      throw new AgyError("invalid_request", "Conflicting tool records across Antigravity profiles; execution cannot be retried", { retryable: false });
+    }
+    await sessionStore.saveToolCall(this.key, id, candidates.find(record => record.result) ?? first, true);
+    return sessionStore.toolCall(this.key, id);
   }
 }
 

@@ -70,7 +70,7 @@ export function acpModelCatalog(
 }
 
 /** No invented availability when discovery has never succeeded. */
-export function fallbackAcpModelCatalog(executable = "agy_acp_server.par", version: string | null = null): AcpModelCatalog {
+export function fallbackAcpModelCatalog(executable = "agy", version: string | null = null): AcpModelCatalog {
   return { ...acpModelCatalog(executable, version), source: "empty", discoveredAt: 0 };
 }
 
@@ -144,19 +144,13 @@ export function resolveAcpModelSelection(requestedModel: string | undefined, req
   if (!effort || effort === "default") return { requestedModel: raw, acpModel: model.acpModel };
   if (!(SUPPORTED_EFFORTS as readonly string[]).includes(effort)) throw new AgyError("invalid_request", `Unsupported effort "${effort}"`, { code: "agy_invalid_effort" });
   const level = effort as AcpEffort;
-  if (catalog.thinking) {
-    // 1.4 applies thinking through its own session option, not a model id.
-    if (catalog.thinking.values.length && !catalog.thinking.values.includes(level)) {
-      throw new AgyError("invalid_request", `Antigravity did not advertise effort "${level}" for "${raw}"`, { code: "agy_invalid_effort", details: { available: catalog.thinking.values } });
-    }
-    return { requestedModel: raw, acpModel: model.acpModel, effort: level };
-  }
   const variant = model.variants?.[level];
   if (variant) return { requestedModel: raw, acpModel: variant.acpModel };
   const sibling = model.family && catalog.exactModels.find((entry) => entry.family === model.family && entry.effort === level);
   if (sibling) return { requestedModel: raw, acpModel: sibling.acpModel };
   if (model.effort === level) return { requestedModel: raw, acpModel: model.acpModel };
-  throw new AgyError("invalid_request", `Antigravity did not advertise effort "${level}" for "${raw}"`, { code: "agy_invalid_effort" });
+  // A separate selector can appear only after switching to the target model.
+  return { requestedModel: raw, acpModel: model.acpModel, effort: level };
 }
 
 export function providerModelEntries(catalog: AcpModelCatalog): AcpModel[] { return catalog.models; }

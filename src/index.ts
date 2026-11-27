@@ -184,7 +184,7 @@ export const AntigravityPlugin = Plugin.define({
       });
 
       // Match V1: install the non-secret loopback marker automatically. Google
-      // authentication comes only from the already-authenticated agy CLI.
+      // authentication comes from the already-authenticated agy CLI.
       const connection = await ctx.integration.connection.active(INTEGRATION_ID);
       const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
       if (credential?.type !== "key" || credential.key !== LOCAL_API_KEY) {
@@ -351,7 +351,7 @@ export const AntigravityPlugin = Plugin.define({
 });
 
 export { acpModelCatalog, fallbackAcpModelCatalog } from "./models.js";
-export { detectAcpServer } from "./acp-detect.js";
+export { detectAgyAcp } from "./agy-cli.js";
 export { getRuntime, refreshModels } from "./runtime.js";
 export { sessionPool } from "./session-pool.js";
 

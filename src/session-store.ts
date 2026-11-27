@@ -336,16 +336,21 @@ export class SessionStore {
     finally { await unlock(); }
   }
 
-  async saveToolCall(key: string, id: string, value: Record<string, unknown>): Promise<void> {
+  async saveToolCall(key: string, id: string, value: Record<string, unknown>, insertOnly = false): Promise<void> {
     const host = typeof value.hostSessionID === "string" ? value.hostSessionID : undefined;
     const release = host ? await this.lockTurn(`host-record:${host}`, 5000) : undefined;
     let unlock: (() => Promise<void>) | undefined;
     try {
       unlock = await this.lockTurn(`tool-record:${key}:${id}`, 5000);
       if (host && await this.isHostDeleted(host)) throw new AgyError("invalid_request", "Host session has been deleted");
+      const path = join(dataDirectory(), "tools", digest(key), `${digest(id)}.json`);
+      if (insertOnly) {
+        try { await readFile(path); return; }
+        catch (error: any) { if (error.code !== "ENOENT") throw error; }
+      }
       const record = { ...value, version: 2, conversationKey: key, hostSessionID: value.hostSessionID ?? null, profile: value.profile ?? null, profileDigest: value.profileDigest ?? (typeof value.profile === "string" ? digest(value.profile) : null), argumentsDigest: value.argumentsDigest ?? digest(canonical((value.call as any)?.input)), updatedAt: Date.now() };
       validateTool(record, key, id);
-      await atomicWrite(join(dataDirectory(), "tools", digest(key), `${digest(id)}.json`), record);
+      await atomicWrite(path, record);
     } finally { await releaseLocks(unlock, release); }
   }
 

@@ -14,6 +14,7 @@ export type OneShotSettings = {
   model: string;
   effort?: AcpEffort;
   executable?: string;
+  credentialRevision?: string | null;
   signal?: AbortSignal;
   /** Keep the current generate request intact; reject rather than silently truncate. */
   preserveRequest?: string;
@@ -104,6 +105,7 @@ export async function runAcpOneShot(prompt: string, settings: OneShotSettings): 
     worker = await createAcpWorker({
       cwd: utilityCwd,
       executable: settings.executable,
+      credentialRevision: settings.credentialRevision,
       model: settings.model,
       effort: settings.effort,
       mode: "plan",

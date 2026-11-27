@@ -48,7 +48,7 @@ test("ACP config options win over legacy models and preserve opaque wire IDs", (
   expect(catalog.models.map((m) => m.id)).toEqual(["gemini-pro-agent", "new-opaque-id"]);
   expect(resolveAcpModelSelection(undefined, undefined, catalog).acpModel).toBe("gemini-pro-agent");
   expect(() => resolveAcpModelSelection("gemini-3.1-pro-high", undefined, catalog)).toThrow(/Unknown/);
-  expect(() => resolveAcpModelSelection("gemini-pro-agent", "high", catalog)).toThrow(/did not advertise/);
+  expect(resolveAcpModelSelection("gemini-pro-agent", "high", catalog)).toEqual({ requestedModel: "gemini-pro-agent", acpModel: "gemini-pro-agent", effort: "high" });
   expect(buildProviderModels(catalog)[1].name).toContain("limits estimated");
 });
 
@@ -69,7 +69,7 @@ test("1.4 family ids and thought_level replace effort-suffixed model ids", () =>
       { id: "thought_level", category: "thought_level", options: [{ value: "low" }, { value: "high" }] },
     ],
   }, "fake")!;
-  expect(() => resolveAcpModelSelection("gemini-3.8-flash", "medium", limited)).toThrow(/did not advertise/);
+  expect(resolveAcpModelSelection("gemini-3.8-flash", "medium", limited).effort).toBe("medium");
 });
 
 test("missing, empty, legacy, and colliding catalogs do not invent model availability", () => {

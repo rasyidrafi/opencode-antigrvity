@@ -217,7 +217,7 @@ input.on("line", (line) => {
   if (message?.method === "initialize") {
     respond(message.id, {
       protocolVersion: 1,
-      agentCapabilities: { loadSession: process.env.FAKE_ACP_LOAD_MODE !== "unsupported", promptCapabilities: { image: true, audio: true, embeddedContext: true }, sessionCapabilities: { list: {}, resume: {} }, auth: { logout: {} } },
+      agentCapabilities: { promptCapabilities: { image: true, audio: true, embeddedContext: true }, sessionCapabilities: { list: {}, ...(process.env.FAKE_ACP_LOAD_MODE !== "unsupported" ? { resume: {} } : {}) }, auth: { logout: {} } },
       authMethods: [{ id: "oauth-personal", name: "Fake Google" }],
       agentInfo: { name: "fake-antigravity-acp", title: "Fake ACP", version: "test" },
     });
@@ -236,14 +236,14 @@ input.on("line", (line) => {
       return;
     }
     // Distinct sessions must not alias one private trajectory across unrelated
-    // host owners. session/load below still preserves its requested identity.
+    // host owners. session/resume below still preserves its requested identity.
     sessionId = `fake-acp-session-${randomUUID()}`;
     const thoughtLevel = Boolean(process.env.FAKE_ACP_THOUGHT_LEVEL);
     respond(message.id, {
       sessionId,
       configOptions: [
         { id: "model", category: "model", name: "Model", type: "select", currentValue: thoughtLevel ? "gemini-3.8-flash" : "gemini-3.8-flash-high", options: thoughtLevel
-          ? [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }]
+          ? [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }, { value: "target-model", name: "Target" }]
           : [
             { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
             { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
@@ -251,13 +251,13 @@ input.on("line", (line) => {
             { value: "fake-model-low", name: "Fake Model" },
             ...(process.env.FAKE_ACP_EXTRA_MODEL ? [{ value: process.env.FAKE_ACP_EXTRA_MODEL, name: process.env.FAKE_ACP_EXTRA_MODEL }] : []),
           ] },
-        ...(thoughtLevel ? [{ id: "thought_level", category: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [
+        ...(process.env.FAKE_ACP_THOUGHT_LEVEL === "remove" ? [{ id: "thought_level", category: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [
           { value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" },
         ] }] : []),
         { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }, { value: "plan", name: "Plan" }, { value: "default", name: "Default" }] },
       ],
     });
-  } else if (message?.method === "session/load") {
+  } else if (message?.method === "session/resume") {
     if (process.env.FAKE_ACP_LOAD_MODE === "missing") { remembered = ""; fail(message.id, -32000, "Session not found"); return; }
     if (process.env.FAKE_ACP_LOAD_MODE === "not-resumable") { remembered = ""; fail(message.id, -32000, "Session is not resumable"); return; }
     if (process.env.FAKE_ACP_LOAD_MODE === "method-unsupported") { fail(message.id, -32601, "Method not found"); return; }
@@ -267,7 +267,12 @@ input.on("line", (line) => {
     sessionId = String(message.params?.sessionId ?? sessionId);
     respond(message.id, { configOptions: [] });
   } else if (message?.method === "session/set_config_option") {
-    respond(message.id, { configOptions: [] });
+    const thoughtLevel = process.env.FAKE_ACP_THOUGHT_LEVEL;
+    respond(message.id, { configOptions: thoughtLevel ? [
+      { id: "model", category: "model", name: "Model", type: "select", currentValue: "target-model", options: [{ value: "gemini-3.8-flash", name: "Gemini" }, { value: "target-model", name: "Target" }] },
+      { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }] },
+      ...(thoughtLevel === "1" ? [{ id: "target_effort", category: "thought_level", type: "select", name: "Thinking", currentValue: "high", options: [{ value: "high", name: "High" }] }] : []),
+    ] : [] });
   } else if (message?.method === "session/prompt") {
     void handlePrompt(message);
   } else if (message?.method === "session/cancel") {

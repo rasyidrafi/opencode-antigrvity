@@ -1,17 +1,20 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LanguageModelV3FunctionTool, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { DIRECTORY_HEADER, EFFORT_HEADER, FORK_HEADER, MODEL_HEADER, REQUEST_KIND_HEADER, SESSION_HEADER } from "../src/constants.js";
-import { startRuntime, stopRuntime } from "../src/runtime.js";
+import { getRuntime, startRuntime, stopRuntime } from "../src/runtime.js";
 import { driveModel, textOf, toolCallsOf } from "./fixtures/drive.js";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
 import { sdkPromptToHostMessages } from "../src/sdk-prompt.js";
 import { toAIUsage } from "../src/stream-converter.js";
 import { buildCompactionPrompt } from "../src/utility.js";
 import { hostBridge } from "../src/host-tools.js";
-import { bridgeKey } from "../src/language-model.js";
+import { AntigravityLanguageModel, bridgeKey } from "../src/language-model.js";
+import * as promptModule from "../src/prompt.js";
+import { sessionStore } from "../src/session-store.js";
+import { canonical } from "../src/coordinator.js";
 
 let compatibility: ReturnType<typeof fixtureCompatibility>;
 
@@ -156,11 +159,101 @@ describe("AntigravityLanguageModel", () => {
     expect(hostBridge(bridgeKey(directory, "ses_no_tools")).tools).toEqual([]);
   });
 
+  test("rejects required and named tool choices before routing", async () => {
+    for (const kind of ["chat", "title"]) {
+      for (const toolChoice of [{ type: "required" } as const, { type: "tool", toolName: "shell" } as const]) {
+        await expect(driveModel({ prompt: [user("unused")], headers: { ...headers, [REQUEST_KIND_HEADER]: kind }, tools, toolChoice }))
+          .rejects.toThrow(/cannot enforce required or named tool choices/);
+      }
+    }
+  });
+
+  test("reconstructs a completed tool batch from the prior runtime without reusing its native ID", async () => {
+    const session = "ses_migrated_tool_batch";
+    await getRuntime()?.manager.refresh();
+    const key = bridgeKey(directory, session);
+    const oldKey = `host-v1:standalone:${key.split(":").at(-1)}`;
+    const id = "migration-call";
+    await sessionStore.set(oldKey, { version: 1, sessionId: "old-native-id", model: "model", cwd: directory, cliVersion: "1.3.0", createdAt: Date.now(), updatedAt: Date.now(), lastUsedAt: Date.now(),
+      conversation: { version: 1, epoch: 0, hostSessionID: session, boundary: [], instructions: "", resumable: false } });
+    await sessionStore.saveToolCall(oldKey, id, { call: { type: "tool_use", id, name: "shell", input: {} }, hostSessionID: session, profile: canonical({ model: "model", tools: [{ name: "shell", input_schema: {} }] }) });
+    await sessionStore.saveToolResult(oldKey, id, { content: [{ type: "text", text: "already executed" }], isError: false });
+    const { result: _expired, ...record } = (await sessionStore.toolCall(oldKey, id))!;
+    await sessionStore.saveToolCall(oldKey, id, { ...record, payloadExpired: true });
+    const drive = (value: string) => driveModel({ headers: { ...headers, [SESSION_HEADER]: session }, tools, prompt: [user("previous request"),
+      { role: "assistant", content: [{ type: "tool-call", toolCallId: id, toolName: "shell", input: {} }] },
+      { role: "tool", content: [{ type: "tool-result", toolCallId: id, toolName: "shell", output: { type: "text", value } }] }, user("FAKE_STREAM")] });
+    const conflict = (await drive("conflicting result")).find(part => part.type === "error");
+    expect(String(conflict?.error)).toContain("Conflicting result for completed tool call");
+    const parts = await drive("already executed");
+    for (const part of parts) if (part.type === "error") throw part.error;
+    expect(textOf(parts)).toContain("FAKE_STREAM_OK");
+    expect(toolCallsOf(parts)).toEqual([]);
+    expect((await sessionStore.get(key))?.sessionId).not.toBe("old-native-id");
+    expect((await sessionStore.toolCall(key, id))?.result).toEqual({ content: [{ type: "text", text: "already executed" }], isError: false });
+  });
+
+  test("reader cancellation closes a quiet bridge without aborting the caller", async () => {
+    const session = "ses_reader_cancel";
+    const model = new AntigravityLanguageModel("gemini-3.8-flash", {});
+    const signal = new AbortController().signal;
+    const bridge = hostBridge(bridgeKey(directory, session), session, directory);
+    const rpcLog = join(directory, "cancel-rpc.jsonl");
+    process.env.FAKE_ACP_RPC_LOG = rpcLog;
+    const { stream } = await model.doStream({ prompt: [user("FAKE_HANG reader-cancel")], headers: { ...headers, [SESSION_HEADER]: session }, abortSignal: signal });
+    const reader = stream.getReader();
+    try {
+      await reader.read();
+      const deadline = Date.now() + 2500;
+      while (!(await readFile(join(directory, "prompts.jsonl"), "utf8").catch(() => "")).includes("reader-cancel") && Date.now() < deadline) await Bun.sleep(10);
+      expect(await readFile(join(directory, "prompts.jsonl"), "utf8")).toContain("reader-cancel");
+      await reader.cancel();
+      expect(hostBridge(bridgeKey(directory, session), session, directory)).not.toBe(bridge);
+      expect(signal.aborted).toBe(false);
+      const cancelDeadline = Date.now() + 2500;
+      while (!(await readFile(rpcLog, "utf8")).includes("session/cancel") && Date.now() < cancelDeadline) await Bun.sleep(10);
+      expect(await readFile(rpcLog, "utf8")).toContain("session/cancel");
+    } finally {
+      delete process.env.FAKE_ACP_RPC_LOG;
+      await bridge.close();
+    }
+  });
+
+  test("cancelling during prompt preparation does not start a turn", async () => {
+    const session = "ses_cancel_preparation";
+    const bridge = hostBridge(bridgeKey(directory, session), session, directory);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const normalize = promptModule.normalizePrompt;
+    const preparation = spyOn(promptModule, "normalizePrompt").mockImplementation(async (messages, options) => {
+      const result = await normalize(messages, options);
+      entered.resolve();
+      await release.promise;
+      return result;
+    });
+    const request = spyOn(bridge, "request");
+    try {
+      const model = new AntigravityLanguageModel("gemini-3.8-flash", {});
+      const { stream } = await model.doStream({ prompt: [user("FAKE_STREAM cancel-preparation")], headers: { ...headers, [SESSION_HEADER]: session } });
+      await entered.promise;
+      await stream.cancel();
+      release.resolve();
+      // Wait behind the stream's pending generator read, then check for a turn.
+      await request.mock.results[0].value.return(undefined);
+      expect(await readFile(join(directory, "prompts.jsonl"), "utf8")).not.toContain("cancel-preparation");
+    } finally {
+      release.resolve();
+      request.mockRestore();
+      preparation.mockRestore();
+      await bridge.close();
+    }
+  });
+
   test("surfaces denied ACP permission requests in the model stream", async () => {
     const parts = await driveModel({ prompt: [user("FAKE_PERMISSION")], headers: { ...headers, [SESSION_HEADER]: "ses_permission" }, tools });
     const reasoning = parts.filter((part) => part.type === "reasoning-delta").map((part) => part.type === "reasoning-delta" ? part.delta : "").join("");
     expect(reasoning).toContain("Run fake tool (denied)");
-    expect(reasoning).toContain("OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow");
+    expect(reasoning).toContain("OpenCode owns the tool execution policy");
   });
 
   test("accepts image attachments", async () => {

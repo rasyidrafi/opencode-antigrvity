@@ -1,0 +1,7 @@
+# Antigravity ACP 1.5 migration
+
+The supported runtime is Google's **ACP Registry 1.5.2 Linux x64** executable and its matching `localharness_external`. Both files are verified against pinned executable hashes. The ZIP was verified against the official ACP Registry manifest. Set `OPENCODE_ANTIGRAVITY_ACP_PATH` to the extracted `agy_acp_server.par`, or place both files together on `PATH`. There is no 1.3 fallback.
+
+This is not the CLI-embedded `agy acp` runtime. CLI 1.5.18 failed the native tool A/B test: with no MCP servers and `disableBuiltInTools: true`, it called a native tool and read a sentinel file. The registry runtime supports `_meta.antigravity.enabledTools: []`; its embedded source applies the filter in agent construction and restores it on resume. Live tests through this adapter verified that both fresh and resumed sessions refused to read a sentinel file with no MCP servers, with zero tool events. A separate adapter inference smoke test returned its expected marker.
+
+Sign in through `agy`. The adapter reads the personal CLI refresh credential from `$GEMINI_HOME/antigravity-cli/antigravity-oauth-token` (default `$HOME/.gemini`), translates it into the standalone server's format, and writes it only into an account-scoped private profile. It does not modify the CLI credential, use a pre-existing standalone credential, or start interactive login. Missing CLI credentials fail before ACP starts. Unsupported binaries and platforms are rejected.

@@ -34,6 +34,7 @@ export type SessionSettings = {
   cliVersion?: string | null;
   executable?: string;
   catalogScope?: string;
+  credentialRevision?: string | null;
   hostTools?: boolean;
   mcpServers?: AcpWorkerOptions["mcpServers"];
   waitingForTools?: () => boolean;
@@ -114,6 +115,7 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
     cwd: settings.cwd,
     executable: settings.executable,
     catalogScope: settings.catalogScope,
+    credentialRevision: settings.credentialRevision,
     model: settings.model,
     effort: settings.effort,
     sessionId,

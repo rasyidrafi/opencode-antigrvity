@@ -1,11 +1,31 @@
 import { test, expect } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { SessionStore } from "../src/session-store.js";
 import { canonical } from "../src/coordinator.js";
 
 const hash = (v: string) => createHash("sha256").update(v).digest("hex");
+test("late provenance import cannot overwrite a result written after its miss", async () => {
+  const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
+  const root = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/tool-import-`);
+  process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = root;
+  try {
+    const late = new SessionStore(), winner = new SessionStore();
+    const record = { call: { id: "call", name: "shell", input: {} } };
+    expect(await late.toolCall("new-scope", "call")).toBeUndefined();
+    await winner.saveToolCall("new-scope", "call", record, true);
+    const result = { content: [{ type: "text", text: "winner" }], isError: false };
+    await winner.saveToolResult("new-scope", "call", result);
+    await late.saveToolCall("new-scope", "call", record, true);
+    expect((await late.toolCall("new-scope", "call"))?.result).toEqual(result);
+    await expect(late.saveToolResult("new-scope", "call", { ...result, content: [] })).rejects.toThrow("Conflicting result");
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
+    else process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 test("tool V2 validates versions, ownership, profile and digests on every read; corruption stays nonretryable", async () => {
   const previous = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;
   const root = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/tool-record-`);

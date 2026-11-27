@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createAcpWorker } from "../src/acp-process.js";
-import { detectAcpServer } from "../src/acp-detect.js";
+import { detectAgyAcp as detectAcpServer } from "../src/agy-cli.js";
 import { mapAcpEvent } from "../src/translate.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { runAcpOneShot } from "../src/utility.js";

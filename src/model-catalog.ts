@@ -3,13 +3,12 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createAcpWorker } from "./acp-process.js";
-import { ensureAcpServer } from "./acp-detect.js";
+import { agyProfileScope, assertAgyCliCompatibility, detectAgyAcp, isRegistryRuntime } from "./agy-cli.js";
 import { onAcpCatalog } from "./catalog-events.js";
 import { acpModelCatalog, fallbackAcpModelCatalog, type AcpModelCatalog } from "./models.js";
 import { warn } from "./log.js";
-import { effectiveAuth } from "./effective-auth.js";
 
-export type CatalogContext = { scope: string; executable: string; args: string[]; cacheDirectory: string };
+export type CatalogContext = { scope: string; executable: string; args: string[]; cacheDirectory: string; credentialRevision?: string | null };
 
 /** Windows cold discovery can exceed one minute; keep every probe bounded. */
 export function discoveryTimeoutMs(platform = process.platform): number {
@@ -39,21 +38,22 @@ async function jsonFile(path: string): Promise<Record<string, any>> {
 
 /** Cache filenames contain only a digest. Never persist or log source credentials. */
 export async function catalogContext(): Promise<CatalogContext> {
-  const detection = await ensureAcpServer();
+  const detection = await detectAgyAcp(assertAgyCliCompatibility);
   const binary = await stat(detection.executable);
-  const auth = await effectiveAuth();
+  const profile = await agyProfileScope(process.env, isRegistryRuntime(detection.executable));
   const scope = createHash("sha256").update(JSON.stringify({
-    client: "opencode-antigravity", protocol: 1, auth: auth.scope,
+    client: "opencode-antigravity-agy-cli", protocol: 1, profile,
     executable: detection.executable, args: detection.args, size: binary.size, modified: binary.mtimeMs,
   })).digest("hex");
   const data = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR?.trim() ||
     join(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"), "opencode-antigravity");
-  return { scope, executable: detection.executable, args: detection.args, cacheDirectory: join(data, "model-catalogs") };
+  return { scope, executable: detection.executable, args: detection.args, cacheDirectory: join(data, "model-catalogs"), credentialRevision: profile.revision };
 }
 
 async function probe(context: CatalogContext, directory: string, signal: AbortSignal): Promise<AcpModelCatalog> {
   const worker = await createAcpWorker({
     cwd: directory, executable: context.executable, executableArgs: context.args,
+    credentialRevision: context.credentialRevision,
     hostTools: true, catalogScope: undefined,
     // Discovery does not select a model and never sends an inference prompt.
   }, signal);
@@ -76,6 +76,7 @@ export class ModelCatalog {
   scope = "";
   lastError: unknown;
   private context?: CatalogContext;
+  get credentialRevision() { return this.context?.credentialRevision; }
   private inFlight?: Promise<AcpModelCatalog>;
   private writes: Promise<void> = Promise.resolve();
   private controller = new AbortController();

@@ -5,11 +5,10 @@ import { mkdtemp, writeFile, readFile, readdir, mkdir, rm, utimes } from "node:f
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { acquireFileLock } from "../src/file-lock.js";
-import { effectiveAuth } from "../src/effective-auth.js";
+import { agyProfileScope, assertAgyCliCompatibility } from "../src/agy-cli.js";
 import { hostResults, readMcpBody, mcpProgressResponse } from "../src/host-tools.js";
 import { SessionStore } from "../src/session-store.js";
 import { acpModelCatalog, resolveAcpModelSelection } from "../src/models.js";
-import { assertHostToolCompatibility } from "../src/acp-compatibility.js";
 import { pruneUtilityArtifacts } from "../src/retention.js";
 import { SessionPool } from "../src/session-pool.js";
 import { getEventListeners } from "node:events";
@@ -127,7 +126,7 @@ test("utility retention removes dead abandoned private directories but protects 
 });
 
 test("unknown ACP overrides fail closed regardless of version text", async () => {
-  await expect(assertHostToolCompatibility(join(import.meta.dir, "fixtures/fake-acp.mjs"))).rejects.toMatchObject({ code: "agy_acp_compatibility", kind: "unsupported" });
+  await expect(assertAgyCliCompatibility(process.execPath)).rejects.toMatchObject({ code: "agy_cli_isolation_unverified", kind: "unsupported" });
 });
 
 test("legacy stale owners recover, releases are idempotent, and unrelated locks progress", async () => {
@@ -157,24 +156,19 @@ test("legacy stale owners recover, releases are idempotent, and unrelated locks 
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("effective auth scopes overrides, project/location, endpoint and credential revision without exposing secrets", async () => {
+test("CLI profile scope changes when the CLI credential changes in place", async () => {
   const home = await mkdtemp(`${process.env.TMPDIR || "/tmp/opencode"}/agy-auth-`);
   try {
-    await mkdir(join(home, "antigravity-acp"));
-    await writeFile(join(home, "antigravity-acp", "settings.json"), JSON.stringify({ auth: { type: "oauth-business" }, gcp: { project: "a", location: "us" } }));
-    const env = { GEMINI_HOME: home };
-    const first = await effectiveAuth(env);
-    const override = await effectiveAuth({ ...env, OPENCODE_ANTIGRAVITY_ACP_AUTH_METHOD: "oauth-personal" });
-    expect(override.settings.auth.type).toBe("oauth-personal");
-    expect(override.scope).toBe(first.scope);
-    expect((await effectiveAuth({ ...env, GOOGLE_CLOUD_LOCATION: "eu" })).scope).not.toBe(first.scope);
-    const adcDirectory = join(home, "gcloud");
-    await mkdir(adcDirectory);
-    const adcEnv = { ...env, CLOUDSDK_CONFIG: adcDirectory };
-    const beforeAdc = await effectiveAuth(adcEnv);
-    await writeFile(join(adcDirectory, "application_default_credentials.json"), JSON.stringify({ refresh_token: "synthetic-private-revision" }));
-    expect((await effectiveAuth(adcEnv)).scope).not.toBe(beforeAdc.scope);
-    expect(first.scope).toMatch(/^[a-f0-9]{64}$/);
+    const env = { OPENCODE_ANTIGRAVITY_DATA_DIR: home, GEMINI_HOME: home };
+    const first = await agyProfileScope(env);
+    const directory = join(home, "antigravity-cli");
+    await mkdir(directory);
+    const file = join(directory, "antigravity-oauth-token");
+    await writeFile(file, JSON.stringify({ token: { refresh_token: "account-a" } }));
+    const signedIn = await agyProfileScope(env);
+    expect(signedIn).not.toEqual(first);
+    await writeFile(file, JSON.stringify({ token: { refresh_token: "account-b" } }));
+    expect(await agyProfileScope(env)).not.toEqual(signedIn);
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 

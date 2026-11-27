@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { win32 } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import { performance } from "node:perf_hooks";
 import { Readable, Writable } from "node:stream";
 import {
@@ -15,15 +15,12 @@ import {
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import { AgyAbortError, AgyError, AgyProcessError, AgyProtocolError, AgyTimeoutError } from "./errors.js";
-import { DEFAULT_MAX_STDERR_BYTES, configuredPermissionPolicy, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort, type AcpPermissionPolicy } from "./constants.js";
-import { detectAcpServer, ensureAcpServer } from "./acp-detect.js";
-import { cliAuthenticationError, requireCliAuthentication } from "./auth-bridge.js";
+import { DEFAULT_MAX_STDERR_BYTES, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort, type AcpPermissionPolicy } from "./constants.js";
+import { agyAcpArgs, assertAgyCliCompatibility, cliHostEnvironment, detectAgyAcp, isRegistryRuntime } from "./agy-cli.js";
 import { debug, info, warn } from "./log.js";
 import type { AcpEvent } from "./protocol.js";
 import { catalogFromSession, type AcpModelCatalog } from "./models.js";
 import { emitAcpCatalog } from "./catalog-events.js";
-import { hostEnvironment } from "./host-environment.js";
-import { assertHostToolCompatibility } from "./acp-compatibility.js";
 import { BLOCKED_BROWSER_MARKER, prepareBrowserBlocker } from "./browser-blocker.js";
 export type { AcpEvent } from "./protocol.js";
 
@@ -40,6 +37,7 @@ export type AcpWorkerOptions = {
   sessionId?: string;
   mode?: "accept-edits" | "plan";
   catalogScope?: string;
+  credentialRevision?: string | null;
   printTimeoutMs?: number;
   stallTimeoutMs?: number;
   onActivity?: () => void;
@@ -172,7 +170,7 @@ function asAcpError(error: unknown, fallback: string): AgyError {
     return new AgyError("context_overflow", message, { code: "context_length_exceeded", details });
   }
   if (/auth|login|authenticate|credential/.test(lower)) {
-    return new AgyError("auth", `${message}. Sign in through the agy CLI, then retry; automatic login is disabled.`, { code: "agy_acp_auth", details });
+    return new AgyError("auth", `${message}. Sign in to the plugin's private agy ACP profile, then retry; automatic login is disabled.`, { code: "agy_acp_auth", details });
   }
   if (/rate.?limit|too many requests/.test(lower)) return new AgyError("rate_limit", message, { code: "agy_acp_rate_limit", details });
   if (/quota|resource[ _]exhausted/.test(lower)) return new AgyError("quota", message, { code: "agy_acp_quota", details });
@@ -193,22 +191,6 @@ function isMissingSessionError(error: unknown): boolean {
   // of an unavailable cache. Deny precedence also covers mixed messages.
   if (/auth|permission|forbidden|access denied|unauthorized|credentials|login/i.test(message)) return false;
   return /session.{0,200}not found|unknown session|invalid session|no such session|cannot load (?:stored )?session|method not found|session (?:cannot be resumed|is not resumable|has expired)|resume (?:is )?not supported/i.test(message);
-}
-
-function parseVersion(version: string | null | undefined): [number, number, number] | undefined {
-  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version?.trim() ?? "");
-  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : undefined;
-}
-
-function compareVersions(left: [number, number, number], right: [number, number, number]): number {
-  return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
-}
-
-/** 1.4.2 through 1.4.5 create or overwrite a run-workflow skill in the
- * workspace unless the session disables that tool. */
-function writesRunWorkflowSkill(version: string | null | undefined): boolean {
-  const parsed = parseVersion(version);
-  return parsed !== undefined && compareVersions(parsed, [1, 4, 2]) >= 0 && compareVersions(parsed, [1, 4, 5]) <= 0;
 }
 
 async function terminateProcess(child: ChildProcess, force = false): Promise<void> {
@@ -285,14 +267,17 @@ export class AcpWorker {
     if (this.stateValue !== "created") throw new AgyProcessError(`Cannot start ACP worker from state ${this.stateValue}`);
     this.stateValue = "starting";
     try {
-      const environment = { ...process.env, ...this.options.environment };
+      const registry = isRegistryRuntime(this.executable);
+      const environment: NodeJS.ProcessEnv = registry ? { ...this.options.environment, ANTIGRAVITY_HARNESS_PATH: join(dirname(this.executable), "localharness_external") } : { ...process.env, ...this.options.environment };
       const browser = await prepareBrowserBlocker(environment);
-      const args = this.options.executableArgs ?? (await detectAcpServer(this.executable)).args;
+      const args = isRegistryRuntime(this.executable) ? ["--uid="] : agyAcpArgs(environment.GEMINI_HOME!);
+      await assertAgyCliCompatibility(this.executable);
+      signal?.throwIfAborted();
       this.child = spawn(this.executable, args, {
         cwd: this.options.cwd,
         // ACP itself can launch OAuth from session/new or a failed refresh.
         // Its Python webbrowser controller must never reach the real browser.
-        env: { ...environment, BROWSER: browser },
+        env: { ...environment, BROWSER: browser, AGY_CLI_DISABLE_AUTO_UPDATE: "true" },
         stdio: ["pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,
@@ -302,7 +287,7 @@ export class AcpWorker {
         const stderr = this.stderrTail + String(chunk);
         this.stderrTail = stderr.slice(-512);
         if (stderr.includes(BLOCKED_BROWSER_MARKER)) {
-          this.authenticationFailure = cliAuthenticationError();
+          this.authenticationFailure = new AgyError("auth", "Sign in to the plugin's private agy ACP profile before retrying. The plugin does not launch interactive login.", { code: "agy_cli_auth_required" });
           this.turnEvents?.close(this.authenticationFailure);
           this.connection?.close(this.authenticationFailure);
           void terminateProcess(child, true);
@@ -339,23 +324,16 @@ export class AcpWorker {
     }
   }
 
-  /** 1.3 disables built-ins through `agy.enabledTools`; 1.4.2–1.4.5 also
-   * writes a run-workflow skill unless `antigravity.disabledTools` names it. */
-  private sessionMeta(): Record<string, unknown> {
-    const meta: Record<string, unknown> = { agy: { enabledTools: [] } };
-    if (writesRunWorkflowSkill(this.initValue?.agentInfo?.version)) meta.antigravity = { disabledTools: ["run_workflow"] };
-    return meta;
-  }
-
   private async openSession(agent: ClientConnection["agent"], signal?: AbortSignal): Promise<void> {
     const request = {
       cwd: this.options.cwd,
       mcpServers: this.options.mcpServers ?? [],
-      _meta: this.sessionMeta(),
+      disableBuiltInTools: true,
+      _meta: { antigravity: { enabledTools: [] } },
     };
-    if (this.options.sessionId && this.initValue?.agentCapabilities?.loadSession === true) {
+    if (this.options.sessionId && this.initValue?.agentCapabilities?.sessionCapabilities?.resume) {
       try {
-        const loaded = await this.withSignal(agent.request(methods.agent.session.load, { sessionId: this.options.sessionId, ...request }), signal) as { configOptions?: unknown; modes?: unknown } | void;
+        const loaded = await this.withSignal(agent.request(methods.agent.session.resume, { sessionId: this.options.sessionId, ...request }), signal) as { configOptions?: unknown; modes?: unknown } | void;
         this.recordModels(loaded);
         this.sessionIdValue = this.options.sessionId;
         this.resumedValue = true;
@@ -387,8 +365,8 @@ export class AcpWorker {
     if (this.options.model && this.catalog && !hasModelSelector && this.options.model !== this.catalog.currentModel) {
       throw new AgyError("unsupported", "This ACP server lists models but does not expose session model configuration", { code: "agy_acp_model_selection" });
     }
-    if (!Array.isArray(configOptions)) return;
-    const options = configOptions as Array<{ id?: unknown; category?: unknown; options?: Array<{ value?: unknown }>; currentValue?: unknown }>;
+    type ConfigOption = { id?: unknown; category?: unknown; options?: Array<{ value?: unknown; options?: unknown }>; currentValue?: unknown };
+    let options = Array.isArray(configOptions) ? configOptions as ConfigOption[] : [];
     const desired: Array<{ ids: string[]; value: string | undefined }> = [
       { ids: ["model"], value: this.options.model },
       { ids: ["effort", "thought_level", "reasoning_effort"], value: this.options.effort },
@@ -400,7 +378,10 @@ export class AcpWorker {
         item.ids.includes(String(candidate.id)) ||
         item.ids[0] === "model" && candidate.category === "model" ||
         item.ids[0] === "effort" && (candidate.category === "thought_level" || candidate.category === "effort" || candidate.category === "reasoning_effort"));
-      if (!option) continue;
+      if (!option) {
+        if (item.ids[0] === "effort") throw new AgyError("invalid_request", "The selected Antigravity model does not expose a thinking level selector", { code: "agy_invalid_effort", retryable: false });
+        continue;
+      }
       const values = item.ids[0] === "model" && this.catalog ? this.catalog.exactModels.map((model) => model.id)
         : Array.isArray(option.options) ? option.options.flatMap((entry) => Array.isArray((entry as { options?: unknown }).options)
           ? ((entry as { options: Array<{ value?: unknown }> }).options).map((nested) => String(nested.value))
@@ -421,6 +402,7 @@ export class AcpWorker {
         value,
       }), signal);
       this.recordModels(updated);
+      if (Array.isArray(updated?.configOptions)) options = updated.configOptions;
     }
   }
 
@@ -605,13 +587,12 @@ export class AcpWorker {
     this.executionActivity = true;
     const meta = (params.toolCall as { _meta?: { mcp?: { server?: string } } })._meta;
     // The isolated harness contains only our session-bound MCP endpoint.
-    const dispatcher = params.toolCall.title === "Run call_mcp_tool?";
     const ownMcp = Boolean(this.options.mcpServers?.length) &&
-      (this.options.mcpServers?.some(server => server.name === meta?.mcp?.server) || dispatcher);
+      this.options.mcpServers?.some(server => server.name === meta?.mcp?.server);
     // OpenCode already gates its own tools, so an own-MCP approval is not a
     // second decision. Anything else is Antigravity's own tool: surface it and
     // apply the configured policy instead of silently rejecting it.
-    const policy = this.options.permissionPolicy ?? configuredPermissionPolicy();
+    const policy = this.options.permissionPolicy ?? "deny";
     const allowed = ownMcp || policy === "allow";
     const option = params.options.find((item) => item.kind === (allowed ? "allow_once" : "reject_once"))
       ?? params.options.find((item) => item.kind === (allowed ? "allow_always" : "reject_always"));
@@ -626,8 +607,8 @@ export class AcpWorker {
     if (!this.turnEvents || !this.sessionIdValue) return;
     const title = typeof params.toolCall.title === "string" && params.toolCall.title ? params.toolCall.title : "Antigravity tool";
     const reason = allowed
-      ? "Allowed by OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow."
-      : "Denied. Set OPENCODE_ANTIGRAVITY_ACP_PERMISSION=allow to permit Antigravity's own tools.";
+      ? "Allowed by the worker's explicit permission policy."
+      : "Denied. OpenCode owns the tool execution policy.";
     this.turnEvents.push({
       event: "update",
       sessionId: this.sessionIdValue,
@@ -675,22 +656,15 @@ export class AcpWorker {
 }
 
 export async function createAcpWorker(options: AcpWorkerOptions, signal?: AbortSignal): Promise<AcpWorker> {
-  // CLI consumer credentials are the sole authentication source. Legacy ACP
-  // method overrides must not select another interactive login mechanism.
   const environment = { ...process.env, ...options.environment };
-  await requireCliAuthentication(environment);
   const detection = options.executable
-    ? { executable: options.executable, args: options.executableArgs }
-    : await ensureAcpServer();
-  if (options.hostTools) await assertHostToolCompatibility(detection.executable);
-  if (options.hostTools) {
-    const isolated = await hostEnvironment(environment,
-      options.catalogScope, options.utilityDirectory);
-    options = { ...options, ...isolated };
-  }
+    ? { executable: options.executable }
+    : await detectAgyAcp(assertAgyCliCompatibility);
+  await assertAgyCliCompatibility(detection.executable);
+  const isolated = await cliHostEnvironment(environment, options.utilityDirectory, options.credentialRevision, isRegistryRuntime(detection.executable));
   const worker = new AcpWorker({
     ...options,
-    executableArgs: options.executableArgs ?? detection.args,
+    ...isolated,
     printTimeoutMs: options.printTimeoutMs ?? configuredPrintTimeoutMs(),
   }, detection.executable);
   await worker.start(signal);
