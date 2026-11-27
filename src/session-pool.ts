@@ -70,6 +70,10 @@ type SessionEntry = {
 };
 
 function settingsSignature(settings: SessionSettings): string {
+  // Native resume is safe only while the complete MCP endpoint is unchanged.
+  // The bridge URL contains a transient secret: persist only the hash of this
+  // signature, never the signature itself. A changed endpoint intentionally
+  // rebuilds from host history until the runtime's resume behavior is verified.
   return JSON.stringify({
     cwd: settings.cwd,
     model: settings.model,
@@ -135,6 +139,7 @@ async function reconstructionBlocks(message: HostMessage, cwd: string, budget: M
 
 export class SessionPool {
   private entries = new Map<string, SessionEntry>();
+  private forgetting = new Map<string, Promise<void>>();
   private readonly maxQueue: number;
   private readonly maxSessions: number;
   private readonly idleMs: number;
@@ -166,16 +171,21 @@ export class SessionPool {
 
   async *turn(request: SessionTurnRequest): AsyncGenerator<AcpEvent> {
     if (request.hostSessionID && await sessionStore.isHostDeleted(request.hostSessionID)) throw new AgyError("invalid_request", "This host session was deleted; late requests cannot recreate its execution state");
-    if (this.disposed) throw new AgyError("invalid_request", "The Antigravity session pool has been shut down", { code: "agy_pool_closed", retryable: false });
-    let entry = this.entries.get(request.key);
-    if (!entry) {
+    let entry: SessionEntry;
+    for (;;) {
+      const forgetting = this.forgetting.get(request.key);
+      if (forgetting) { await forgetting; continue; }
+      if (this.disposed) throw new AgyError("invalid_request", "The Antigravity session pool has been shut down", { code: "agy_pool_closed", retryable: false });
+      const existing = this.entries.get(request.key);
+      if (existing) { entry = existing; break; }
       if (this.entries.size >= this.maxSessions) {
         const idle = [...this.entries].filter(([, value]) => value.pending === 0).sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)[0];
-        if (idle) await this.forgetWorker(idle[0]);
+        if (idle) { await this.forgetWorker(idle[0]); continue; }
       }
       if (this.entries.size >= this.maxSessions) throw new AgyBusyError("The Antigravity session pool has reached its session limit");
       entry = { tail: Promise.resolve(), pending: 0, lastUsedAt: this.now(), turnCount: 0, historyTransferred: false };
       this.entries.set(request.key, entry);
+      break;
     }
     if (entry.pending > this.maxQueue) throw new AgyBusyError();
     entry.pending += 1;
@@ -456,11 +466,20 @@ export class SessionPool {
   }
 
   async forget(key: string): Promise<void> {
+    if (this.forgetting.has(key)) throw new AgyBusyError("Session deletion is already in progress");
     const entry = this.entries.get(key);
     if (entry?.pending) throw new AgyBusyError("Cannot forget an active Antigravity session");
-    await sessionStore.delete(key);
-    await entry?.worker?.stop();
-    this.entries.delete(key);
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    this.forgetting.set(key, barrier);
+    try {
+      await sessionStore.delete(key);
+      await entry?.worker?.stop();
+      this.entries.delete(key);
+    } finally {
+      this.forgetting.delete(key);
+      release();
+    }
   }
 
   /** Release an idle process while retaining the persisted ACP resume point. */

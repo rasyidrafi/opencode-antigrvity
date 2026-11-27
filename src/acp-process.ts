@@ -30,7 +30,6 @@ export type AcpWorkerOptions = {
   utilityDirectory?: string;
   cwd: string;
   executable?: string;
-  executableArgs?: string[];
   environment?: Record<string, string | undefined>;
   model?: string;
   effort?: AcpEffort;

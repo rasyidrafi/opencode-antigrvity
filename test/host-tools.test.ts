@@ -21,6 +21,7 @@ beforeAll(async () => {
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = directory;
   process.env.GEMINI_HOME = join(directory, "gemini");
   process.env.FAKE_ACP_PROMPT_LOG = join(directory, "prompts.jsonl");
+  process.env.FAKE_ACP_RPC_LOG = join(directory, "rpc.jsonl");
   await chmod(process.env.OPENCODE_ANTIGRAVITY_ACP_PATH, 0o755);
   await startRuntime(directory);
 });
@@ -49,6 +50,28 @@ const send = async (session: string, messages: any[], extra: Record<string, unkn
   });
 };
 const result = (id: string, text: string, is_error = false) => ({ type: "tool_result", tool_use_id: id, content: text, is_error });
+
+test("synthetic ACP trace rebuilds a recreated bridge without reissuing a settled tool", async () => {
+  const session = "endpoint-recreated-settled";
+  const initial = [{ role: "user", content: "FAKE_MCP endpoint recovery" }];
+  const first = await (await send(session, initial)).json();
+  const call = first.content.find((part: any) => part.type === "tool_use");
+  expect(call).toBeDefined();
+  const history = [...initial, { role: "assistant", content: first.content }, { role: "user", content: [result(call.id, "SETTLED_ENDPOINT_RESULT")] }];
+  const completed = await (await send(session, history)).json();
+  expect(completed.stop_reason).toBe("end_turn");
+  await closeHostBridges(session);
+  const before = (await readFile(join(directory, "rpc.jsonl"), "utf8")).trim().split("\n").length;
+  const continuation = [...history, { role: "assistant", content: completed.content }, { role: "user", content: "Continue without a tool" }];
+  const next = await (await send(session, continuation)).json();
+  expect(next.stop_reason).toBe("end_turn");
+  expect(next.content.some((part: any) => part.type === "tool_use")).toBe(false);
+  const frames = (await readFile(join(directory, "rpc.jsonl"), "utf8")).trim().split("\n").slice(before).map(line => JSON.parse(line));
+  expect(frames.filter(frame => frame.method === "session/new" || frame.method === "session/resume").map(frame => frame.method)).toEqual(["session/new"]);
+  const prompts = frames.filter(frame => frame.method === "session/prompt");
+  expect(prompts).toHaveLength(1);
+  expect(JSON.stringify(prompts[0].params.prompt)).toContain("SETTLED_ENDPOINT_RESULT");
+});
 
 test("bridge requests emit only configured instructions and user content", async () => {
   for (const system of ["Search only", ""]) {

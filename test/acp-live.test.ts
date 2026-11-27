@@ -15,7 +15,7 @@ describe("opt-in official Antigravity live checks", () => {
     const samples: Array<{ used: number; size: number }> = [];
     const terminalUsage: Array<unknown> = [];
     try {
-      worker = await createAcpWorker({ cwd: data, executable: detection.executable, executableArgs: detection.args, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
+      worker = await createAcpWorker({ cwd: data, executable: detection.executable, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
       for (const prompt of ["Remember USAGE_CHECK_MAPLE_827. Reply OK only.", "Return the marker from my previous message only."]) {
         for await (const event of worker.runTurn(prompt, AbortSignal.timeout(120_000))) {
           if (event.event === "update" && event.update.sessionUpdate === "usage_update") {
@@ -56,7 +56,7 @@ describe("opt-in official Antigravity live checks", () => {
   }, 180_000);
   test.skipIf(!live)("initializes, streams, resumes, and accepts an image prompt", async () => {
     const detection = await detectAcpServer();
-    const worker = await createAcpWorker({ cwd: process.cwd(), executable: detection.executable, executableArgs: detection.args, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
+    const worker = await createAcpWorker({ cwd: process.cwd(), executable: detection.executable, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
     const responses: string[] = [];
     try {
       for (const prompt of [
@@ -70,7 +70,7 @@ describe("opt-in official Antigravity live checks", () => {
       const sessionId = worker.sessionId;
       expect(sessionId).toBeTruthy();
       await worker.stop(true);
-      const resumed = await createAcpWorker({ cwd: process.cwd(), executable: detection.executable, executableArgs: detection.args, model: "gemini-3.8-flash-high", sessionId, hostTools: true, stallTimeoutMs: 120_000 });
+      const resumed = await createAcpWorker({ cwd: process.cwd(), executable: detection.executable, model: "gemini-3.8-flash-high", sessionId, hostTools: true, stallTimeoutMs: 120_000 });
       try {
         for await (const event of resumed.runTurn([{ type: "text", text: "Reply with exactly ANTIGRAVITY_ACP_RESUMED_OK." }, { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", mimeType: "image/png" }])) {
           const mapped = mapAcpEvent(event);
@@ -89,7 +89,7 @@ describe("opt-in official Antigravity live checks", () => {
 
   test.skipIf(!live)("cancels an official persistent worker request", async () => {
     const detection = await detectAcpServer();
-    const worker = await createAcpWorker({ cwd: process.cwd(), executable: detection.executable, executableArgs: detection.args, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
+    const worker = await createAcpWorker({ cwd: process.cwd(), executable: detection.executable, model: "gemini-3.8-flash-high", hostTools: true, stallTimeoutMs: 120_000 });
     const controller = new AbortController();
     const turn = (async () => {
       for await (const _event of worker.runTurn("Explain why a long-running task should be cancellable.", controller.signal)) {

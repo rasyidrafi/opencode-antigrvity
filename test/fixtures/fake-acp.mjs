@@ -78,7 +78,7 @@ async function handlePrompt(message) {
     fail(id, -32000, "rate limit; retry in 2 minutes", { retryAfter: "2 minutes" });
     activePrompt = undefined; return;
   }
-  if (text.includes("FAKE_MCP") && !text.includes("[tool result") && !text.includes("[host accepted terminal output")) {
+  if (text.includes("FAKE_MCP") && (!text.includes("[tool result") || text.includes("FAKE_MCP_AFTER_HISTORY")) && !text.includes("[host accepted terminal output")) {
     const url = mcpServers[0]?.url;
     if (!url) { fail(id, -32603, "Missing MCP bridge"); return; }
     const rpc = async (method, params = {}) => (await (await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },

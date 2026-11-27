@@ -1,10 +1,47 @@
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { SessionStore } from "../src/session-store.js";
 
 describe("non-secret session persistence", () => {
+  test("delete does not remove a record replaced before ownership acquisition", async () => {
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = await mkdtemp(join(tmpdir(), "agy-delete-snapshot-"));
+    const store = new SessionStore();
+    const peer = new SessionStore();
+    const base = { sessionId: "old", model: "m", cwd: "/workspace", cliVersion: null, createdAt: 1, updatedAt: 1, lastUsedAt: 1 };
+    for (const changeOwner of [false, true]) {
+      const key = `snapshot-${changeOwner}`;
+      const conversation = { version: 1 as const, epoch: 0, boundary: [], instructions: "", resumable: true, hostSessionID: "host-a" };
+      await store.set(key, { ...base, version: 1, conversation });
+      let reached!: () => void; let release!: () => void;
+      const waiting = new Promise<void>(resolve => { reached = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const lock = store.lockTurn.bind(store);
+      const delayed = spyOn(store, "lockTurn").mockImplementation(async (...args) => { reached(); await gate; return lock(...args); });
+      try {
+        const deleting = store.delete(key);
+        await waiting;
+        await peer.set(key, { ...base, sessionId: "new", version: 1, conversation: { ...conversation, hostSessionID: changeOwner ? "host-b" : "host-a" } });
+        release();
+        await expect(deleting).rejects.toThrow("Session");
+        expect((await peer.get(key))?.sessionId).toBe("new");
+      } finally { release(); delayed.mockRestore(); }
+    }
+    const missing = "missing-before-delete";
+    const get = store.get.bind(store);
+    let reached!: () => void; let release!: () => void;
+    const waiting = new Promise<void>(resolve => { reached = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const delayedGet = spyOn(store, "get").mockImplementation(async key => { const result = await get(key); reached(); await gate; return result; });
+    try {
+      const deleting = store.delete(missing);
+      await waiting;
+      await peer.set(missing, base);
+      release(); await deleting;
+      expect((await peer.get(missing))?.sessionId).toBe("old");
+    } finally { release(); delayedGet.mockRestore(); }
+  });
   test("defaults to the opencode-antigravity directory under XDG_DATA_HOME", async () => {
     const dataHome = await mkdtemp(join(tmpdir(), "opencode-antigravity-xdg-store-"));
     const previousDataDir = process.env.OPENCODE_ANTIGRAVITY_DATA_DIR;

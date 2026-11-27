@@ -46,6 +46,13 @@ left untrusted. A clean Bun install and Koffi import were verified on Linux.
 
 ## Usage fallback
 
+Tool-enabled native sessions rebuild from host history when their MCP bridge
+endpoint changes, including after bridge recreation. The execution profile
+stores a hash, not the endpoint token. Do not resume across a changed endpoint
+until the admitted standalone runtime is verified to replace its MCP wiring;
+reconstruction must not re-execute historical tool calls. Tool-free sessions
+can still resume when their history and settings align.
+
 ACP prompt-response usage is authoritative when present, including explicit
 zero values. If it is absent, the language model may report a fresh measured
 context occupancy as input tokens with zero output tokens. This is an

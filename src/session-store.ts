@@ -311,12 +311,19 @@ export class SessionStore {
   }
 
   async delete(key: string): Promise<void> {
-    await this.mutate(async records => {
-      const unlock = await this.lockTurn(ownershipKey(key, records[key]?.conversation?.hostSessionID));
-      try {
+    const snapshot = await this.get(key);
+    if (!snapshot) return;
+    const owner = ownershipKey(key, snapshot?.conversation?.hostSessionID);
+    const unlock = await this.lockTurn(owner);
+    try {
+      await this.mutate(records => {
+        // Ownership can change between the read and lock acquisition. Never
+        // delete a record protected by a different turn lock.
+        if (ownershipKey(key, records[key]?.conversation?.hostSessionID) !== owner) throw new AgyBusyError("Session ownership changed during deletion");
+        if (canonical(records[key]) !== canonical(snapshot)) throw new AgyBusyError("Session changed during deletion");
         delete records[key];
-      } finally { await unlock(); }
-    });
+      });
+    } finally { await unlock(); }
   }
 
   async entries(): Promise<Array<[string, SessionRecord]>> {
