@@ -1,4 +1,4 @@
-import { Integration, Model, Plugin, Provider } from "@opencode/plugin";
+import { Model, Plugin, Provider } from "@opencode/plugin";
 import { resolve as resolvePath } from "node:path";
 import {
   DIRECTORY_HEADER,
@@ -33,10 +33,6 @@ export const INTEGRATION_ID = PROVIDER_ID;
 // local shim with a `create*` export so that loader succeeds; the hook below
 // then replaces it with the ACP-backed SDK.
 export const PROVIDER_PACKAGE = `aisdk:${new URL("./sdk-shim.mjs", import.meta.url).href}`;
-
-async function retainWorkspace(directory: string): Promise<void> {
-  await startRuntime(resolvePath(directory));
-}
 
 async function releaseWorkspace(directory: string): Promise<void> {
   await stopRuntime(resolvePath(directory));
@@ -129,7 +125,7 @@ function instructionText(system: ReadonlyArray<SystemPartLike> | undefined): str
 export const AntigravityPlugin = Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
-    const workspaces = new WorkspaceRegistry(retainWorkspace, releaseWorkspace);
+    const workspaces = new WorkspaceRegistry((directory) => startRuntime(resolvePath(directory), ctx.options?.acpPath), releaseWorkspace);
     let unsubscribe: (() => void) | undefined;
     let disposed = false;
     let metadataTimer: ReturnType<typeof setInterval> | undefined;
@@ -171,30 +167,12 @@ export const AntigravityPlugin = Plugin.define({
         ...Provider.Info.empty(providerID),
         name: PROVIDER_NAME,
         activation: "enabled",
-        integrationID: Integration.ID.make(INTEGRATION_ID),
         package: PROVIDER_PACKAGE,
         settings: {
           provider: PROVIDER_ID,
           apiKey: LOCAL_API_KEY,
         },
       };
-
-      await ctx.integration.transform((editor) => {
-        editor.update(INTEGRATION_ID, (integration) => {
-          integration.name = PROVIDER_NAME;
-        });
-        // This is a local adapter, not a Google API-key provider. Keep the
-        // integration ID equal to the provider ID for clients such as OpenChamber.
-        editor.method.update({ integrationID: INTEGRATION_ID, method: { type: "key", label: "Local Antigravity" } });
-      });
-
-      // Match V1: install the non-secret loopback marker automatically. Google
-      // authentication comes from the already-authenticated agy CLI.
-      const connection = await ctx.integration.connection.active(INTEGRATION_ID);
-      const credential = connection ? await ctx.integration.connection.resolve(connection) : undefined;
-      if (credential?.type !== "key" || credential.key !== LOCAL_API_KEY) {
-        await ctx.integration.connect.key({ integrationID: INTEGRATION_ID, key: LOCAL_API_KEY });
-      }
 
       await ctx.provider.transform((editor) => {
         editor.add({ info, models: buildProviderModels(getRuntime()?.catalog ?? fallbackAcpModelCatalog()) });

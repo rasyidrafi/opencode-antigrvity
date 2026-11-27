@@ -52,7 +52,7 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
   for (const key of environmentKeys) savedEnvironment.set(key, process.env[key]);
   const root = await temporaryDirectory("agy-v2-plugin-");
   const geminiHome = await temporaryDirectory("agy-v2-gemini-");
-  process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
+  delete process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
   process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(root, "data");
   process.env.GEMINI_HOME = geminiHome;
   process.env.OPENCODE_ANTIGRAVITY_MODELS_DEV = "0";
@@ -88,7 +88,7 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
       } };
     } },
     location: { directory: root },
-    options: {},
+    options: { acpPath: fixture },
     integration: {
       connection: { active: async () => marker ? { id: "local-marker" } : undefined, resolve: async () => marker },
       connect: { key: async (input: any) => { savedMarkers.push(input); marker = { type: "key", key: input.key }; } },
@@ -121,25 +121,29 @@ test("V2 setup registers the aisdk provider, hooks, and language model", async (
     },
   };
 
+  context.options.acpPath = "relative";
+  await expect((AntigravityPlugin as any).setup(context)).rejects.toMatchObject({ code: "agy_acp_path_invalid" });
+  expect(getRuntime()).toBeNull();
+  context.options.acpPath = fixture;
   const cleanup = await (AntigravityPlugin as any).setup(context);
   cleanupTasks.push(cleanup);
+  expect(getRuntime()?.executable).toBe(fixture);
   expect(PLUGIN_ID).toBe("opencode-antigravity");
   expect(INTEGRATION_ID).toBe(PROVIDER_ID);
-  expect(savedMarkers).toEqual([{ integrationID: PROVIDER_ID, key: LOCAL_API_KEY }]);
+  expect(savedMarkers).toEqual([]);
 
   const provider = providers[0];
   expect(provider.info).toMatchObject({
     id: PROVIDER_ID,
     name: "Antigravity",
     activation: "enabled",
-    integrationID: INTEGRATION_ID,
     package: PROVIDER_PACKAGE,
     settings: { provider: PROVIDER_ID, apiKey: LOCAL_API_KEY },
   });
   expect(provider.info.settings.baseURL).toBeUndefined();
   const flash = provider.models.find((model: { id: string }) => model.id === "gemini-3.8-flash");
   expect(flash.variants.map((variant: { id: string }) => variant.id)).toEqual(["high", "medium", "low"]);
-  expect(methods.some((method) => method.integrationID === PROVIDER_ID && method.method.type === "key")).toBe(true);
+  expect(methods).toEqual([]);
 
   const sdkHook = aisdkHooks.get("sdk")!;
   expect(sdkHook.options).toEqual({ providerID: PROVIDER_ID });

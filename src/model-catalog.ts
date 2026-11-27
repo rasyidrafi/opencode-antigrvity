@@ -37,8 +37,11 @@ async function jsonFile(path: string): Promise<Record<string, any>> {
 }
 
 /** Cache filenames contain only a digest. Never persist or log source credentials. */
-export async function catalogContext(): Promise<CatalogContext> {
-  const detection = await detectAgyAcp(assertAgyCliCompatibility);
+export async function catalogContext(executable?: string): Promise<CatalogContext> {
+  const detection = executable
+    ? { executable, args: isRegistryRuntime(executable) ? ["--uid="] : ["acp"] }
+    : await detectAgyAcp(assertAgyCliCompatibility);
+  if (executable) await assertAgyCliCompatibility(executable);
   const binary = await stat(detection.executable);
   const profile = await agyProfileScope(process.env, isRegistryRuntime(detection.executable));
   const scope = createHash("sha256").update(JSON.stringify({

@@ -2,7 +2,7 @@
 
 An OpenCode V2 plugin that exposes Google's Antigravity ACP agent as an
 `antigravity` provider. OpenCode owns the agent loop and calls the in-process
-AI SDK `LanguageModelV3` adapter; the adapter starts a separately installed
+AI SDK `LanguageModelV3` adapter; the adapter starts a verified
 ACP server and bridges OpenCode tools to it. This is not an Anthropic HTTP
 proxy and is not an official Google or OpenCode product.
 
@@ -11,11 +11,18 @@ proxy and is not an official Google or OpenCode product.
 1. Use an OpenCode V2 host compatible with the plugin API used here
    (`@opencode/plugin` 2.0.22). The package requires Bun >= 1.4.4 and exports
    TypeScript source; the OpenCode host must provide Bun.
-2. Obtain Google's **ACP Registry 1.5.2 Linux x64** standalone artifact from
-   the [`antigravity-acp` entry in the official Registry manifest](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json)
-   and extract it. The manifest is a moving latest listing; check the version
-   before downloading. This project does not install the
-   artifact. Keep `agy_acp_server.par` and `localharness_external` together.
+2. On Linux x64, if no admitted local runtime is found, the plugin downloads
+   the pinned official **ACP Registry 1.5.2** archive at first setup. The
+   download is approximately 262 MiB and the extracted pair is approximately
+   814 MiB; allow disk space and network access. First setup normally takes
+   several minutes. Installation aborts if no progress is made for 120
+   seconds or after 30 minutes overall, so a slow-but-steady download still
+   completes while a stalled one fails instead of hanging. The archive and
+   both files are checked against pinned SHA-256 hashes, not a moving latest manifest.
+   The managed runtime is stored under
+   `${XDG_CACHE_HOME:-~/.cache}/opencode-antigravity/runtime/registry-1.5.2`.
+   Alternatively, install the reviewed artifact manually and keep
+   `agy_acp_server.par` and `localharness_external` together.
    The launcher must be executable. The adapter admits only Linux x64 and
    checks the SHA-256 of **both** extracted files before launching:
 
@@ -26,7 +33,7 @@ proxy and is not an official Google or OpenCode product.
 
    For example, run `sha256sum agy_acp_server.par localharness_external` in
    the extracted directory. These pins are an admission check, not an
-   automatic download or update mechanism. See
+   automatic update mechanism. See
    [the migration notes](docs/agy-cli-migration.md) for the artifact review.
 3. Sign in separately with the official `agy` CLI using a personal account.
    The CLI is used for its existing personal authentication, **not** as the
@@ -41,6 +48,26 @@ proxy and is not an official Google or OpenCode product.
    the pair together in a directory on its `PATH`. An explicit path is the
    launcher, not its directory or the `agy` CLI. A long-running shared service
    must actually inherit the chosen environment.
+   Alternatively set the plugin option `acpPath` to the absolute launcher path
+   in the plugin's native V2 configuration, for example:
+
+   ```jsonc
+   { "$schema": "https://opencode.ai/config.json", "plugins": [{ "package": "/absolute/path/to/opencode-antigrvity", "options": { "acpPath": "/absolute/path/to/agy_acp_server.par" } }] }
+   ```
+
+   The environment override takes precedence over the option; an invalid
+   explicit path fails rather than falling back to `PATH`. Workspaces in one
+   process share the selected runtime. A conflicting explicit selection fails
+   until the existing workspaces release it; discovery and inference use the
+   same selection. Without an explicit path, a verified managed runtime wins
+   over a verified `PATH` runtime; only if neither is available does setup
+   download the pinned archive. Generic `detectAgyAcp` remains local-only.
+   Offline setups can preinstall the pair or provide an explicit path. Download
+   failure aborts setup without retaining a workspace; retry setup after
+   restoring connectivity. Unsupported platforms do not download. Once a
+   runtime is selected, discovery or authentication failure keeps the runtime
+   selected and an empty catalog; later catalog refreshes retry without
+   switching executables or downloading another runtime.
 5. Install dependencies in this checkout using Bun:
 
    ```sh
@@ -60,12 +87,14 @@ proxy and is not an official Google or OpenCode product.
 
    See the OpenCode
    [plugin guide](https://opencode.ai/docs/build/plugins) and
-   [configuration guide](https://opencode.ai/docs/config). The npm latest
-   release 0.6.5 predates this runtime; publication of 0.6.6 has not been
-   verified. Use the current checkout for the behavior documented here. The
+   [configuration guide](https://opencode.ai/docs/config). The npm release
+   0.7.0 changed the provider credential registration and added runtime
+   path options and managed installation. Use this current checkout
+   until 0.7.0 is published and verified. The
    plugin registers the provider and a
-   non-secret local connection marker automatically; no Google API key needs
-   to be configured in OpenCode.
+   non-secret provider placeholder; no Google API key needs to be configured
+   in OpenCode. The API key form is not the Antigravity login: use the `agy`
+   CLI. Existing local connections from older plugin versions are not removed.
 
 Use `/models` in OpenCode to select an available **Antigravity** model after
 discovery. Model

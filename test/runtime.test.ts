@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fixtureCompatibility } from "./fixtures/compatibility.js";
 import { getRuntime, startRuntime, stopRuntime } from "../src/runtime.js";
+import * as cli from "../src/agy-cli.js";
+import * as installer from "../src/runtime-installer.js";
 
 const fixture = join(import.meta.dir, "fixtures", "fake-acp.mjs");
 const directory = await mkdtemp(join(tmpdir(), "agy-runtime-"));
@@ -62,4 +64,141 @@ test("compatible module reload shares one bridge server", async () => {
   const replacement = await first.ensureHostBridgeServer();
   expect(replacement).not.toBe(original);
   await first.stopHostBridgeServer();
+});
+
+test("explicit selection is transactional, env wins, and discovery stays pinned", async () => {
+  await stopRuntime();
+  const other = join(directory, "other.mjs");
+  await copyFile(fixture, other);
+  await chmod(other, 0o755);
+  const validate = spyOn(cli, "assertAgyCliCompatibility").mockImplementation(async (path) => {
+    if (path !== fixture && path !== other) throw new Error("unreviewed");
+  });
+  const root2 = join(directory, "second");
+  try {
+    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
+    await startRuntime(directory, other);
+    expect(getRuntime()?.executable).toBe(fixture);
+    expect(getRuntime()?.catalog.executable).toBe(fixture);
+    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = other;
+    await expect(startRuntime(root2, fixture)).rejects.toMatchObject({ code: "agy_runtime_path_conflict" });
+    await stopRuntime(root2);
+    expect(getRuntime()?.executable).toBe(fixture);
+    await getRuntime()!.manager.refresh(true);
+    expect(getRuntime()?.catalog.executable).toBe(fixture);
+    await stopRuntime(directory);
+    delete process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
+    await expect(startRuntime(directory, "relative")).rejects.toMatchObject({ code: "agy_acp_path_invalid" });
+    await expect(startRuntime(directory, join(directory, "missing"))).rejects.toThrow();
+    const optionError = await startRuntime(directory, join(directory, "missing")).catch(error => error);
+    expect(optionError.message).toContain("plugin option acpPath");
+    expect(optionError.cause).toBeUndefined();
+    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = join(directory, "missing");
+    await expect(startRuntime(directory, fixture)).rejects.toThrow("OPENCODE_ANTIGRAVITY_ACP_PATH");
+    delete process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
+    expect(getRuntime()).toBeNull();
+    const results = await Promise.allSettled([startRuntime(directory, fixture), startRuntime(root2, other)]);
+    expect(results.map(result => result.status)).toEqual(["fulfilled", "rejected"]);
+    expect(getRuntime()?.executable).toBe(fixture);
+    await stopRuntime(directory);
+    expect(getRuntime()).toBeNull();
+  } finally {
+    await stopRuntime();
+    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
+    validate.mockRestore();
+  }
+});
+
+test("a managed pair behind a symlinked cache ancestor is not selected", async () => {
+  await stopRuntime();
+  const saved = { ...process.env };
+  const real = join(directory, "real-cache"), link = join(directory, "linked-cache");
+  const managed = join(real, "opencode-antigravity", "runtime", "registry-1.5.2", "agy_acp_server.par");
+  const bin = join(directory, "safe-bin");
+  const validate = spyOn(cli, "assertAgyCliCompatibility").mockImplementation(async () => {});
+  const install = spyOn(installer, "installManagedRuntime").mockImplementation(async () => { throw new Error("unexpected install"); });
+  try {
+    await mkdir(join(managed, ".."), { recursive: true, mode: 0o700 });
+    await copyFile(fixture, managed); await chmod(managed, 0o700);
+    await writeFile(join(managed, "..", "localharness_external"), "fixture", { mode: 0o700 });
+    await symlink(real, link);
+    await mkdir(bin); await symlink(fixture, join(bin, "agy"));
+    delete process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
+    process.env.XDG_CACHE_HOME = link; process.env.PATH = bin;
+    await startRuntime(directory);
+    expect(getRuntime()?.executable).toBe(fixture);
+    expect(install).not.toHaveBeenCalled();
+  } finally {
+    await stopRuntime(); validate.mockRestore(); install.mockRestore();
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
+});
+
+test("a module reload rejects an active legacy runtime without changing its owner", async () => {
+  await stopRuntime();
+  const global = globalThis as any;
+  const previous = global.__agyRuntimeV1;
+  const legacy = { runtime: { directory, manager: {} }, refs: new Map([[directory, 1]]), lifecycle: Promise.resolve() };
+  global.__agyRuntimeV1 = legacy;
+  try {
+    const reloaded = await import("../src/runtime.ts?old-owner-test");
+    await expect(reloaded.startRuntime(directory)).rejects.toMatchObject({ code: "agy_runtime_reload_incompatible" });
+    expect(global.__agyRuntimeV1).toBe(legacy);
+    expect(legacy.refs.get(directory)).toBe(1);
+  } finally { global.__agyRuntimeV1 = previous; }
+});
+
+test("managed, PATH, then install selection is offline and failed install can retry", async () => {
+  await stopRuntime();
+  const saved = { ...process.env };
+  const cache = join(directory, "selection-cache"), bin = join(directory, "bin");
+  const managed = join(cache, "opencode-antigravity", "runtime", "registry-1.5.2", "agy_acp_server.par");
+  const originalValidate = cli.assertAgyCliCompatibility;
+  const validate = spyOn(cli, "assertAgyCliCompatibility").mockImplementation(async path => {
+    if (path === managed || path === fixture) return;
+    return originalValidate(path);
+  });
+  const noNetwork = spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("unexpected network"); });
+  let calls = 0;
+  const install = spyOn(installer, "installManagedRuntime").mockImplementation(async () => {
+    calls++;
+    if (calls === 1) throw new Error("offline");
+    await mkdir(join(managed, ".."), { recursive: true, mode: 0o700 });
+    await copyFile(fixture, managed);
+    await writeFile(join(managed, "..", "localharness_external"), "fixture", { mode: 0o700 });
+    await chmod(managed, 0o700);
+    return managed;
+  });
+  try {
+    delete process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
+    process.env.XDG_CACHE_HOME = cache;
+    await mkdir(bin, { recursive: true });
+    await symlink(fixture, join(bin, "agy"));
+    process.env.PATH = bin;
+    await startRuntime(directory);
+    expect(getRuntime()?.executable).toBe(fixture);
+    expect(calls).toBe(0);
+    await stopRuntime(directory);
+    process.env.PATH = "";
+    await expect(cli.detectAgyAcp()).rejects.toThrow();
+    expect(calls).toBe(0);
+    await expect(startRuntime(directory)).rejects.toMatchObject({ code: "agy_runtime_install_failed" });
+    expect(getRuntime()).toBeNull();
+    await startRuntime(directory);
+    expect(getRuntime()?.executable).toBe(managed);
+    expect(calls).toBe(2);
+    await stopRuntime(directory);
+    process.env.PATH = bin;
+    await startRuntime(directory);
+    expect(getRuntime()?.executable).toBe(managed);
+    expect(calls).toBe(2);
+    await stopRuntime(directory);
+    expect(noNetwork).not.toHaveBeenCalled();
+  } finally {
+    await stopRuntime();
+    install.mockRestore(); noNetwork.mockRestore(); validate.mockRestore();
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
 });

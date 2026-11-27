@@ -1,6 +1,6 @@
 {
   "name": "@rasyid_rafi/opencode-antigravity",
-  "version": "0.6.6",
+  "version": "0.7.0",
   "packageManager": "bun@1.4.4",
   "description": "OpenCode LanguageModelV3 provider for Google's official Antigravity server via ACP",
   "license": "MIT",
