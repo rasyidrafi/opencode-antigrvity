@@ -140,6 +140,18 @@ async function publishPrivateFile(target: string, value: string | Uint8Array) {
   const temporary = `${target}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, value, { mode: 0o600, flag: "wx" });
-    await rename(temporary, target);
+    await renamePrivateFile(temporary, target);
   } finally { await rm(temporary, { force: true }); }
+}
+
+/** Concurrent replacements can transiently fail with sharing violations on Windows. */
+export async function renamePrivateFile(source: string, target: string, move = rename, platform = process.platform): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try { await move(source, target); return; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "") || attempt === 7) throw error;
+      await new Promise(resolve => setTimeout(resolve, 10 * (attempt + 1)));
+    }
+  }
 }

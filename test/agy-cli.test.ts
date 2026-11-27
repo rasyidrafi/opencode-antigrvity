@@ -2,8 +2,21 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { agyAcpArgs, agyProfileScope, assertAgyCliCompatibility, cliHostEnvironment, resolveAgyCli } from "../src/agy-cli.js";
+import { agyAcpArgs, agyProfileScope, assertAgyCliCompatibility, cliHostEnvironment, renamePrivateFile, resolveAgyCli } from "../src/agy-cli.js";
 import { AgyError } from "../src/errors.js";
+
+test("Windows staging retries transient rename failures but preserves permanent errors", async () => {
+  let attempts = 0;
+  const sharing = Object.assign(new Error("sharing violation"), { code: "EPERM" });
+  await renamePrivateFile("source", "target", async () => { if (++attempts < 3) throw sharing; }, "win32");
+  expect(attempts).toBe(3);
+  attempts = 0;
+  await expect(renamePrivateFile("source", "target", async () => { attempts++; throw sharing; }, "win32")).rejects.toBe(sharing);
+  expect(attempts).toBe(8);
+  attempts = 0;
+  await expect(renamePrivateFile("source", "target", async () => { attempts++; throw sharing; }, "linux")).rejects.toBe(sharing);
+  expect(attempts).toBe(1);
+});
 
 test("CLI discovery skips unreviewed implicit candidates but does not fall back from an override", async () => {
   const root = await mkdtemp(join(tmpdir(), "agy-discovery-"));
