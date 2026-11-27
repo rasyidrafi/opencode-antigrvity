@@ -1,5 +1,5 @@
 /**
- * Placeholder AI-SDK provider factory for OpenCode >= 2.2.0.
+ * Placeholder AI-SDK provider factory for OpenCode's dynamic provider loader.
  *
  * OpenCode's built-in DynamicProviderPlugin is registered before user plugins.
  * For an `aisdk:*` provider it runs `loadSDKFactory()` first and looks for a

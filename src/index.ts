@@ -27,7 +27,7 @@ import { AGENT_OPTION, AntigravityLanguageModel, INSTRUCTIONS_OPTION } from "./l
 
 export const PLUGIN_ID = "opencode-antigravity";
 export const INTEGRATION_ID = PROVIDER_ID;
-// OpenCode >= 2.2.0 runs its built-in DynamicProviderPlugin before user
+// OpenCode runs its built-in DynamicProviderPlugin before user
 // plugins. For an `aisdk:*` provider it tries to load a `create*` export from
 // the provider package before our `sdk` hook can supply the real SDK. Use a
 // local shim with a `create*` export so that loader succeeds; the hook below
