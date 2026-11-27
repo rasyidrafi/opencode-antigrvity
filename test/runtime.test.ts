@@ -202,3 +202,76 @@ test("managed, PATH, then install selection is offline and failed install can re
     Object.assign(process.env, saved);
   }
 });
+
+test("conflicting client identity for a running runtime is rejected; matching identity retains", async () => {
+  await stopRuntime();
+  const saved = { ...process.env };
+  const root2 = join(directory, "identity-second");
+  const validate = spyOn(cli, "assertAgyCliCompatibility").mockImplementation(async (path) => {
+    if (path === fixture) return;
+    return (cli.assertAgyCliCompatibility as any)(path);
+  });
+  try {
+    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
+    delete process.env.OPENCODE_ANTIGRAVITY_CLIENT_NAME;
+    await startRuntime(directory, fixture, "zed");
+    expect(getRuntime()?.clientIdentity?.name).toBe("zed");
+    // Same identity: retained (refcounted).
+    await startRuntime(root2, fixture, "zed");
+    // Conflicting identity (default vs zed): rejected, runtime unchanged.
+    await expect(startRuntime(root2, fixture)).rejects.toMatchObject({ code: "agy_runtime_client_identity_conflict" });
+    expect(getRuntime()?.clientIdentity?.name).toBe("zed");
+    await stopRuntime(root2);
+    expect(getRuntime()?.clientIdentity?.name).toBe("zed");
+    await stopRuntime(directory);
+    expect(getRuntime()).toBeNull();
+    // Default identity runtime rejects a zed workspace.
+    await startRuntime(directory, fixture);
+    expect(getRuntime()?.clientIdentity).toBeUndefined();
+    await expect(startRuntime(root2, fixture, "zed")).rejects.toMatchObject({ code: "agy_runtime_client_identity_conflict" });
+    await stopRuntime(directory);
+    expect(getRuntime()).toBeNull();
+  } finally {
+    validate.mockRestore();
+    await stopRuntime();
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+  }
+});
+
+test("running runtime manager scope equals the real pinned-identity scope", async () => {
+  const { catalogContext } = await import("../src/model-catalog.js");
+  const validate = spyOn(cli, "assertAgyCliCompatibility").mockImplementation(async (path) => {
+    if (path === fixture) return;
+    return (cli.assertAgyCliCompatibility as any)(path);
+  });
+  const savedEnv = { ...process.env };
+  try {
+    process.env.OPENCODE_ANTIGRAVITY_ACP_PATH = fixture;
+    process.env.OPENCODE_ANTIGRAVITY_DATA_DIR = join(directory, "scope-data");
+    process.env.GEMINI_HOME = join(directory, "scope-gemini");
+    delete process.env.OPENCODE_ANTIGRAVITY_CLIENT_NAME;
+    await startRuntime(directory, fixture, "zed");
+    try {
+      const expected = await catalogContext(fixture, { name: "zed", version: "0.8.0" });
+      expect(getRuntime()?.manager.scope).toBe(expected.scope);
+      // Env changes after pinning do not move the live manager scope.
+      process.env.OPENCODE_ANTIGRAVITY_CLIENT_NAME = "bogus";
+      await getRuntime()!.manager.refresh();
+      expect(getRuntime()!.manager.scope).toBe(expected.scope);
+    } finally { await stopRuntime(directory); }
+    // Default runtime uses the default scope, distinct from zed's.
+    delete process.env.OPENCODE_ANTIGRAVITY_CLIENT_NAME;
+    await startRuntime(directory, fixture);
+    try {
+      const expectedDefault = await catalogContext(fixture);
+      expect(getRuntime()?.manager.scope).toBe(expectedDefault.scope);
+      expect(getRuntime()!.manager.scope).not.toBe((await catalogContext(fixture, { name: "zed", version: "0.8.0" })).scope);
+    } finally { await stopRuntime(directory); }
+  } finally {
+    validate.mockRestore();
+    await stopRuntime();
+    for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
+    Object.assign(process.env, savedEnv);
+  }
+});

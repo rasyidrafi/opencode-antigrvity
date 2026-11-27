@@ -38,6 +38,15 @@ async function releaseWorkspace(directory: string): Promise<void> {
   await stopRuntime(resolvePath(directory));
 }
 
+/** Variant ids for one model: only routable variants are published —
+ * sibling efforts (exact wire ids) plus per-model selector values bound to
+ * this exact model, both filtered to supported efforts at catalog build
+ * time (`variantEfforts`). Legacy (schema-1) global thinking is never
+ * promoted into variants here. */
+export function variantIds(model: AcpModel): string[] {
+  return [...(model.variantEfforts ?? [])];
+}
+
 function providerModel(model: AcpModel): Model.Info {
   const id = Model.ID.make(model.id);
   const base = Model.Info.default(Provider.ID.make(PROVIDER_ID), id);
@@ -56,7 +65,7 @@ function providerModel(model: AcpModel): Model.Info {
       context: metadata?.context ?? 32_768,
       output: metadata?.output ?? 8_192,
     },
-    variants: Object.keys(model.variants ?? {}).map((variant) => ({ id: Model.VariantID.make(variant) })),
+    variants: variantIds(model).map((variant) => ({ id: Model.VariantID.make(variant) })),
   };
 }
 
@@ -125,7 +134,7 @@ function instructionText(system: ReadonlyArray<SystemPartLike> | undefined): str
 export const AntigravityPlugin = Plugin.define({
   id: PLUGIN_ID,
   async setup(ctx) {
-    const workspaces = new WorkspaceRegistry((directory) => startRuntime(resolvePath(directory), ctx.options?.acpPath), releaseWorkspace);
+    const workspaces = new WorkspaceRegistry((directory) => startRuntime(resolvePath(directory), ctx.options?.acpPath, ctx.options?.clientName), releaseWorkspace);
     let unsubscribe: (() => void) | undefined;
     let disposed = false;
     let metadataTimer: ReturnType<typeof setInterval> | undefined;

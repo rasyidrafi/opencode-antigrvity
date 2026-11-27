@@ -87,11 +87,8 @@ proxy and is not an official Google or OpenCode product.
 
    See the OpenCode
    [plugin guide](https://opencode.ai/docs/build/plugins) and
-   [configuration guide](https://opencode.ai/docs/config). The npm release
-   0.7.0 changed the provider credential registration and added runtime
-   path options and managed installation. Use this current checkout
-   until 0.7.0 is published and verified. The
-   plugin registers the provider and a
+   [configuration guide](https://opencode.ai/docs/config). The plugin
+   registers the provider and a
    non-secret provider placeholder; no Google API key needs to be configured
    in OpenCode. The API key form is not the Antigravity login: use the `agy`
    CLI. Existing local connections from older plugin versions are not removed.
@@ -101,8 +98,28 @@ discovery. Model
 IDs and availability come from the authenticated ACP session, not a fixed
 list in this repository; before successful discovery the fallback catalog is
 empty. Some explicitly advertised effort siblings are grouped into variants
-(`low`, `medium`, `high`). Availability can change by account or runtime.
+(`low`, `medium`, `high`, and `xhigh` where advertised). Thinking selectors
+are bound to the exact model they were observed on: a selector confirmed for
+one model is never applied to another. `xhigh` appears only for models that
+advertise it (an `xhigh` sibling or a per-model thinking selector listing
+`xhigh`). Availability can change by account or runtime.
 Unknown model limits are estimates, not guarantees.
+
+### ACP client identity (`clientInfo`)
+
+By default the plugin sends no `clientInfo` in the ACP `initialize`
+handshake. Set the plugin option `clientName: "zed"` (or the environment
+variable `OPENCODE_ANTIGRAVITY_CLIENT_NAME=zed`) to explicitly identify as
+Zed: every handshake (model discovery, pooled workers and utility workers)
+then sends `clientInfo: { name: "zed", version: "0.8.0" }`. Only `zed` is
+accepted. The identity is pinned to the shared runtime: a workspace asking
+for a different identity while the runtime is running is rejected
+(`agy_runtime_client_identity_conflict`); stop all workspaces first to
+change it. Discovery caches are scoped per identity, so a default-identity
+cache is never reused for a Zed-identified runtime or vice versa. This only
+changes the self-reported client name; it does not change authentication,
+entitlements, tool policy or model availability, and Zed-specific server
+behaviour is not guaranteed.
 
 ## Tools, prompts, and safety
 

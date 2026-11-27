@@ -186,6 +186,25 @@ async function handlePrompt(message) {
   if (text.includes("[image]")) response = "IMAGE_OK\n";
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: response.slice(0, -1) } });
   update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n" } });
+  if (text.includes("FAKE_REMOVE_SELECTOR")) update({ sessionUpdate: "config_option_update", configOptions: [
+    { id: "model", category: "model", name: "Model", type: "select", currentValue: "model-alpha", options: [{ value: "model-alpha", name: "Model Alpha" }, { value: "model-beta", name: "Model Beta" }, { value: "model-gamma", name: "Model Gamma" }] },
+  ] });
+  if (text.includes("FAKE_RESURRECT_SELECTOR")) update({ sessionUpdate: "config_option_update", configOptions: [
+    { id: "model", category: "model", name: "Model", type: "select", currentValue: "model-alpha", options: [{ value: "model-alpha", name: "Model Alpha" }, { value: "model-beta", name: "Model Beta" }, { value: "model-gamma", name: "Model Gamma" }] },
+    { id: "alpha_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: "low", options: [{ value: "low", name: "Low" }] },
+  ] });
+  if (text.includes("FAKE_PARTIAL_THOUGHT_UPDATE")) update({ sessionUpdate: "config_option_update", configOptions: [
+    { id: "beta_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: "low", options: [{ value: "low", name: "Low" }] },
+  ] });
+  if (text.includes("FAKE_CLEAR_THOUGHT_UPDATE")) update({ sessionUpdate: "config_option_update", configOptions: [
+    { id: "alpha_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: "low", options: [] },
+  ] });
+  if (text.includes("FAKE_PARTIAL_THOUGHT_HIGH")) update({ sessionUpdate: "config_option_update", configOptions: [
+    { id: "alpha_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [{ value: "high", name: "High" }] },
+  ] });
+  if (text.includes("FAKE_EMPTY_INVENTORY")) update({ sessionUpdate: "config_option_update", configOptions: [
+    { id: "model", category: "model", name: "Model", type: "select", currentValue: "model-alpha", options: [] },
+  ] });
   if (text.includes("FAKE_FALLBACK_AVAILABLE")) update({ sessionUpdate: "config_option_update", configOptions: [{ id: "model", category: "model", type: "select", name: "Model", currentValue: "gemini-3.8-flash-low", options: [
     { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }, { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" }, { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
   ] }] });
@@ -239,10 +258,15 @@ input.on("line", (line) => {
     // host owners. session/resume below still preserves its requested identity.
     sessionId = `fake-acp-session-${randomUUID()}`;
     const thoughtLevel = Boolean(process.env.FAKE_ACP_THOUGHT_LEVEL);
+    const perModel = process.env.FAKE_ACP_PER_MODEL === "1";
     respond(message.id, {
       sessionId,
       configOptions: [
-        { id: "model", category: "model", name: "Model", type: "select", currentValue: thoughtLevel ? "gemini-3.8-flash" : "gemini-3.8-flash-high", options: thoughtLevel
+        { id: "model", category: "model", name: "Model", type: "select", currentValue: perModel ? "model-alpha" : thoughtLevel ? "gemini-3.8-flash" : "gemini-3.8-flash-high", options: process.env.FAKE_ACP_GROUPED === "1" && perModel
+          ? [{ group: "Models", options: [{ value: "model-alpha", name: "Model Alpha" }, { value: "model-beta", name: "Model Beta" }, { value: "model-gamma", name: "Model Gamma" }] }]
+          : perModel
+          ? [{ value: "model-alpha", name: "Model Alpha" }, { value: "model-beta", name: "Model Beta" }, { value: "model-gamma", name: "Model Gamma" }]
+          : thoughtLevel
           ? [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }, { value: "target-model", name: "Target" }]
           : [
             { value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
@@ -251,6 +275,7 @@ input.on("line", (line) => {
             { value: "fake-model-low", name: "Fake Model" },
             ...(process.env.FAKE_ACP_EXTRA_MODEL ? [{ value: process.env.FAKE_ACP_EXTRA_MODEL, name: process.env.FAKE_ACP_EXTRA_MODEL }] : []),
           ] },
+        ...(perModel ? [{ id: "alpha_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [{ value: "low", name: "Low" }, { value: "high", name: "High" }] }] : []),
         ...(process.env.FAKE_ACP_THOUGHT_LEVEL === "remove" ? [{ id: "thought_level", category: "thought_level", name: "Thinking", type: "select", currentValue: "high", options: [
           { value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" },
         ] }] : []),
@@ -268,7 +293,43 @@ input.on("line", (line) => {
     respond(message.id, { configOptions: [] });
   } else if (message?.method === "session/set_config_option") {
     const thoughtLevel = process.env.FAKE_ACP_THOUGHT_LEVEL;
-    respond(message.id, { configOptions: thoughtLevel ? [
+    if (process.env.FAKE_ACP_PER_MODEL === "1") {
+      const target = message.params?.configId === "model" ? String(message.params?.value) : (globalThis.__fakeModel ?? "model-alpha");
+      if (message.params?.configId === "model") globalThis.__fakeModel = target;
+      const effortMode = process.env.FAKE_ACP_EFFORT_MODE;
+      const effortValue = message.params?.configId === "model" ? undefined : String(message.params?.value);
+      const selector = target === "model-alpha"
+        ? [{ id: effortMode === "otherid" && effortValue ? "wrong_effort" : "alpha_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: effortMode === "wrong" && effortValue ? "low" : "high", options: [{ value: "low", name: "Low" }, { value: "high", name: "High" }] }]
+        : target === "model-beta"
+        ? [{ id: "beta_effort", category: "thought_level", name: "Thinking", type: "select", currentValue: "xhigh", options: [{ value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" }, { value: "xhigh", name: "XHigh" }] }]
+        : [];
+      const modelCurrent = effortMode === "modelchanged" && effortValue && message.params?.configId !== "model" ? "model-beta" : target;
+      const modelOptions = effortMode === "emptymodel" && effortValue ? [] : null;
+      const grouped = process.env.FAKE_ACP_GROUPED === "1";
+      respond(message.id, { configOptions: [
+        { id: "model", category: "model", name: "Model", type: "select", currentValue: modelCurrent, options: modelOptions ?? (grouped ? [{ group: "Models", options: [{ value: "model-alpha", name: "Model Alpha" }, { value: "model-beta", name: "Model Beta" }, { value: "model-gamma", name: "Model Gamma" }] }] : [{ value: "model-alpha", name: "Model Alpha" }, { value: "model-beta", name: "Model Beta" }, { value: "model-gamma", name: "Model Gamma" }]) },
+        ...selector,
+      ] });
+    } else if (message.params?.configId === "model") {
+      if (process.env.FAKE_ACP_SET_MODEL_MODE === "empty") { respond(message.id, { configOptions: [] }); }
+      else if (process.env.FAKE_ACP_SET_MODEL_MODE === "emptyinventory") {
+        respond(message.id, { configOptions: [
+          { id: "model", category: "model", name: "Model", type: "select", currentValue: String(message.params.value), options: [] },
+        ] });
+      }
+      else if (process.env.FAKE_ACP_SET_MODEL_MODE === "wrong") {
+        respond(message.id, { configOptions: [
+          { id: "model", category: "model", name: "Model", type: "select", currentValue: "gemini-3.8-flash-high", options: [{ value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }, { value: "fake-model-low", name: "Fake Model" }] },
+        ] });
+      } else {
+        const requested = String(message.params.value);
+        respond(message.id, { configOptions: [
+          { id: "model", category: "model", name: "Model", type: "select", currentValue: requested, options: [{ value: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }, { value: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" }, { value: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" }, { value: "fake-model-low", name: "Fake Model" }, { value: "target-model", name: "Target" }] },
+          { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }] },
+          ...(thoughtLevel === "1" ? [{ id: "target_effort", category: "thought_level", type: "select", name: "Thinking", currentValue: "high", options: [{ value: "high", name: "High" }] }] : []),
+        ] });
+      }
+    } else respond(message.id, { configOptions: thoughtLevel ? [
       { id: "model", category: "model", name: "Model", type: "select", currentValue: "target-model", options: [{ value: "gemini-3.8-flash", name: "Gemini" }, { value: "target-model", name: "Target" }] },
       { id: "mode", name: "Mode", type: "select", currentValue: "code", options: [{ value: "code", name: "Code" }] },
       ...(thoughtLevel === "1" ? [{ id: "target_effort", category: "thought_level", type: "select", name: "Thinking", currentValue: "high", options: [{ value: "high", name: "High" }] }] : []),

@@ -6,6 +6,7 @@ import { assertAgyCliCompatibility, resolveAgyCli } from "./agy-cli.js";
 import { AgyError } from "./errors.js";
 import { assertManagedRuntimeCacheTrust, installManagedRuntime, managedRuntimePath } from "./runtime-installer.js";
 import { sessionPool } from "./session-pool.js";
+import { clientIdentityForName, type AcpClientIdentity } from "./constants.js";
 import { closeHostBridges, closeHostBridgesForScope, stopHostBridgeServer } from "./host-tools.js";
 import { info } from "./log.js";
 
@@ -22,6 +23,7 @@ type RuntimeState = {
   directory: string;
   executable: string;
   selectionVersion: 1;
+  clientIdentity?: AcpClientIdentity;
   manager: ModelCatalog;
   readonly catalog: AcpModelCatalog;
 };
@@ -79,10 +81,14 @@ export async function workspaceContains(directory: string): Promise<boolean> {
   return checks.some(Boolean);
 }
 
-async function startRuntimeInternal(directory: string, executable: string): Promise<void> {
+async function startRuntimeInternal(directory: string, executable: string, clientIdentity?: AcpClientIdentity): Promise<void> {
   sessionPool.open();
   const manager = new ModelCatalog(directory, {
-    context: () => catalogContext(executable),
+    // The pinned identity is hashed into the scope by catalogContext itself.
+    // Never overwrite it afterwards: that would leave the scope (and hence
+    // the cache file and catalog-event scope) describing the default
+    // identity while workers use the pinned one.
+    context: () => catalogContext(executable, clientIdentity),
     onChange: () => {
       for (const listener of modelCatalogListeners()) listener();
     },
@@ -92,7 +98,7 @@ async function startRuntimeInternal(directory: string, executable: string): Prom
       info("Retired incompatible ACP authentication scope", { reason: "scope_changed" });
     },
   });
-  state.runtime = { directory, executable, selectionVersion: 1, manager, get catalog() { return manager.catalog; } };
+  state.runtime = { directory, executable, selectionVersion: 1, ...(clientIdentity ? { clientIdentity } : {}), manager, get catalog() { return manager.catalog; } };
   await manager.start();
   info("Antigravity runtime ready", { directory, models: manager.catalog.models.length, ready: manager.catalog.source !== "empty" });
 }
@@ -141,12 +147,32 @@ async function selectLocalOrInstall(): Promise<string> {
   }
 }
 
-export async function startRuntime(directory = process.cwd(), acpPath?: unknown): Promise<void> {
+/** Resolve the pinned client identity. Env wins over the plugin option,
+ * mirroring `acpPath`. Returns undefined for the default (omitted) identity. */
+export function resolveClientIdentity(option?: unknown): AcpClientIdentity | undefined {
+  const env = process.env.OPENCODE_ANTIGRAVITY_CLIENT_NAME;
+  // Empty string from the environment means "explicitly unset" (default).
+  if (env !== undefined && env === "") return undefined;
+  const raw = env !== undefined ? env : option;
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string" || !raw.trim()) {
+    const source = env !== undefined ? "OPENCODE_ANTIGRAVITY_CLIENT_NAME" : "plugin option clientName";
+    throw new AgyError("invalid_request", `${source} must be "zed" when set.`, { code: "agy_client_name_invalid" });
+  }
+  try { return clientIdentityForName(raw); }
+  catch {
+    const source = env !== undefined ? "OPENCODE_ANTIGRAVITY_CLIENT_NAME" : "plugin option clientName";
+    throw new AgyError("invalid_request", `Unsupported ${source} "${raw}". Only "zed" is supported.`, { code: "agy_client_name_invalid" });
+  }
+}
+
+export async function startRuntime(directory = process.cwd(), acpPath?: unknown, clientName?: unknown): Promise<void> {
   const root = resolvePath(directory);
   return serializeLifecycle(async () => {
     if (state.runtime && (state.runtime.selectionVersion !== 1 || typeof state.runtime.executable !== "string" || !state.runtime.executable)) {
       throw new AgyError("busy", "An incompatible older Antigravity runtime is active in this process. Stop its workspaces and restart the OpenCode service before loading this version.", { code: "agy_runtime_reload_incompatible" });
     }
+    const clientIdentity = resolveClientIdentity(clientName);
     const envPath = process.env.OPENCODE_ANTIGRAVITY_ACP_PATH;
     const explicit = envPath !== undefined ? envPath : acpPath;
     let executable: string;
@@ -172,11 +198,16 @@ export async function startRuntime(directory = process.cwd(), acpPath?: unknown)
         const source = envPath !== undefined ? "OPENCODE_ANTIGRAVITY_ACP_PATH" : "plugin option acpPath";
         throw new AgyError("busy", `The ACP executable selected by ${source} conflicts with the shared runtime; stop its workspaces before changing it.`, { code: "agy_runtime_path_conflict" });
       }
+      const existing = state.runtime.clientIdentity?.name;
+      const requested = clientIdentity?.name;
+      if (existing !== requested) {
+        throw new AgyError("busy", `The ACP client identity (${requested ?? "default"}) conflicts with the shared runtime identity (${existing ?? "default"}); stop its workspaces before changing it.`, { code: "agy_runtime_client_identity_conflict" });
+      }
       state.refs.set(root, (state.refs.get(root) ?? 0) + 1);
       return;
     }
     try {
-      await startRuntimeInternal(root, executable);
+      await startRuntimeInternal(root, executable, clientIdentity);
       state.refs.set(root, (state.refs.get(root) ?? 0) + 1);
     } catch (error) {
       const manager = getRuntime()?.manager;

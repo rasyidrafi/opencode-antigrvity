@@ -124,6 +124,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
       executable: runtime.catalog.executable,
       catalogScope: runtime.manager.scope,
       credentialRevision: runtime.manager.credentialRevision,
+      ...(runtime.clientIdentity ? { clientIdentity: runtime.clientIdentity } : {}),
       hostTools: true,
     };
   }
@@ -205,6 +206,7 @@ export class AntigravityLanguageModel implements LanguageModelV3 {
         ...(selected.effort ? { effort: selected.effort } : {}),
         executable: runtime.catalog.executable,
         credentialRevision: runtime.manager.credentialRevision,
+        ...(runtime.clientIdentity ? { clientIdentity: runtime.clientIdentity } : {}),
         signal: options.abortSignal,
         ...(kind === "compaction" ? { maxChars: TRANSCRIPT_INPUT_BYTE_CAP } : {}),
       });

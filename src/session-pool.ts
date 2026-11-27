@@ -36,6 +36,7 @@ export type SessionSettings = {
   catalogScope?: string;
   credentialRevision?: string | null;
   hostTools?: boolean;
+  clientIdentity?: AcpWorkerOptions["clientIdentity"];
   mcpServers?: AcpWorkerOptions["mcpServers"];
   waitingForTools?: () => boolean;
   hasToolActivity?: () => boolean;
@@ -82,6 +83,7 @@ function settingsSignature(settings: SessionSettings): string {
     catalogScope: settings.catalogScope,
     mcpServers: settings.mcpServers,
     hostTools: settings.hostTools,
+    clientIdentity: settings.clientIdentity?.name ?? null,
   });
 }
 
@@ -122,6 +124,7 @@ function workerOptions(settings: SessionSettings, sessionId?: string): AcpWorker
     credentialRevision: settings.credentialRevision,
     model: settings.model,
     effort: settings.effort,
+    ...(settings.clientIdentity ? { clientIdentity: settings.clientIdentity } : {}),
     sessionId,
     mode: settings.mode,
     hostTools: settings.hostTools,

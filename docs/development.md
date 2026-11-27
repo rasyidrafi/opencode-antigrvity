@@ -95,3 +95,21 @@ compatibility testing.
 - [Bun script execution and `--bun`](https://bun.com/docs/runtime#bun)
 - [Dependency lifecycle scripts and `trustedDependencies`](https://bun.com/docs/pm/lifecycle#trusteddependencies)
 - [Portable environment-variable prefixes](https://bun.com/docs/runtime/environment-variables#setting-environment-variables)
+
+
+## Model variants and client identity
+
+Models are advertised with per-model effort variants: sibling wire ids
+(`<family>-low|medium|high|xhigh`) and thinking selectors bound to the exact
+model they were observed on. A selector seen for one model is merged into the
+catalog for that model only and never reused for another model; confirmed
+absence clears that model's entry, and authoritative removal prunes it.
+Discovery probes each advertised model with prompt-free disposable workers
+on first load where feasible; models without confirmed coverage simply have
+no variants advertised (availability is never invented). The optional
+`clientName: "zed"` plugin option (or `OPENCODE_ANTIGRAVITY_CLIENT_NAME=zed`)
+sends `clientInfo: { name: "zed", version: "0.8.0" }` on every ACP
+initialize handshake (discovery, pooled and utility paths); the default
+omits `clientInfo`. The identity is pinned to the shared runtime and scopes
+the model-catalog cache; see the README for the full configuration notes and
+limitations.

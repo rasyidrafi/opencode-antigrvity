@@ -28,8 +28,13 @@ when continuing or rebuilding a trajectory. Changed/cleared instructions
 retire the previous ACP context, including a parked tool turn once its results
 are available, so old instructions are not silently retained.
 
-ACP initialization omits optional `clientInfo` and advertises empty
-`clientCapabilities`. Tool configuration uses the protocol's `mcpServers`
+ACP initialization omits optional `clientInfo` by default and advertises
+empty `clientCapabilities`. When the user explicitly opts in with the plugin
+option `clientName: "zed"` (or `OPENCODE_ANTIGRAVITY_CLIENT_NAME=zed`), every
+handshake instead sends `clientInfo: { name: "zed", version: "0.8.0" }`;
+the identity is pinned to the shared runtime (see the README client
+identity section). The MCP tool-bridge handshake (`external_tool`) is
+unaffected in either case. Tool configuration uses the protocol's `mcpServers`
 field with a server named `external_tool`; model selection is unchanged.
 
 These rules govern the host input to ACP, not Antigravity's own internal

@@ -69,13 +69,20 @@ test("1.4 family ids and thought_level replace effort-suffixed model ids", () =>
       { id: "thought_level", category: "thought_level", options: [{ value: "low" }, { value: "high" }] },
     ],
   }, "fake")!;
-  expect(resolveAcpModelSelection("gemini-3.8-flash", "medium", limited).effort).toBe("medium");
+  // A confirmed selector for this exact model that excludes "medium" fails
+  // closed at selection time, before any prompt is sent.
+  expect(() => resolveAcpModelSelection("gemini-3.8-flash", "medium", limited)).toThrow(/Unsupported effort/);
+  expect(resolveAcpModelSelection("gemini-3.8-flash", "low", limited).effort).toBe("low");
 });
 
 test("missing, empty, legacy, and colliding catalogs do not invent model availability", () => {
   expect(fallbackAcpModelCatalog().models).toEqual([]);
   expect(catalogFromSession({ configOptions: [] }, "fake")).toBeUndefined();
+  // Explicit empty inventories are authoritative clears; a missing model
+  // selector remains no update.
   expect(catalogFromSession({ configOptions: [{ id: "model", options: [] }] }, "fake")?.models).toEqual([]);
+  expect(catalogFromSession({ models: { availableModels: [] } }, "fake")?.models).toEqual([]);
+  expect(catalogFromSession({ configOptions: [{ id: "mode", options: [{ value: "code" }] }] }, "fake")).toBeUndefined();
   const legacy = catalogFromSession({ models: { availableModels: [{ modelId: "legacy-exact", name: "Legacy" }], currentModelId: "legacy-exact" } }, "fake")!;
   expect(legacy.currentModel).toBe("legacy-exact");
   const colliding = acpModelCatalog("fake", null, [["foo", "Foo"], ["foo-high", "Foo (High)"], ["foo-low", "Foo (Low)"], ["foo", "Duplicate"]]);

@@ -102,3 +102,58 @@ test("an account switch during discovery cannot publish the previous account's r
     expect(manager.catalog.models).toEqual([]);
   } finally { finish(); await manager.close(); await rm(directory, { recursive: true, force: true }); }
 });
+
+test("per-model selectors persist versioned, notify changes, and isolate by client identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-catalog-permodel-"));
+  const seen: unknown[] = [];
+  const context = async (): Promise<CatalogContext> => ({ scope: "account", executable: "fake", args: [], cacheDirectory: directory });
+  const probe = async () => acpModelCatalog("fake", "test", [["model-alpha", "Model Alpha"], ["model-beta", "Model Beta"]], "model-beta", undefined, { "model-beta": { id: "beta_effort", values: ["low", "xhigh"], current: "xhigh" } });
+  let manager = new ModelCatalog(directory, { context, probe, onChange: (c) => seen.push(c.thinkingSelectors) });
+  try {
+    await manager.refresh();
+    expect(manager.catalog.thinkingSelectors?.["model-beta"]?.values).toEqual(["low", "xhigh"]);
+    // Notify on selector change via emitted catalog (worker snapshot merge).
+    emitAcpCatalog("account", acpModelCatalog("fake", "test", [["model-alpha", "Model Alpha"], ["model-beta", "Model Beta"]], "model-beta", undefined, { "model-beta": { id: "beta_effort", values: ["low", "high", "xhigh"], current: "high" } }));
+    expect(manager.catalog.thinkingSelectors?.["model-beta"]?.values).toEqual(["low", "high", "xhigh"]);
+    expect(seen.length).toBeGreaterThanOrEqual(1);
+    expect(seen.at(-1)).toMatchObject({ "model-beta": { values: ["low", "high", "xhigh"] } });
+    await manager.close();
+    // Versioned cache (schema 2) round-trips per-model selectors.
+    const stored = JSON.parse(await readFile(join(directory, "account.json"), "utf8"));
+    expect(stored.schema).toBe(2);
+    expect(stored.thinkingSelectors["model-beta"].values).toEqual(["low", "high", "xhigh"]);
+    manager = new ModelCatalog(directory, { context, probe: async () => { throw new Error("offline"); } });
+    await manager.refresh();
+    expect(manager.catalog.source).toBe("cache");
+    expect(manager.catalog.thinkingSelectors?.["model-beta"]?.values).toEqual(["low", "high", "xhigh"]);
+    // Identity isolation: a cache record naming a different identity is ignored.
+    await writeFile(join(directory, "zed-account.json"), JSON.stringify({ schema: 2, discoveredAt: Date.now(), version: "test", currentModel: "model-beta", clientIdentity: "zed", thinkingSelectors: { "model-beta": { id: "beta_effort", values: ["xhigh"] } }, entries: [["model-beta", "Model Beta"]] }), { mode: 0o600 });
+    const zedContext = async (): Promise<CatalogContext> => ({ scope: "zed-account", executable: "fake", args: [], cacheDirectory: directory, clientIdentity: { name: "zed", version: "0.8.0" } });
+    const zedManager = new ModelCatalog(directory, { context: zedContext, probe: async () => { throw new Error("offline"); } });
+    try {
+      await zedManager.refresh();
+      expect(zedManager.catalog.thinkingSelectors?.["model-beta"]?.values).toEqual(["xhigh"]);
+    } finally { await zedManager.close(); }
+    // Default identity must not read the zed cache (scope differs, and the
+    // identity check rejects cross-identity records).
+    const defaultContext = async (): Promise<CatalogContext> => ({ scope: "zed-account", executable: "fake", args: [], cacheDirectory: directory });
+    const defaultManager = new ModelCatalog(directory, { context: defaultContext, probe: async () => { throw new Error("offline"); } });
+    try {
+      await defaultManager.refresh();
+      expect(defaultManager.catalog.models).toEqual([]);
+    } finally { await defaultManager.close(); }
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("legacy schema-1 caches remain readable", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "acp-catalog-legacy-"));
+  await writeFile(join(directory, "account.json"), JSON.stringify({ schema: 1, discoveredAt: Date.now(), version: "1.4.5", currentModel: "gemini-3.8-flash", thinking: { values: ["low", "medium", "high"], current: "high" }, entries: [["gemini-3.8-flash", "Gemini 3.8 Flash"]] }), { mode: 0o600 });
+  const context = async (): Promise<CatalogContext> => ({ scope: "account", executable: "fake", args: [], cacheDirectory: directory });
+  const manager = new ModelCatalog(directory, { context, probe: async () => { throw new Error("offline"); } });
+  try {
+    await manager.refresh();
+    expect(manager.catalog.source).toBe("cache");
+    expect(manager.catalog.thinking).toEqual({ values: ["low", "medium", "high"], current: "high" });
+    expect(resolveAcpModelSelection("gemini-3.8-flash", "high", manager.catalog).effort).toBe("high");
+  } finally { await manager.close(); await rm(directory, { recursive: true, force: true }); }
+});

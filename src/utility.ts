@@ -15,6 +15,7 @@ export type OneShotSettings = {
   effort?: AcpEffort;
   executable?: string;
   credentialRevision?: string | null;
+  clientIdentity?: import("./acp-process.js").AcpWorkerOptions["clientIdentity"];
   signal?: AbortSignal;
   /** Keep the current generate request intact; reject rather than silently truncate. */
   preserveRequest?: string;
@@ -106,6 +107,7 @@ export async function runAcpOneShot(prompt: string, settings: OneShotSettings): 
       cwd: utilityCwd,
       executable: settings.executable,
       credentialRevision: settings.credentialRevision,
+      ...(settings.clientIdentity ? { clientIdentity: settings.clientIdentity } : {}),
       model: settings.model,
       effort: settings.effort,
       mode: "plan",

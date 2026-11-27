@@ -15,11 +15,11 @@ import {
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
 import { AgyAbortError, AgyError, AgyProcessError, AgyProtocolError, AgyTimeoutError } from "./errors.js";
-import { DEFAULT_MAX_STDERR_BYTES, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpEffort, type AcpPermissionPolicy } from "./constants.js";
+import { ACP_CLIENT_NAME, DEFAULT_MAX_STDERR_BYTES, configuredPrintTimeoutMs, configuredTurnStallTimeoutMs, type AcpClientIdentity, type AcpEffort, type AcpPermissionPolicy } from "./constants.js";
 import { agyAcpArgs, assertAgyCliCompatibility, cliHostEnvironment, detectAgyAcp, isRegistryRuntime } from "./agy-cli.js";
 import { debug, info, warn } from "./log.js";
 import type { AcpEvent } from "./protocol.js";
-import { catalogFromSession, type AcpModelCatalog } from "./models.js";
+import { acpModelCatalog, catalogFromSession, mergeCatalog, selectOptionValueIds, thinkingSelectorsFromSession, type AcpModelCatalog } from "./models.js";
 import { emitAcpCatalog } from "./catalog-events.js";
 import { BLOCKED_BROWSER_MARKER, prepareBrowserBlocker } from "./browser-blocker.js";
 export type { AcpEvent } from "./protocol.js";
@@ -41,6 +41,9 @@ export type AcpWorkerOptions = {
   stallTimeoutMs?: number;
   onActivity?: () => void;
   hostTools?: boolean;
+  /** Explicit ACP clientInfo. When set, sent on every handshake; when
+   * omitted, clientInfo is omitted entirely (default). */
+  clientIdentity?: AcpClientIdentity;
   mcpServers?: Array<{ type: "http"; name: string; url: string; headers: Array<{ name: string; value: string }> }>;
   waitingForTools?: () => boolean;
   permissionPolicy?: AcpPermissionPolicy;
@@ -255,9 +258,33 @@ export class AcpWorker {
       const current = selector?.currentValue ?? value.models?.currentModelId;
       if (typeof current === "string" && current) this.actualModelValue = current;
     }
-    const catalog = catalogFromSession(response, this.executable, this.initValue?.agentInfo?.version ?? null);
-    if (!catalog) return;
-    this.catalog = catalog;
+    let catalog = catalogFromSession(response, this.executable, this.initValue?.agentInfo?.version ?? null, this.actualModelValue);
+    if (!catalog) {
+      // Thought-only updates carry NO inventory. When the worker's current
+      // model is known they are unambiguous: a thought option with values
+      // binds to that exact model; an explicitly empty thought option
+      // clears it; a missing thought option is unknown (ignored). Models
+      // absent from the authoritative inventory are ignored.
+      const thoughtOnly = thinkingSelectorsFromSession(response, this.actualModelValue);
+      if (!thoughtOnly.thoughtOnly || !this.catalog || !thoughtOnly.currentModel) return;
+      if (!this.catalog.exactModels.some((m) => m.id === thoughtOnly.currentModel)) return;
+      if (thoughtOnly.selectors) {
+        catalog = acpModelCatalog(this.executable, this.initValue?.agentInfo?.version ?? null,
+          [], this.actualModelValue, undefined, thoughtOnly.selectors,
+          { observation: { authoritativeInventory: false, confirmedModel: thoughtOnly.currentModel, confirmedNoSelector: false } });
+      } else if (thoughtOnly.hasThinkingOption) {
+        catalog = acpModelCatalog(this.executable, this.initValue?.agentInfo?.version ?? null,
+          [], this.actualModelValue, undefined, undefined,
+          { observation: { authoritativeInventory: false, confirmedModel: thoughtOnly.currentModel, confirmedNoSelector: false, confirmedNoneModels: [thoughtOnly.currentModel] } });
+      } else return;
+    }
+    // Local accumulation merges every snapshot (for configure decisions).
+    const merged = mergeCatalog(this.catalog, catalog);
+    this.catalog = merged;
+    // Emit only this snapshot's fresh observation (+ explicit clears via
+    // its observation), never the locally accumulated state: replaying
+    // accumulated selectors would resurrect stale values in the shared
+    // catalog and could overwrite newer live updates for the same model.
     emitAcpCatalog(this.options.catalogScope, catalog);
   }
 
@@ -300,7 +327,7 @@ export class AcpWorker {
       const input = Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>;
       const output = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
       const stream = ndJsonStream(output, input);
-      const app = client({ name: "opencode-antigravity" });
+      const app = client({ name: ACP_CLIENT_NAME });
       app.onNotification(methods.client.session.update, ({ params }) => this.onSessionUpdate(params));
       app.onRequest(methods.client.session.requestPermission, ({ params }) => this.requestPermission(params));
       this.connection = app.connect(stream);
@@ -311,6 +338,7 @@ export class AcpWorker {
       const init = await this.withSignal(agent.request(methods.agent.initialize, {
         protocolVersion: 1,
         clientCapabilities: {},
+        ...(this.options.clientIdentity ? { clientInfo: { name: this.options.clientIdentity.name, version: this.options.clientIdentity.version } } : {}),
       }), signal);
       this.initValue = init;
       await this.openSession(agent, signal);
@@ -378,30 +406,93 @@ export class AcpWorker {
         item.ids[0] === "model" && candidate.category === "model" ||
         item.ids[0] === "effort" && (candidate.category === "thought_level" || candidate.category === "effort" || candidate.category === "reasoning_effort"));
       if (!option) {
-        if (item.ids[0] === "effort") throw new AgyError("invalid_request", "The selected Antigravity model does not expose a thinking level selector", { code: "agy_invalid_effort", retryable: false });
+        if (item.ids[0] === "effort") {
+          // Confirmed no selector for the exact model now selected: clear
+          // any stale per-model observation and fail closed before any
+          // prompt is sent.
+          const target = this.options.model ?? this.catalog?.currentModel;
+          if (this.catalog?.thinkingSelectors && target) delete this.catalog.thinkingSelectors[target];
+          if (this.catalog && (this.catalog.thinkingSelectors === undefined || Object.keys(this.catalog.thinkingSelectors).length === 0)) this.catalog.thinkingSelectors = undefined;
+          throw new AgyError("invalid_request", "The selected Antigravity model does not expose a thinking level selector", { code: "agy_invalid_effort", retryable: false });
+        }
         continue;
       }
+      // Exact membership only: values are the option's advertised strings.
+      // An option with no usable values has no membership (never fall back
+      // to the requested value), and nested non-string values are ignored.
       const values = item.ids[0] === "model" && this.catalog ? this.catalog.exactModels.map((model) => model.id)
-        : Array.isArray(option.options) ? option.options.flatMap((entry) => Array.isArray((entry as { options?: unknown }).options)
-          ? ((entry as { options: Array<{ value?: unknown }> }).options).map((nested) => String(nested.value))
-          : [String(entry.value)]) : [];
-      const value = values.length
-        ? values.find((entry) => entry === item.value)
-        : item.value;
-      if (!value || (values.length > 0 && !values.includes(value))) {
-        throw new AgyError("unknown_model", `The ACP session does not support the requested ${String(option.id)} value`, {
-          code: "agy_acp_config_value",
+        : selectOptionValueIds(option);
+      const value = values.find((entry) => entry === item.value);
+      if (!value) {
+        // Mode is a best-effort display selector: an unadvertised mode
+        // value skips without failing the turn (pre-existing behaviour).
+        // Model and effort require exact membership and fail closed.
+        if (item.ids[0] === "mode") continue;
+        throw new AgyError(item.ids[0] === "effort" ? "invalid_request" : "unknown_model", `The ACP session does not support the requested ${String(option.id)} value`, {
+          code: item.ids[0] === "effort" ? "agy_invalid_effort" : "agy_acp_config_value",
           details: { configId: String(option.id), available: values },
         });
       }
       if (item.ids[0] === "model") this.actualModelValue = undefined;
+      const expectedOptionId = String(option.id);
       const updated = await this.withSignal(agent.request(methods.agent.session.setConfigOption, {
         sessionId: this.sessionIdValue,
         configId: String(option.id),
         value,
       }), signal);
-      this.recordModels(updated);
-      if (Array.isArray(updated?.configOptions)) options = updated.configOptions;
+      // Validate the ack BEFORE publishing: a rejected ack must not change
+      // the worker's local catalog, emit to the shared catalog, or persist.
+      if (item.ids[0] === "model") {
+        // Strict target confirmation: a model switch is only accepted when
+        // the response is complete (non-empty configOptions) and its model
+        // selector confirms the exact target model with exact membership
+        // in the advertised options. An incomplete or wrong-target
+        // response fails closed here — no effort is applied and no prompt
+        // is ever sent on the wrong model.
+        const updatedOptions = Array.isArray((updated as { configOptions?: unknown } | null)?.configOptions)
+          ? (updated as { configOptions: Array<{ id?: unknown; category?: unknown; currentValue?: unknown; options?: Array<{ value?: unknown }> }> }).configOptions
+          : undefined;
+        const modelOption = updatedOptions?.find((candidate) => candidate.category === "model" || candidate.id === "model");
+        const advertised = selectOptionValueIds(modelOption);
+        const confirmed = typeof modelOption?.currentValue === "string" ? modelOption.currentValue : undefined;
+        // Explicit empty inventory (model option with no usable values)
+        // never confirms a switch.
+        if (!updatedOptions || updatedOptions.length === 0 || !modelOption || confirmed !== item.value || !advertised.includes(item.value)) {
+          throw new AgyError("unknown_model", "The ACP session did not confirm the requested model; refusing to continue on an unconfirmed model", {
+            code: "agy_acp_model_unconfirmed",
+            details: { requested: item.value, confirmed: confirmed ?? null, available: advertised },
+          });
+        }
+        this.recordModels(updated);
+        options = updatedOptions as typeof options;
+      } else if (item.ids[0] === "effort") {
+        // Contradictory-response check: the effort response must confirm the
+        // exact effort on the thought selector and keep the target model.
+        // Anything else fails closed here — no prompt is ever sent.
+        const updatedOptions = Array.isArray((updated as { configOptions?: unknown } | null)?.configOptions)
+          ? (updated as { configOptions: Array<{ id?: unknown; category?: unknown; currentValue?: unknown }> }).configOptions
+          : undefined;
+        const thoughtOption = updatedOptions?.find((candidate) => String(candidate.id) === expectedOptionId);
+        const confirmedEffort = thoughtOption && typeof thoughtOption.currentValue === "string" ? thoughtOption.currentValue : undefined;
+        const modelOption = updatedOptions?.find((candidate) => candidate.category === "model" || candidate.id === "model");
+        const confirmedModel = modelOption && typeof modelOption.currentValue === "string" ? modelOption.currentValue : undefined;
+        // With an explicit model inventory in the ack, the target must be a
+        // member of it; an explicit empty list is contradictory.
+        const modelAdvertised = modelOption ? selectOptionValueIds(modelOption) : undefined;
+        if (!updatedOptions || updatedOptions.length === 0 || !thoughtOption || confirmedEffort !== item.value
+          || (modelOption !== undefined && this.options.model !== undefined
+              && (confirmedModel !== this.options.model || !modelAdvertised?.includes(this.options.model)))) {
+          throw new AgyError("invalid_request", "The ACP session did not confirm the requested thinking level; refusing to prompt on an unconfirmed model", {
+            code: "agy_acp_effort_unconfirmed",
+            details: { requested: item.value, confirmed: confirmedEffort ?? null, model: confirmedModel ?? null },
+          });
+        }
+        this.recordModels(updated);
+        options = updatedOptions as typeof options;
+      } else if (Array.isArray((updated as { configOptions?: unknown } | null)?.configOptions)) {
+        this.recordModels(updated);
+        options = (updated as { configOptions: typeof options }).configOptions;
+      }
     }
   }
 
