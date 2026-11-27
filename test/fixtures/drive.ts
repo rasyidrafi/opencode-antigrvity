@@ -14,6 +14,7 @@ export type DriveOptions = {
   tools?: HostTool[];
   model?: string;
   signal?: AbortSignal;
+  requestId?: string;
 };
 
 function acpModel(requested: string): string {
@@ -45,6 +46,7 @@ export async function driveBridge(options: DriveOptions): Promise<Response> {
     },
     baseURL: await ensureHostBridgeServer(),
     signal: options.signal,
+    requestId: options.requestId,
   });
   const content: Array<Record<string, unknown>> = [];
   const state = createAcpTranslationState();

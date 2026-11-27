@@ -187,6 +187,8 @@ export class HostBridge {
   private idle?: ReturnType<typeof setTimeout>;
   private instructions = "";
   private closing?: Promise<void>;
+  private transitioning = false;
+  private transitionCancelled = false;
   private turn?: SessionTurnRequest;
   private callCount = 0;
   private readonly sessions: Pick<SessionPool, "turn" | "forgetWorker">;
@@ -262,8 +264,11 @@ export class HostBridge {
         for (const id of results.keys()) if (!this.reported.has(id) && !this.settled.has(id)) throw new AgyError("invalid_request", "Tool result does not belong to this session's pending calls");
         for (const [id, result] of results) await sessionStore.saveToolResult(this.key, id, result);
         if ([...this.reported].every(id => results.has(id) || this.pending.get(id)?.result)) {
-          await this.close();
-          yield* hostBridge(this.key, this.sessionID, this.cwd).request(input);
+          if (!this.canReconstructReported(input.messages)) {
+            parked = true;
+            throw new AgyError("invalid_request", "The original host tool batch is missing or conflicts with its originating calls, or has results in optional history; include the calls and move results to the current continuation before continuing");
+          }
+          yield* this.replace(input);
           finished = true;
           return;
         }
@@ -295,6 +300,16 @@ export class HostBridge {
           const delivery = [...deliveryContent, ...steering];
           validateMediaBlocks(delivery);
           blockBudget(input.settings.model, delivery, input.settings.outputBudget);
+          // Result images re-enter natively instead of being offloaded by MCP.
+          if (delivery.some((block) => block.type === "image")) {
+            if (!this.canReconstructReported(input.messages)) {
+              parked = true;
+              throw new AgyError("invalid_request", "The original host tool batch is missing or conflicts with its originating calls, or has results in optional history; include the calls and move results to the current continuation before continuing");
+            }
+            yield* this.replace(input);
+            finished = true;
+            return;
+          }
           const last = [...this.reported].at(-1);
           const requestID = this.turn?.identity?.value ?? this.turn?.requestId;
           if (requestID) await sessionStore.saveReceipt(this.key, requestID, { state: "running" });
@@ -434,10 +449,47 @@ export class HostBridge {
     }
   }
 
+  private canReconstructReported(messages: unknown): boolean {
+    const calls = Array.isArray(messages) ? messages.flatMap(m => m?.role === "assistant" && Array.isArray(m.content) ? m.content.filter((part: any) => part?.type === "tool_use") : []) : [];
+    const history = Array.isArray(messages) ? messages : [];
+    let lastAssistant = -1;
+    history.forEach((message, index) => { if (message?.role === "assistant") lastAssistant = index; });
+    const historicalResults = new Set(history.slice(0, lastAssistant).filter(m => m?.role === "user").flatMap(message => [...hostResults([message]).keys()]));
+    const trailingResults = hostResults(messages);
+    return [...this.reported].every(id => {
+      const matching = calls.filter((call: any) => call.id === id);
+      const pending = this.pending.get(id);
+      // Results after the final assistant boundary are queued user context and
+      // mandatory in reconstruction. Earlier results are optional and suppress
+      // durable recovery, so require the host to move or omit those copies.
+      const recoverable = !historicalResults.has(id) && matching.length > 0;
+      return !!pending && !historicalResults.has(id) && (trailingResults.has(id) || recoverable) && matching.every((call: unknown) => canonical(call) === canonical(pending.call));
+    });
+  }
+
+  private async *replace(input: Parameters<HostBridge["request"]>[0]): AsyncGenerator<BridgeEvent> {
+    this.transitioning = true;
+    try {
+      await this.closeInternal();
+      if (this.transitionCancelled || input.signal?.aborted || bridges.get(this.key) !== this) throw new AgyAbortError();
+    } finally {
+      if (bridges.get(this.key) === this) bridges.delete(this.key);
+      this.transitioning = false;
+    }
+    yield* hostBridge(this.key, this.sessionID, this.cwd).request(input);
+  }
+
   close(): Promise<void> {
+    if (this.transitioning) {
+      this.transitionCancelled = true;
+    }
+    return this.closeInternal();
+  }
+
+  private closeInternal(): Promise<void> {
     if (this.closing) return this.closing;
     this.closed = true; this.active = false; clearTimeout(this.idle);
-    tokens.delete(this.token); if (bridges.get(this.key) === this) bridges.delete(this.key);
+    tokens.delete(this.token); if (!this.transitioning && bridges.get(this.key) === this) bridges.delete(this.key);
     this.controller.abort();
     // Interrupt ACP before rejecting MCP results, so rejection cannot start another model step.
     return this.closing = (async () => {
